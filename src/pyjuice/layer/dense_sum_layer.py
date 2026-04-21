@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import math
 import torch
 import torch.nn as nn
@@ -139,13 +140,10 @@ class DenseSumLayer(SumLayer):
         self._layer_pid_range = (layer_pid_start, curr_pid)
         self._layer_pfid_range = (layer_pfid_start, curr_pfid)
 
-        # Register per-block metadata as a long tensor so ``.to(device)`` on
-        # the module moves it alongside params. Shape: [num_blocks, 8].
-        self.register_buffer(
-            "_dense_blocks",
-            torch.tensor(blocks, dtype = torch.long),
-            persistent = False,
-        )
+        # Host-side metadata driving kernel launches — never read on GPU,
+        # so keep it as a plain Python list to avoid a D2H copy + implicit
+        # stream sync on every forward/backward.
+        self._dense_blocks = blocks
 
         # Stubs that the parent's forward/backward loops look at; keep them
         # empty so any accidental fallback into the sparse path does nothing.
@@ -191,13 +189,14 @@ class DenseSumLayer(SumLayer):
 
         batch_size = node_mars.size(1)
 
-        for block in self._dense_blocks.tolist():
+        for block in self._dense_blocks:
             nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, bs, cbs = block
 
             total_edges = NB_ch * cbs
 
             TILE_M, TILE_K, BLOCK_B, use_bf16, use_tl_dot = _select_fw_tiles(
                 bs = bs, total_edges = total_edges, batch_size = batch_size,
+                NB = NB,
                 force_use_bf16 = force_use_bf16, force_use_fp32 = force_use_fp32,
             )
 
@@ -257,7 +256,7 @@ class DenseSumLayer(SumLayer):
         # Optional preprocessing: replace ``node_flows`` with
         # ``log(node_flows) - node_mars`` on this layer's parent nodes.
         if allow_modify_flows:
-            for block in self._dense_blocks.tolist():
+            for block in self._dense_blocks:
                 nid_start, _cid_start, _pid_start, _pfid_start, NB, _NB_ch, bs, _cbs = block
                 layer_n_nodes = NB * bs
                 BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
@@ -279,11 +278,12 @@ class DenseSumLayer(SumLayer):
                     alpha = alpha,
                 )
 
-        for block in self._dense_blocks.tolist():
+        for block in self._dense_blocks:
             nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, bs, cbs = block
 
             TILE_N, TILE_K, BLOCK_B, use_tl_dot = _select_bk_tiles(
                 cbs = cbs, bs = bs, batch_size = batch_size,
+                NB_ch = NB_ch,
                 force_use_fp32 = force_use_fp32,
             )
 
@@ -341,22 +341,35 @@ class DenseSumLayer(SumLayer):
         nblock_id = pid_m // (BS // TILE_M)
         tile_id_m = pid_m % (BS // TILE_M)
 
-        # Parent node offsets within block (BS dim) and global node ids
+        # Parent node offsets within block (BS dim) and global node ids.
+        # tile_id_m comes from pid_m % (BS//TILE_M) so Triton can't infer
+        # divisibility by TILE_M on its own — hint it explicitly.
         offs_node = tl.arange(0, TILE_M) + tile_id_m * TILE_M      # [TILE_M]
+        offs_node = tl.max_contiguous(tl.multiple_of(offs_node, TILE_M), TILE_M)
         off_nid = nid_start + nblock_id * BS + offs_node           # [TILE_M]
 
-        # Batch offsets
+        # Batch offsets: chunk of BLOCK_B starting at pid_b*BLOCK_B, so values
+        # are multiple_of(BLOCK_B) and max_contiguous(BLOCK_B).
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
         mask_batch = offs_batch < batch_size
 
         # Edge offsets; the k-th edge within a parent block corresponds to
         # global child id ``cid_start + k`` and edge-block base pid
         # ``pid_start + (nblock_id*NB_ch*CBS + k) * BS``.
+        # offs_edge = arange(0,TILE_K) is already contig(TILE_K)/mult(TILE_K).
         par_block_base = pid_start + nblock_id * NB_ch * CBS * BS
         offs_edge = tl.arange(0, TILE_K)
 
+        # epars tile: [TILE_M, TILE_K]
+        #   outer dim (TILE_M, rows): stride 1   — contiguous in memory
+        #   inner dim (TILE_K, cols): stride BS  — strided (not fast axis)
+        # Base aligned to TILE_M (par_block_base mult of BS, BS mult of TILE_M).
         epars_ptr = mparams + par_block_base + \
             offs_edge[None, :] * BS + offs_node[:, None]   # [TILE_M, TILE_K]
+        # emars tile: [TILE_K, BLOCK_B]
+        #   inner dim (BLOCK_B): stride 1         — fully coalesced
+        #   outer dim (TILE_K):  stride batch_size — strided
         emars_ptr = element_mars + \
             (cid_start + offs_edge)[:, None] * batch_size + \
             offs_batch[None, :]                            # [TILE_K, BLOCK_B]
@@ -364,7 +377,9 @@ class DenseSumLayer(SumLayer):
         acc = tl.zeros([TILE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
         for _k in range(0, K_NUM_TILES):
+            # epars: TILE_M rows each contiguous in memory (stride 1 along M).
             epars = tl.load(epars_ptr)
+            # emars: BLOCK_B inner dim contiguous (stride 1 along batch).
             emars = tl.load(emars_ptr, mask = mask_batch[None, :])
 
             if propagation_alg_id == 1:
@@ -413,6 +428,9 @@ class DenseSumLayer(SumLayer):
                     ),
                 )
 
+            # Advance along K: next TILE_K edges = TILE_K*BS scalars (params)
+            # and TILE_K*batch_size scalars (emars rows). Both are multiples
+            # of TILE_M / BLOCK_B respectively, so alignment is preserved.
             epars_ptr += TILE_K * BS
             emars_ptr += TILE_K * batch_size
 
@@ -420,6 +438,8 @@ class DenseSumLayer(SumLayer):
             # Rescale back: node_mars = (log sum w^alpha * p^alpha) / alpha
             acc = acc * (1.0 / alpha)
 
+        # Store [TILE_M, BLOCK_B]: inner dim BLOCK_B is stride 1 (contiguous,
+        # coalesced), outer dim TILE_M is stride batch_size.
         off_out = off_nid[:, None] * batch_size + offs_batch[None, :]
         tl.store(node_mars + off_out, acc, mask = mask_batch[None, :])
 
@@ -437,15 +457,23 @@ class DenseSumLayer(SumLayer):
         pid_b = tl.program_id(0)
         pid_m = tl.program_id(1)
 
+        # Parent-node offsets: chunk of BLOCK_M starting at a multiple of BLOCK_M.
         offs_m = tl.arange(0, BLOCK_M) + pid_m * BLOCK_M
+        offs_m = tl.max_contiguous(tl.multiple_of(offs_m, BLOCK_M), BLOCK_M)
         mask_m = offs_m < num_parents
 
+        # Batch offsets: chunk of BLOCK_B starting at a multiple of BLOCK_B.
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
         mask_batch = offs_batch < batch_size
 
+        # [BLOCK_M, BLOCK_B] tile:
+        #   inner dim (BLOCK_B): stride 1         — contiguous / coalesced
+        #   outer dim (BLOCK_M): stride batch_size
         off_nmfs = (nid_start + offs_m)[:, None] * batch_size + offs_batch[None, :]
         mask = mask_m[:, None] & mask_batch[None, :]
 
+        # Both loads: BLOCK_B inner dim is stride 1 (contiguous).
         nmars = tl.load(node_mars + off_nmfs, mask = mask)
         nflows = tl.load(node_flows + off_nmfs, mask = mask)
 
@@ -462,6 +490,7 @@ class DenseSumLayer(SumLayer):
                 -float("inf"),
             )
 
+        # Store [BLOCK_M, BLOCK_B]: BLOCK_B inner dim is stride 1 (contiguous).
         tl.store(node_flows + off_nmfs, uflows, mask = mask)
 
     @staticmethod
@@ -490,12 +519,20 @@ class DenseSumLayer(SumLayer):
         cblock_id = pid_n // (CBS // TILE_N)
         tile_id_n = pid_n % (CBS // TILE_N)
 
+        # Child node offsets. tile_id_n comes from a pid modulo so divisibility
+        # by TILE_N is not inferred automatically — hint it.
         offs_child = tl.arange(0, TILE_N) + tile_id_n * TILE_N    # [TILE_N]
+        offs_child = tl.max_contiguous(tl.multiple_of(offs_child, TILE_N), TILE_N)
         off_cid = cid_start + cblock_id * CBS + offs_child
 
+        # Batch offsets: mult/contig of BLOCK_B.
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
         mask_batch = offs_batch < batch_size
 
+        # emars [TILE_N, BLOCK_B]:
+        #   inner dim (BLOCK_B): stride 1         — contiguous / coalesced
+        #   outer dim (TILE_N):  stride batch_size
         emars = tl.load(
             element_mars + off_cid[:, None] * batch_size + offs_batch[None, :],
             mask = mask_batch[None, :],
@@ -515,21 +552,32 @@ class DenseSumLayer(SumLayer):
             pblock_id = kt // (BS // TILE_K)
             within_tile_id = kt % (BS // TILE_K)
 
+            # Parent-within-block offsets: arange(TILE_K) + mult_of(TILE_K).
             off_pwithin = tl.arange(0, TILE_K) + within_tile_id * TILE_K   # [TILE_K]
+            off_pwithin = tl.max_contiguous(
+                tl.multiple_of(off_pwithin, TILE_K), TILE_K
+            )
             off_mid = nid_start + pblock_id * BS + off_pwithin
 
-            # Edge block base for (pblock_id, cblock_id).
+            # Edge block base for (pblock_id, cblock_id). Scalar multiple of BS.
             edge_block_base = pid_start + \
                 (pblock_id * NB_ch + cblock_id) * CBS * BS
+            # epars [TILE_N, TILE_K] — note: the inner/outer layout is the
+            # TRANSPOSE of the forward kernel's epars load.
+            #   inner dim (TILE_K, cols): stride 1  — contiguous / coalesced
+            #   outer dim (TILE_N, rows): stride BS — strided
             epars = tl.load(
                 mparams + edge_block_base +
                 offs_child[:, None] * BS + off_pwithin[None, :]
             )  # [TILE_N, TILE_K]
 
+            # [TILE_K, BLOCK_B] offset — BLOCK_B inner dim is stride 1.
             off_mb = off_mid[:, None] * batch_size + offs_batch[None, :]
+            # nflows: contiguous along BLOCK_B inner dim.
             nflows = tl.load(node_flows + off_mb, mask = mask_batch[None, :])
 
             if propagation_alg_id == 1:
+                # nmars: contiguous along BLOCK_B inner dim.
                 nmars = tl.load(node_mars + off_mb, mask = mask_batch[None, :])
                 elpars = tl.log(tl.trans(epars))                           # [TILE_K, TILE_N]
                 eflows = tl.sum(
@@ -563,6 +611,7 @@ class DenseSumLayer(SumLayer):
                 if allow_modify_flows == 1:
                     log_n_fdm = nflows
                 else:
+                    # nmars: contiguous along BLOCK_B inner dim.
                     nmars = tl.load(node_mars + off_mb, mask = mask_batch[None, :])
                     if logspace_flows == 1:
                         if propagation_alg_id == 0:
@@ -633,13 +682,16 @@ class DenseSumLayer(SumLayer):
                 else:
                     acc = acc + partial_flows * tl.exp(emars + log_n_fdm_max)
 
+        # [TILE_N, BLOCK_B] offset — BLOCK_B inner dim is stride 1 (contiguous).
         off_emfs = off_cid[:, None] * batch_size + offs_batch[None, :]
         if accumulate_ch_flows == 1:
+            # Load existing element_flows: contiguous along BLOCK_B inner dim.
             ori = tl.load(
                 element_flows + off_emfs, mask = mask_batch[None, :],
                 other = 0.0,
             )
             acc = acc + ori
+        # Store [TILE_N, BLOCK_B]: contiguous / coalesced along BLOCK_B.
         tl.store(element_flows + off_emfs, acc, mask = mask_batch[None, :])
 
 
@@ -651,34 +703,91 @@ def _greatest_power_of_2_divisor(n: int, cap: int) -> int:
     return p
 
 
-def _select_fw_tiles(bs: int, total_edges: int, batch_size: int,
+@functools.lru_cache(maxsize=16)
+def _target_grid_size(device_index: int) -> int:
+    # Target ~1 program per SM. Going higher (e.g. 4x) forces smaller tiles
+    # that lose arithmetic intensity faster than they gain from occupancy at
+    # HMM-shaped workloads. Falls back to a fixed value if CUDA properties
+    # can't be queried.
+    try:
+        n_sm = torch.cuda.get_device_properties(device_index).multi_processor_count
+        return n_sm
+    except Exception:
+        return 128
+
+
+def _shrink_for_grid(tile_m: int, block_b: int, m_total: int, batch_size: int,
+                     target_grid: int, dot_floor: int = 16):
+    # Halve whichever of (tile_m, block_b) is currently larger until the grid
+    # reaches target_grid or both tiles hit the tl.dot-friendly floor.
+    def _grid() -> int:
+        return triton.cdiv(batch_size, block_b) * (m_total // tile_m)
+
+    while _grid() < target_grid:
+        can_shrink_m = tile_m > dot_floor and (tile_m // 2) >= 1
+        can_shrink_b = block_b > dot_floor
+        if can_shrink_m and can_shrink_b:
+            if tile_m >= block_b:
+                tile_m //= 2
+            else:
+                block_b //= 2
+        elif can_shrink_m:
+            tile_m //= 2
+        elif can_shrink_b:
+            block_b //= 2
+        else:
+            break
+    return tile_m, block_b
+
+
+def _select_fw_tiles(bs: int, total_edges: int, batch_size: int, NB: int,
                      force_use_bf16: bool, force_use_fp32: bool):
-    # Mirror the block-sparse heuristic: use tl.dot when all three tile dims
-    # are ≥ 16; otherwise fall back to explicit-sum.
+    # Start from the largest tl.dot-friendly tiles (same cap as before), then
+    # shrink TILE_M / BLOCK_B toward the 16x16 floor until the launch grid
+    # (ceil(B/BLOCK_B) * NB * bs/TILE_M) saturates the SMs. TILE_K is left
+    # large — it does not affect the grid, only the inner K-loop trip count.
     TILE_M = _greatest_power_of_2_divisor(bs, 64)
     TILE_K = _greatest_power_of_2_divisor(total_edges, 64)
     BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
     if BLOCK_B < 1:
         BLOCK_B = 1
 
+    target_grid = _target_grid_size(torch.cuda.current_device())
+    TILE_M, BLOCK_B = _shrink_for_grid(
+        tile_m = TILE_M, block_b = BLOCK_B,
+        m_total = NB * bs, batch_size = batch_size,
+        target_grid = target_grid,
+    )
+
     use_tl_dot = 1 if (TILE_M >= 16 and TILE_K >= 16 and BLOCK_B >= 16) else 0
+    # Match the sparse-path policy: bf16 inputs to tl.dot whenever tl.dot is
+    # chosen. Keeps numerical behaviour aligned between the two kernels, which
+    # is what tests (and users comparing outputs) expect.
     if force_use_fp32:
         use_bf16 = 0
-    elif force_use_bf16:
-        use_bf16 = 1 if use_tl_dot else 0
     else:
-        use_bf16 = 1 if (use_tl_dot and TILE_M >= 32 and TILE_K >= 32) else 0
+        use_bf16 = 1 if use_tl_dot else 0
 
     return TILE_M, TILE_K, BLOCK_B, use_bf16, use_tl_dot
 
 
-def _select_bk_tiles(cbs: int, bs: int, batch_size: int,
+def _select_bk_tiles(cbs: int, bs: int, batch_size: int, NB_ch: int,
                      force_use_fp32: bool):
+    # Backward grid is (ceil(B/BLOCK_B), NB_ch * cbs/TILE_N). TILE_K loops
+    # over the parent dimension inside the kernel, so only TILE_N and BLOCK_B
+    # can grow the grid — shrink them toward 16 when the launch is too small.
     TILE_N = _greatest_power_of_2_divisor(cbs, 64)
     TILE_K = _greatest_power_of_2_divisor(bs, 64)
     BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
     if BLOCK_B < 1:
         BLOCK_B = 1
+
+    target_grid = _target_grid_size(torch.cuda.current_device())
+    TILE_N, BLOCK_B = _shrink_for_grid(
+        tile_m = TILE_N, block_b = BLOCK_B,
+        m_total = NB_ch * cbs, batch_size = batch_size,
+        target_grid = target_grid,
+    )
 
     use_tl_dot = 1 if (TILE_N >= 16 and TILE_K >= 16 and BLOCK_B >= 16) else 0
     return TILE_N, TILE_K, BLOCK_B, use_tl_dot
