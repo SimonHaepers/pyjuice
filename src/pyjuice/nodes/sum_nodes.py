@@ -75,6 +75,15 @@ class SumNodes(CircuitNodes):
     def num_ch_nodes(self):
         return self.num_ch_node_blocks * self.ch_block_size
 
+    @property
+    def is_block_dense(self) -> bool:
+        # Edge-count check is sufficient because `_construct_edges` deduplicates
+        # and asserts indices are in-range; equality to the Cartesian-product
+        # size therefore implies an all-to-all block graph.
+        if self.edge_ids.size(1) != self.num_node_blocks * self.num_ch_node_blocks:
+            return False
+        return all(c.block_size == self.ch_block_size for c in self.chs)
+
     def duplicate(self, *args, tie_params: bool = False) -> SumNodes:
         """
         Create a duplication of the current node with the same specification (i.e., number of nodes, block size).

@@ -12,7 +12,7 @@ from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, LayerGroup
+from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, DenseSumLayer, LayerGroup
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -116,11 +116,12 @@ class TensorCircuit(nn.Module):
     :type verbose: bool
     """
 
-    def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5, 
-                 max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False, 
+    def __init__(self, root_ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
+                 max_num_partitions: Optional[int] = None, disable_gpu_compilation: bool = False,
                  force_gpu_compilation: bool = False,
                  max_tied_ns_per_parflow_block: int = 8,
                  device: Optional[Union[int,torch.device]] = None,
+                 use_dense_sum_layer: bool = False,
                  verbose: bool = True) -> None:
 
         super(TensorCircuit, self).__init__()
@@ -137,11 +138,13 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
-        
+
+        self.use_dense_sum_layer = use_dense_sum_layer
+
         self._init_layers(
-            layer_sparsity_tol = layer_sparsity_tol, 
-            max_num_partitions = max_num_partitions, 
-            disable_gpu_compilation = disable_gpu_compilation, 
+            layer_sparsity_tol = layer_sparsity_tol,
+            max_num_partitions = max_num_partitions,
+            disable_gpu_compilation = disable_gpu_compilation,
             force_gpu_compilation = force_gpu_compilation,
             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
             device = device,
@@ -1037,18 +1040,28 @@ class TensorCircuit(nn.Module):
                         num_elements = layer_num_elements
 
                     # Sum layer(s)
+                    # Split by (block_size, dense-eligibility). Dense-eligible
+                    # nodes must be fully connected at the block level, have a
+                    # single child group, and not be tied (tied params share
+                    # state with the block-sparse path we cannot round-trip
+                    # through yet).
+                    def _dense_eligible(ns):
+                        return (self.use_dense_sum_layer
+                                and ns.is_block_dense
+                                and len(ns.chs) == 1
+                                and not ns.is_tied())
+
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        gsize = ns.block_size
-                        if gsize not in gsize2sum_nodes:
-                            gsize2sum_nodes[gsize] = []
-                        gsize2sum_nodes[gsize].append(ns)
-                    
+                        key = (ns.block_size, _dense_eligible(ns))
+                        gsize2sum_nodes.setdefault(key, []).append(ns)
+
                     sum_layers = []
-                    for gsize, nodes in gsize2sum_nodes.items():
-                        sum_layer = SumLayer(
+                    for (gsize, dense), nodes in gsize2sum_nodes.items():
+                        layer_cls = DenseSumLayer if dense else SumLayer
+                        sum_layer = layer_cls(
                             nodes = nodes,
-                            global_nid_start = num_nodes, 
+                            global_nid_start = num_nodes,
                             global_pid_start = num_parameters,
                             global_pfid_start = num_param_flows,
                             node2tiednodes = node2tiednodes,
