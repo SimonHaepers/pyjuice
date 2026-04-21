@@ -145,6 +145,23 @@ class DenseSumLayer(SumLayer):
         # stream sync on every forward/backward.
         self._dense_blocks = blocks
 
+        # The forward path overwrites ``element_mars`` in place per block
+        # (log -> exp(log_emars - per_tile_max)); overlapping child ranges
+        # would re-exp already-linearised values. Reject at compile time so
+        # the runtime can stay simple.
+        child_ranges = sorted(
+            (b[1], b[1] + b[5] * b[7]) for b in blocks
+        )
+        for (_, prev_end), (next_start, _) in zip(child_ranges, child_ranges[1:]):
+            assert prev_end <= next_start, (
+                "DenseSumLayer blocks have overlapping child ranges; the "
+                "forward path requires disjoint cid ranges per block."
+            )
+
+        # Scratch buffer holding the per-k-tile max recorded by the forward
+        # precompute kernel. Allocated lazily on the first forward call.
+        self._element_mars_max = None
+
         # Stubs that the parent's forward/backward loops look at; keep them
         # empty so any accidental fallback into the sparse path does nothing.
         self.num_fw_partitions = 0
@@ -203,9 +220,32 @@ class DenseSumLayer(SumLayer):
             K_NUM_TILES = total_edges // TILE_K
             grid = (triton.cdiv(batch_size, BLOCK_B), NB * (bs // TILE_M))
 
+            element_mars_max = self._get_or_alloc_emars_max(
+                K_NUM_TILES, batch_size, element_mars.device,
+            )
+
+            # LL / GeneralLL precompute once per block: exp(log_emars -
+            # per_tile_max) + the per-tile max. MPE needs raw log-space
+            # emars, so skip precompute there and let the main kernel do
+            # the max-based update in log space.
+            if propagation_alg_id != 1:
+                precompute_grid = (triton.cdiv(batch_size, BLOCK_B), K_NUM_TILES)
+                self._fw_triton_dense_precompute_kernel[precompute_grid](
+                    element_mars = element_mars,
+                    element_mars_max = element_mars_max,
+                    batch_size = batch_size,
+                    cid_start = cid_start,
+                    TILE_K = TILE_K,
+                    K_NUM_TILES = K_NUM_TILES,
+                    BLOCK_B = BLOCK_B,
+                    propagation_alg_id = propagation_alg_id,
+                    alpha = alpha,
+                )
+
             self._fw_triton_dense_kernel[grid](
                 node_mars = node_mars,
                 element_mars = element_mars,
+                element_mars_max = element_mars_max,
                 mparams = params,
                 batch_size = batch_size,
                 nid_start = nid_start,
@@ -225,6 +265,27 @@ class DenseSumLayer(SumLayer):
             )
 
         return None
+
+    def _get_or_alloc_emars_max(self, K_NUM_TILES: int, batch_size: int,
+                                 device: torch.device) -> torch.Tensor:
+        """
+        Lazily allocate (or grow) the per-k-tile max scratch buffer. One
+        buffer per DenseSumLayer, reused across dense blocks within a single
+        forward pass.
+        """
+        buf = self._element_mars_max
+        if (
+            buf is None
+            or buf.size(0) < K_NUM_TILES
+            or buf.size(1) < batch_size
+            or buf.device != device
+        ):
+            buf = torch.empty(
+                K_NUM_TILES, batch_size,
+                device = device, dtype = torch.float32,
+            )
+            self._element_mars_max = buf
+        return buf
 
     # ------------------------------------------------------------------ #
     # Backward (element flows only)
@@ -324,7 +385,8 @@ class DenseSumLayer(SumLayer):
 
     @staticmethod
     @triton_jit
-    def _fw_triton_dense_kernel(node_mars, element_mars, mparams,
+    def _fw_triton_dense_kernel(node_mars, element_mars, element_mars_max,
+                                mparams,
                                 batch_size: tl.constexpr,
                                 nid_start: tl.constexpr, cid_start: tl.constexpr,
                                 pid_start: tl.constexpr, NB_ch: tl.constexpr,
@@ -334,6 +396,22 @@ class DenseSumLayer(SumLayer):
                                 propagation_alg_id: tl.constexpr,
                                 use_bf16: tl.constexpr, use_tl_dot: tl.constexpr,
                                 alpha = 0.0):
+        """
+        Forward kernel for one DenseSumLayer block. Caller contract:
+
+          * LL (0) / GeneralLL (2): ``element_mars`` holds the pre-computed
+            linear values ``exp(log_emars - per_tile_max)`` in the slice
+            ``[cid_start, cid_start + NB_ch*CBS)`` (produced by
+            :meth:`_fw_triton_dense_precompute_kernel`), and ``element_mars_max``
+            holds the per-k-tile maxima of shape ``[K_NUM_TILES, batch_size]``.
+          * MPE (1): ``element_mars`` holds raw log-space values;
+            ``element_mars_max`` is not read (caller may still pass the
+            scratch buffer — its contents are ignored).
+
+        Internals keep a running ``{linear sum, log max}`` accumulator for
+        LL/GeneralLL so the k-loop costs 1 exp/tile with a single ``log`` at
+        the end. MPE only needs the running max.
+        """
 
         pid_b = tl.program_id(0)
         pid_m = tl.program_id(1)
@@ -373,8 +451,14 @@ class DenseSumLayer(SumLayer):
         emars_ptr = element_mars + \
             (cid_start + offs_edge)[:, None] * batch_size + \
             offs_batch[None, :]                            # [TILE_K, BLOCK_B]
+        # Pointer into the per-tile max: element_mars_max[k_tile, batch_tile].
+        emax_ptr = element_mars_max + pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
 
-        acc = tl.zeros([TILE_M, BLOCK_B], dtype = tl.float32) - float("inf")
+        # Running {linear sum, log max}. Invariant for LL/GeneralLL:
+        # true log-space result = log(acc_sum) + acc_max. For MPE only
+        # acc_max is used (as a plain running max).
+        acc_sum = tl.zeros([TILE_M, BLOCK_B], dtype = tl.float32)
+        acc_max = tl.zeros([TILE_M, BLOCK_B], dtype = tl.float32) - float("inf")
 
         for _k in range(0, K_NUM_TILES):
             # epars: TILE_M rows each contiguous in memory (stride 1 along M).
@@ -383,56 +467,52 @@ class DenseSumLayer(SumLayer):
             emars = tl.load(emars_ptr, mask = mask_batch[None, :])
 
             if propagation_alg_id == 1:
-                # MPE propagation
+                # MPE: log-space emars, update running max.
                 lpars = tl.log(epars)
                 nmars = tl.max(lpars[:, :, None] + emars[None, :, :], axis = 1)
-                acc = tl.maximum(acc, nmars)
+                acc_max = tl.maximum(acc_max, nmars)
             else:
-                if propagation_alg_id == 0:
-                    emars_max = tl.max(emars, axis = 0)[None, :]
-                    emars_sub = tl.where(
-                        emars_max != -float("inf"),
-                        tl.exp(emars - emars_max), 0.0,
-                    )
-
+                # LL / GeneralLL: emars is already linearised and the per-tile
+                # max was recorded by the precompute kernel.
                 if propagation_alg_id == 2:
-                    emars_max = tl.max(emars, axis = 0)[None, :]
-                    emars_sub = tl.where(
-                        emars_max != -float("inf"),
-                        tl.exp((emars - emars_max) * alpha), 0.0,
-                    )
                     epars = tl.exp(tl.log(epars) * alpha)
-                    emars_max *= alpha
+
+                emars_max = tl.load(emax_ptr, mask = mask_batch)[None, :]
+                emax_ptr += batch_size
 
                 if use_tl_dot == 1:
                     if use_bf16 == 1:
                         epars_b = epars.to(tl.bfloat16)
-                        emars_b = emars_sub.to(tl.bfloat16)
+                        emars_b = emars.to(tl.bfloat16)
                         nmars = tl.dot(epars_b, emars_b).to(tl.float32)
                     else:
-                        nmars = tl.dot(epars, emars_sub)
+                        nmars = tl.dot(epars, emars)
                 else:
                     nmars = tl.sum(
-                        epars[:, :, None] * emars_sub[None, :, :], axis = 1
+                        epars[:, :, None] * emars[None, :, :], axis = 1
                     )
 
-                # Numerically stable running-max logsumexp — matches the
-                # block-sparse kernel verbatim.
-                acc = tl.where(
-                    emars_max > acc,
-                    tl.log(nmars + tl.exp(acc - emars_max) + 1e-24) + emars_max,
-                    tl.where(
-                        acc != -float("inf"),
-                        tl.log(tl.exp(emars_max - acc) * nmars + 1.0) + acc,
-                        -float("inf"),
-                    ),
+                # 1 exp/tile, 0 log/tile.
+                mask = emars_max > acc_max
+                diff = tl.where(mask, acc_max - emars_max, emars_max - acc_max)
+                # NaN guard for -inf - (-inf).
+                diff = tl.where(diff != diff, 0.0, diff)
+                scale = tl.exp(diff)
+                acc_sum = tl.where(
+                    mask, acc_sum * scale + nmars, acc_sum + nmars * scale,
                 )
+                acc_max = tl.maximum(acc_max, emars_max)
 
             # Advance along K: next TILE_K edges = TILE_K*BS scalars (params)
             # and TILE_K*batch_size scalars (emars rows). Both are multiples
             # of TILE_M / BLOCK_B respectively, so alignment is preserved.
             epars_ptr += TILE_K * BS
             emars_ptr += TILE_K * batch_size
+
+        if propagation_alg_id == 1:
+            acc = acc_max
+        else:
+            acc = tl.log(acc_sum + 1e-24) + acc_max
 
         if propagation_alg_id == 2:
             # Rescale back: node_mars = (log sum w^alpha * p^alpha) / alpha
@@ -442,6 +522,65 @@ class DenseSumLayer(SumLayer):
         # coalesced), outer dim TILE_M is stride batch_size.
         off_out = off_nid[:, None] * batch_size + offs_batch[None, :]
         tl.store(node_mars + off_out, acc, mask = mask_batch[None, :])
+
+    @staticmethod
+    @triton_jit
+    def _fw_triton_dense_precompute_kernel(element_mars, element_mars_max,
+                                           batch_size: tl.constexpr,
+                                           cid_start: tl.constexpr,
+                                           TILE_K: tl.constexpr,
+                                           K_NUM_TILES: tl.constexpr,
+                                           BLOCK_B: tl.constexpr,
+                                           propagation_alg_id: tl.constexpr,
+                                           alpha = 0.0):
+        """
+        Pre-compute per-k-tile max and ``exp(emars - tile_max)`` for a single
+        DenseSumLayer block. Overwrites ``element_mars`` in place in the range
+        ``[cid_start, cid_start + K_NUM_TILES*TILE_K)``; the maxima land in
+        ``element_mars_max[k_tile_id, batch_tile]``. Only called for LL /
+        GeneralLL — MPE needs the raw log-space emars.
+
+        Grid: ``(cdiv(batch_size, BLOCK_B), K_NUM_TILES)``.
+        """
+
+        pid_b = tl.program_id(0)
+        k_tile_id = tl.program_id(1)
+
+        offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
+        offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
+        mask_batch = offs_batch < batch_size
+
+        offs_edge = tl.arange(0, TILE_K)
+        offs_child = cid_start + k_tile_id * TILE_K + offs_edge
+
+        # emars tile: [TILE_K, BLOCK_B], BLOCK_B inner dim stride 1.
+        emars_ptr = element_mars + offs_child[:, None] * batch_size + \
+            offs_batch[None, :]
+        emars = tl.load(
+            emars_ptr, mask = mask_batch[None, :], other = -float("inf"),
+        )
+
+        # Per-tile max across TILE_K edges.
+        emars_max = tl.max(emars, axis = 0)   # [BLOCK_B]
+
+        if propagation_alg_id == 0:
+            emars_linear = tl.where(
+                emars_max[None, :] != -float("inf"),
+                tl.exp(emars - emars_max[None, :]), 0.0,
+            )
+        if propagation_alg_id == 2:
+            emars_linear = tl.where(
+                emars_max[None, :] != -float("inf"),
+                tl.exp((emars - emars_max[None, :]) * alpha), 0.0,
+            )
+            emars_max = emars_max * alpha
+
+        # Overwrite log-space emars with linear values.
+        tl.store(emars_ptr, emars_linear, mask = mask_batch[None, :])
+
+        # Store per-tile max: element_mars_max[k_tile_id, batch_tile].
+        max_ptr = element_mars_max + k_tile_id * batch_size + offs_batch
+        tl.store(max_ptr, emars_max, mask = mask_batch)
 
     @staticmethod
     @triton_jit
