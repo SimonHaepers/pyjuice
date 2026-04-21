@@ -122,6 +122,7 @@ class TensorCircuit(nn.Module):
                  max_tied_ns_per_parflow_block: int = 8,
                  device: Optional[Union[int,torch.device]] = None,
                  use_dense_sum_layer: bool = False,
+                 param_dtype: torch.dtype = torch.float32,
                  verbose: bool = True) -> None:
 
         super(TensorCircuit, self).__init__()
@@ -140,6 +141,7 @@ class TensorCircuit(nn.Module):
         self.param_flows = None
 
         self.use_dense_sum_layer = use_dense_sum_layer
+        self.param_dtype = param_dtype
 
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol,
@@ -568,6 +570,10 @@ class TensorCircuit(nn.Module):
         """
         assert not step_size_rescaling or self._cum_flow > 0.0, "Please perform a backward pass before calling `mini_batch_em`."
         assert 0.0 < step_size <= 1.0, "`step_size` should be between 0 and 1."
+        assert self.param_dtype == torch.float32, (
+            f"mini_batch_em requires float32 params; got param_dtype={self.param_dtype}. "
+            "Lower-precision param dtypes are inference-only."
+        )
 
         with device_grad_controller(device = self.device, no_grad = True):
 
@@ -1118,7 +1124,7 @@ class TensorCircuit(nn.Module):
                 ns.gather_parameters(params)
 
         self._normalize_parameters(params, pseudocount = pseudocount)
-        self.params = nn.Parameter(params)
+        self.params = nn.Parameter(params.to(self.param_dtype))
 
         # Due to the custom inplace backward pass implementation, we do not track 
         # gradient of PC parameters by PyTorch.

@@ -162,6 +162,13 @@ class DenseSumLayer(SumLayer):
         # precompute kernel. Allocated lazily on the first forward call.
         self._element_mars_max = None
 
+        # Scratch buffer holding the bf16 linear-domain emars written by the
+        # precompute kernel on the LL/bf16 fast path (read back by the main
+        # forward kernel without any dtype cast). Allocated lazily, reused
+        # across dense blocks — each block's NB_ch*CBS rows fit within the
+        # single buffer by using the max over all blocks as the leading dim.
+        self._emars_linear_bf16 = None
+
         # Stubs that the parent's forward/backward loops look at; keep them
         # empty so any accidental fallback into the sparse path does nothing.
         self.num_fw_partitions = 0
@@ -206,6 +213,22 @@ class DenseSumLayer(SumLayer):
 
         batch_size = node_mars.size(1)
 
+        # LL fast path: params already bf16 + plain LL + tl.dot-friendly tiles.
+        # Pre-linearises emars into a dedicated bf16 scratch so the main kernel
+        # loads both ``epars`` and ``emars`` as bf16 with zero in-kernel casts.
+        bf16_fast = (
+            propagation_alg_id == 0
+            and not force_use_fp32
+            and params.dtype == torch.bfloat16
+        )
+        if bf16_fast:
+            max_k_rows = max(b[5] * b[7] for b in self._dense_blocks)  # NB_ch * cbs
+            emars_linear_bf16 = self._get_or_alloc_emars_linear_bf16(
+                max_k_rows, batch_size, element_mars.device,
+            )
+        else:
+            emars_linear_bf16 = element_mars  # unused on non-bf16 path; must be a valid pointer
+
         for block in self._dense_blocks:
             nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, bs, cbs = block
 
@@ -216,6 +239,9 @@ class DenseSumLayer(SumLayer):
                 NB = NB,
                 force_use_bf16 = force_use_bf16, force_use_fp32 = force_use_fp32,
             )
+
+            # Enable the bf16 fast path only when tiles are tl.dot-eligible.
+            bf16_path = 1 if (bf16_fast and use_bf16 == 1 and use_tl_dot == 1) else 0
 
             K_NUM_TILES = total_edges // TILE_K
             grid = (triton.cdiv(batch_size, BLOCK_B), NB * (bs // TILE_M))
@@ -233,12 +259,14 @@ class DenseSumLayer(SumLayer):
                 self._fw_triton_dense_precompute_kernel[precompute_grid](
                     element_mars = element_mars,
                     element_mars_max = element_mars_max,
+                    emars_bf16_out = emars_linear_bf16,
                     batch_size = batch_size,
                     cid_start = cid_start,
                     TILE_K = TILE_K,
                     K_NUM_TILES = K_NUM_TILES,
                     BLOCK_B = BLOCK_B,
                     propagation_alg_id = propagation_alg_id,
+                    BF16_PATH = bf16_path,
                     alpha = alpha,
                 )
 
@@ -247,6 +275,7 @@ class DenseSumLayer(SumLayer):
                 element_mars = element_mars,
                 element_mars_max = element_mars_max,
                 mparams = params,
+                emars_bf16_in = emars_linear_bf16,
                 batch_size = batch_size,
                 nid_start = nid_start,
                 cid_start = cid_start,
@@ -261,6 +290,7 @@ class DenseSumLayer(SumLayer):
                 propagation_alg_id = propagation_alg_id,
                 use_bf16 = use_bf16,
                 use_tl_dot = use_tl_dot,
+                BF16_PATH = bf16_path,
                 alpha = alpha,
             )
 
@@ -285,6 +315,28 @@ class DenseSumLayer(SumLayer):
                 device = device, dtype = torch.float32,
             )
             self._element_mars_max = buf
+        return buf
+
+    def _get_or_alloc_emars_linear_bf16(self, total_rows: int, batch_size: int,
+                                          device: torch.device) -> torch.Tensor:
+        """
+        Lazily allocate (or grow) the bf16 linear-domain emars scratch used by
+        the LL fast path. Sized to the max ``NB_ch * cbs`` across this layer's
+        dense blocks, so all blocks in one forward share it (sequentially —
+        each block overwrites the leading ``NB_ch * cbs`` rows).
+        """
+        buf = self._emars_linear_bf16
+        if (
+            buf is None
+            or buf.size(0) < total_rows
+            or buf.size(1) < batch_size
+            or buf.device != device
+        ):
+            buf = torch.empty(
+                total_rows, batch_size,
+                device = device, dtype = torch.bfloat16,
+            )
+            self._emars_linear_bf16 = buf
         return buf
 
     # ------------------------------------------------------------------ #
@@ -386,7 +438,7 @@ class DenseSumLayer(SumLayer):
     @staticmethod
     @triton_jit
     def _fw_triton_dense_kernel(node_mars, element_mars, element_mars_max,
-                                mparams,
+                                mparams, emars_bf16_in,
                                 batch_size: tl.constexpr,
                                 nid_start: tl.constexpr, cid_start: tl.constexpr,
                                 pid_start: tl.constexpr, NB_ch: tl.constexpr,
@@ -395,22 +447,24 @@ class DenseSumLayer(SumLayer):
                                 TILE_K: tl.constexpr, K_NUM_TILES: tl.constexpr,
                                 propagation_alg_id: tl.constexpr,
                                 use_bf16: tl.constexpr, use_tl_dot: tl.constexpr,
+                                BF16_PATH: tl.constexpr,
                                 alpha = 0.0):
         """
         Forward kernel for one DenseSumLayer block. Caller contract:
 
-          * LL (0) / GeneralLL (2): ``element_mars`` holds the pre-computed
-            linear values ``exp(log_emars - per_tile_max)`` in the slice
-            ``[cid_start, cid_start + NB_ch*CBS)`` (produced by
-            :meth:`_fw_triton_dense_precompute_kernel`), and ``element_mars_max``
-            holds the per-k-tile maxima of shape ``[K_NUM_TILES, batch_size]``.
+          * LL (0) / GeneralLL (2): the pre-computed linear values
+            ``exp(log_emars - per_tile_max)`` live either in ``element_mars``
+            at ``[cid_start, cid_start + NB_ch*CBS)`` (``BF16_PATH == 0``,
+            fp32) or in ``emars_bf16_in`` at zero-based rows
+            ``[0, NB_ch*CBS)`` (``BF16_PATH == 1``, bf16). Per-k-tile maxima
+            live in ``element_mars_max[K_NUM_TILES, batch_size]``.
           * MPE (1): ``element_mars`` holds raw log-space values;
-            ``element_mars_max`` is not read (caller may still pass the
-            scratch buffer — its contents are ignored).
+            ``element_mars_max`` is not read and ``BF16_PATH`` must be 0.
 
-        Internals keep a running ``{linear sum, log max}`` accumulator for
-        LL/GeneralLL so the k-loop costs 1 exp/tile with a single ``log`` at
-        the end. MPE only needs the running max.
+        On ``BF16_PATH == 1`` the K-loop loads ``epars`` (from bf16 ``mparams``)
+        and ``emars`` (from the bf16 scratch) as bf16 directly — no in-kernel
+        dtype casts before the ``tl.dot``. Running ``{linear sum, log max}``
+        accumulator matches the legacy path.
         """
 
         pid_b = tl.program_id(0)
@@ -448,9 +502,14 @@ class DenseSumLayer(SumLayer):
         # emars tile: [TILE_K, BLOCK_B]
         #   inner dim (BLOCK_B): stride 1         — fully coalesced
         #   outer dim (TILE_K):  stride batch_size — strided
-        emars_ptr = element_mars + \
-            (cid_start + offs_edge)[:, None] * batch_size + \
-            offs_batch[None, :]                            # [TILE_K, BLOCK_B]
+        if BF16_PATH == 1:
+            # bf16 scratch is zero-based per block: row = k_tile*TILE_K + offs_edge.
+            emars_ptr = emars_bf16_in + \
+                offs_edge[:, None] * batch_size + offs_batch[None, :]
+        else:
+            emars_ptr = element_mars + \
+                (cid_start + offs_edge)[:, None] * batch_size + \
+                offs_batch[None, :]                         # [TILE_K, BLOCK_B]
         # Pointer into the per-tile max: element_mars_max[k_tile, batch_tile].
         emax_ptr = element_mars_max + pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
 
@@ -462,8 +521,9 @@ class DenseSumLayer(SumLayer):
 
         for _k in range(0, K_NUM_TILES):
             # epars: TILE_M rows each contiguous in memory (stride 1 along M).
-            epars = tl.load(epars_ptr)
             # emars: BLOCK_B inner dim contiguous (stride 1 along batch).
+            # On BF16_PATH both loads yield bf16 tiles directly.
+            epars = tl.load(epars_ptr)
             emars = tl.load(emars_ptr, mask = mask_batch[None, :])
 
             if propagation_alg_id == 1:
@@ -481,7 +541,10 @@ class DenseSumLayer(SumLayer):
                 emax_ptr += batch_size
 
                 if use_tl_dot == 1:
-                    if use_bf16 == 1:
+                    if BF16_PATH == 1:
+                        # Already bf16 — go straight into tl.dot.
+                        nmars = tl.dot(epars, emars).to(tl.float32)
+                    elif use_bf16 == 1:
                         epars_b = epars.to(tl.bfloat16)
                         emars_b = emars.to(tl.bfloat16)
                         nmars = tl.dot(epars_b, emars_b).to(tl.float32)
@@ -526,19 +589,28 @@ class DenseSumLayer(SumLayer):
     @staticmethod
     @triton_jit
     def _fw_triton_dense_precompute_kernel(element_mars, element_mars_max,
+                                           emars_bf16_out,
                                            batch_size: tl.constexpr,
                                            cid_start: tl.constexpr,
                                            TILE_K: tl.constexpr,
                                            K_NUM_TILES: tl.constexpr,
                                            BLOCK_B: tl.constexpr,
                                            propagation_alg_id: tl.constexpr,
+                                           BF16_PATH: tl.constexpr,
                                            alpha = 0.0):
         """
         Pre-compute per-k-tile max and ``exp(emars - tile_max)`` for a single
-        DenseSumLayer block. Overwrites ``element_mars`` in place in the range
-        ``[cid_start, cid_start + K_NUM_TILES*TILE_K)``; the maxima land in
+        DenseSumLayer block. Maxima land in
         ``element_mars_max[k_tile_id, batch_tile]``. Only called for LL /
         GeneralLL — MPE needs the raw log-space emars.
+
+        ``BF16_PATH`` routes the linearised values:
+          * 0 — overwrite ``element_mars`` in place (fp32), matching the
+            historical behaviour.
+          * 1 — write bf16 into ``emars_bf16_out`` at zero-based row
+            ``k_tile_id*TILE_K + offs_edge``; leave ``element_mars``
+            untouched so the log-space buffer stays valid for downstream
+            consumers.
 
         Grid: ``(cdiv(batch_size, BLOCK_B), K_NUM_TILES)``.
         """
@@ -575,8 +647,19 @@ class DenseSumLayer(SumLayer):
             )
             emars_max = emars_max * alpha
 
-        # Overwrite log-space emars with linear values.
-        tl.store(emars_ptr, emars_linear, mask = mask_batch[None, :])
+        if BF16_PATH == 1:
+            # Zero-based row within the dedicated bf16 scratch — independent
+            # of ``cid_start`` so blocks can share one scratch buffer.
+            offs_row_out = k_tile_id * TILE_K + offs_edge
+            out_ptr = emars_bf16_out + offs_row_out[:, None] * batch_size + \
+                offs_batch[None, :]
+            tl.store(
+                out_ptr, emars_linear.to(tl.bfloat16),
+                mask = mask_batch[None, :],
+            )
+        else:
+            # Legacy path: overwrite log-space emars with linear values.
+            tl.store(emars_ptr, emars_linear, mask = mask_batch[None, :])
 
         # Store per-tile max: element_mars_max[k_tile_id, batch_tile].
         max_ptr = element_mars_max + k_tile_id * batch_size + offs_batch
@@ -709,6 +792,10 @@ class DenseSumLayer(SumLayer):
                 mparams + edge_block_base +
                 offs_child[:, None] * BS + off_pwithin[None, :]
             )  # [TILE_N, TILE_K]
+            # Upcast to fp32: downstream ops (tl.dot against fp32 flows, log,
+            # elementwise multiplies with fp32 accumulators) assume fp32.
+            # Works transparently whether ``mparams`` is fp32 or bf16.
+            epars = epars.to(tl.float32)
 
             # [TILE_K, BLOCK_B] offset — BLOCK_B inner dim is stride 1.
             off_mb = off_mid[:, None] * batch_size + offs_batch[None, :]

@@ -4,12 +4,12 @@ Run under a profiler, e.g.:
     nsys profile -t cuda,nvtx -o dense_vs_sparse -f true \\
         pixi run -e dev python profile_dense_vs_sparse.py
 
-    ncu --set full --nvtx --nvtx-include "dense_forward/" \\
+    ncu --set full --nvtx --nvtx-include "dense_bf16_forward/" \\
         pixi run -e dev python profile_dense_vs_sparse.py
 
 NVTX ranges emitted per iteration:
-    sparse_forward / dense_forward
-    sparse_conditional / dense_conditional
+    sparse_forward / dense_forward / dense_bf16_forward
+    sparse_conditional / dense_conditional / dense_bf16_conditional
 
 Defaults target a mid-size HMM; override via argv.
 """
@@ -25,8 +25,9 @@ import pyjuice as juice
 nvtx = torch.cuda.nvtx
 
 
-def build_pair(seed: int, K: int, T: int, V: int, device: torch.device):
-    """Compile the same HMM twice with identical params."""
+def build_triplet(seed: int, K: int, T: int, V: int, device: torch.device):
+    """Compile the same HMM three times (sparse, dense-fp32, dense-bf16) with
+    identical initial params."""
     torch.manual_seed(seed)
     ns_a = juice.structures.HMM(seq_length=T, num_latents=K, num_emits=V, homogeneous=False)
     pc_sparse = juice.TensorCircuit(ns_a, use_dense_sum_layer=False, verbose=False).to(device)
@@ -35,7 +36,15 @@ def build_pair(seed: int, K: int, T: int, V: int, device: torch.device):
     ns_b = juice.structures.HMM(seq_length=T, num_latents=K, num_emits=V, homogeneous=False)
     pc_dense = juice.TensorCircuit(ns_b, use_dense_sum_layer=True, verbose=False).to(device)
     pc_dense.params.data.copy_(pc_sparse.params.data)
-    return pc_sparse, pc_dense
+
+    torch.manual_seed(seed)
+    ns_c = juice.structures.HMM(seq_length=T, num_latents=K, num_emits=V, homogeneous=False)
+    pc_dense_bf16 = juice.TensorCircuit(
+        ns_c, use_dense_sum_layer=True, verbose=False, param_dtype=torch.bfloat16,
+    ).to(device)
+    pc_dense_bf16.params.data.copy_(pc_sparse.params.data.to(torch.bfloat16))
+
+    return pc_sparse, pc_dense, pc_dense_bf16
 
 
 def run_forward(pc, data, label: str, n_warmup: int, n_iter: int):
@@ -91,20 +100,28 @@ def main():
 
     print(f"HMM K={args.K} T={args.T} V={args.V} B={args.B}  "
           f"warmup={args.warmup} iters={args.iters}")
-    pc_sparse, pc_dense = build_pair(args.seed, args.K, args.T, args.V, device)
+    pc_sparse, pc_dense, pc_dense_bf16 = build_triplet(
+        args.seed, args.K, args.T, args.V, device,
+    )
     data = torch.randint(0, args.V, (args.B, args.T), device=device)
 
     print("Forward:")
-    ms_s = run_forward(pc_sparse, data, "sparse_forward", args.warmup, args.iters)
-    ms_d = run_forward(pc_dense,  data, "dense_forward",  args.warmup, args.iters)
-    print(f"  speedup (sparse/dense): {ms_s / ms_d:.2f}x")
+    ms_s  = run_forward(pc_sparse,      data, "sparse_forward",     args.warmup, args.iters)
+    ms_d  = run_forward(pc_dense,       data, "dense_forward",      args.warmup, args.iters)
+    ms_db = run_forward(pc_dense_bf16,  data, "dense_bf16_forward", args.warmup, args.iters)
+    print(f"  speedup (sparse/dense):      {ms_s / ms_d:.2f}x")
+    print(f"  speedup (sparse/dense_bf16): {ms_s / ms_db:.2f}x")
+    print(f"  speedup (dense/dense_bf16):  {ms_d / ms_db:.2f}x")
 
     if not args.skip_conditional:
         target_vars = list(range(args.T // 2))
         print("Conditional (fwd + bwd):")
-        ms_cs = run_conditional(pc_sparse, data, target_vars, "sparse_conditional", args.warmup, args.iters)
-        ms_cd = run_conditional(pc_dense,  data, target_vars, "dense_conditional",  args.warmup, args.iters)
-        print(f"  speedup (sparse/dense): {ms_cs / ms_cd:.2f}x")
+        ms_cs  = run_conditional(pc_sparse,     data, target_vars, "sparse_conditional",     args.warmup, args.iters)
+        ms_cd  = run_conditional(pc_dense,      data, target_vars, "dense_conditional",      args.warmup, args.iters)
+        ms_cdb = run_conditional(pc_dense_bf16, data, target_vars, "dense_bf16_conditional", args.warmup, args.iters)
+        print(f"  speedup (sparse/dense):      {ms_cs / ms_cd:.2f}x")
+        print(f"  speedup (sparse/dense_bf16): {ms_cs / ms_cdb:.2f}x")
+        print(f"  speedup (dense/dense_bf16):  {ms_cd / ms_cdb:.2f}x")
 
 
 if __name__ == "__main__":
