@@ -81,11 +81,13 @@ class InputLayer(Layer, nn.Module):
             layer_num_nodes += ns.num_nodes
 
             if not ns.is_tied():
-                cum_params += ns.num_nodes * ns.dist.num_parameters()
-                ns._param_range = (cum_params - ns.num_nodes * ns.dist.num_parameters(), cum_params)
+                ns_num_params = ns.dist.num_parameters_total(ns.num_nodes)
+                cum_params += ns_num_params
+                ns._param_range = (cum_params - ns_num_params, cum_params)
 
-                cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
-                ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
+                ns_num_pflows = ns.dist.num_param_flows_total(ns.num_nodes)
+                cum_param_flows += ns_num_pflows
+                ns._param_flow_range = (cum_param_flows - ns_num_pflows, cum_param_flows)
 
                 cum_source_ns += ns.num_nodes
             else:
@@ -94,11 +96,12 @@ class InputLayer(Layer, nn.Module):
 
                 if source_ns not in node2tiednodes:
                     node2tiednodes[source_ns] = [[source_ns], 1, source_ns._param_flow_range]
-                
+
                 dup_count = node2tiednodes[source_ns][1]
                 if dup_count >= max_tied_ns_per_parflow_block:
-                    cum_param_flows += ns.num_nodes * ns.dist.num_param_flows()
-                    ns._param_flow_range = (cum_param_flows - ns.num_nodes * ns.dist.num_param_flows(), cum_param_flows)
+                    ns_num_pflows = ns.dist.num_param_flows_total(ns.num_nodes)
+                    cum_param_flows += ns_num_pflows
+                    ns._param_flow_range = (cum_param_flows - ns_num_pflows, cum_param_flows)
                     node2tiednodes[source_ns][2] = ns._param_flow_range
 
                     node2tiednodes[source_ns][0].append(ns)
@@ -174,14 +177,14 @@ class InputLayer(Layer, nn.Module):
             vids[n_start:n_end,:] = torch.tensor(node_vars[ns_id]).view(1, -1)
 
             # `s_pids` and `s_pfids`
-            if ns.dist.num_parameters() > 0:
-                pid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_parameters(), ns.dist.num_parameters())
+            if ns.dist.num_parameters_total(ns.num_nodes) > 0:
+                pid_offsets = ns.dist.compute_pid_offsets(ns.num_nodes)
                 s_pids[n_start:n_end] = ns._param_range[0] + pid_offsets
             else:
                 s_pids[n_start:n_end] = 0
 
-            if ns.dist.num_param_flows() > 0:
-                pfid_offsets = torch.arange(0, ns.num_nodes * ns.dist.num_param_flows(), ns.dist.num_param_flows())
+            if ns.dist.num_param_flows_total(ns.num_nodes) > 0:
+                pfid_offsets = ns.dist.compute_pfid_offsets(ns.num_nodes)
                 s_pfids[n_start:n_end] = ns._param_flow_range[0] + pfid_offsets
             else:
                 s_pfids[n_start:n_end] = 0
@@ -200,7 +203,7 @@ class InputLayer(Layer, nn.Module):
                 node_id2source_id[n_start:n_end] = -1 # Set to -1 as a flag
 
             # `metadata` and `s_mids`
-            s_mids[n_start:n_end] = len(metadata)
+            s_mids[n_start:n_end] = len(metadata) + ns.dist.compute_mid_offsets(ns.num_nodes)
             metadata.extend(node_metadata[ns_id])
 
             # `s_nids`
@@ -1001,7 +1004,7 @@ class InputLayer(Layer, nn.Module):
         for ns_id, ns in enumerate(self.nodes):
             # `params` (init/copy parameters)
             if not ns.is_tied():
-                p_end = p_start + ns.num_nodes * ns.dist.num_parameters()
+                p_end = p_start + ns.dist.num_parameters_total(ns.num_nodes)
                 if ns.has_params():
                     self.params[p_start:p_end] = ns._params.to(self.device)
                 else:

@@ -113,7 +113,7 @@ class InputNodes(CircuitNodes):
         :param normalize: whether to normalize the parameters
         :type normalize: bool
         """
-        assert params.numel() == self.num_nodes * self.dist.num_parameters()
+        assert params.numel() == self.dist.num_parameters_total(self.num_nodes)
 
         params = params.reshape(-1)
         if normalize:

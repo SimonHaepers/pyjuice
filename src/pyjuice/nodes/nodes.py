@@ -174,14 +174,14 @@ class CircuitNodes():
                 if ns.is_sum() and not ns.is_tied():
                     param_count += ns.num_edges
                 elif ns.is_input() and count_input_params:
-                    param_count += ns.num_nodes * ns.dist.num_parameters()
+                    param_count += ns.dist.num_parameters_total(ns.num_nodes)
 
             return param_count
         else:
             if ns.is_sum() and not ns.is_tied():
                 return ns.num_edges
             elif ns.is_input() and count_input_params:
-                return ns.num_nodes * ns.dist.num_parameters()
+                return ns.dist.num_parameters_total(ns.num_nodes)
             else:
                 return 0
 

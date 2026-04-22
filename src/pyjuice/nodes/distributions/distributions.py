@@ -55,6 +55,47 @@ class Distribution():
         """
         raise NotImplementedError()
 
+    def num_parameters_total(self, num_nodes: int) -> int:
+        """
+        Total number of parameters for a group of `num_nodes` nodes. Override when the
+        per-node parameter count is not uniform (e.g. sparse distributions). Default is
+        ``num_nodes * self.num_parameters()``.
+        """
+        return num_nodes * self.num_parameters()
+
+    def num_param_flows_total(self, num_nodes: int) -> int:
+        """
+        Total number of parameter flows for a group of `num_nodes` nodes. Default:
+        ``num_nodes * self.num_param_flows()``.
+        """
+        return num_nodes * self.num_param_flows()
+
+    def compute_pid_offsets(self, num_nodes: int) -> torch.Tensor:
+        """
+        Per-node start offsets into the group's parameter range. Default is a uniform
+        ``arange(0, num_nodes * k, k)`` with ``k = self.num_parameters()``. Override when
+        per-node parameter counts are non-uniform.
+        """
+        k = self.num_parameters()
+        return torch.arange(0, num_nodes * k, k, dtype = torch.long)
+
+    def compute_pfid_offsets(self, num_nodes: int) -> torch.Tensor:
+        """
+        Per-node start offsets into the group's parameter flow range. Default symmetric
+        to :meth:`compute_pid_offsets`.
+        """
+        k = self.num_param_flows()
+        return torch.arange(0, num_nodes * k, k, dtype = torch.long)
+
+    def compute_mid_offsets(self, num_nodes: int) -> torch.Tensor:
+        """
+        Per-node start offsets into the group's metadata slice. Default returns zeros
+        (all nodes in the group read metadata from the same start). Override when each
+        node needs its own metadata slice (e.g. sparse distributions with per-row column
+        index lists).
+        """
+        return torch.zeros(num_nodes, dtype = torch.long)
+
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Randomly initialize node parameters.
