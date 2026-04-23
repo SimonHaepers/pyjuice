@@ -123,6 +123,15 @@ class InputLayer(Layer, nn.Module):
         self.sample_fn = self.nodes[0].dist.get_sample_fn()
         self.em_fn = self.nodes[0].dist.get_em_fn()
 
+        # Dispatch flags for distributions that implement their own per-layer kernels
+        # (e.g. CSC-native SparseCategorical). When a flag is True, `InputLayer` delegates
+        # the corresponding pass to `dist.custom_*` instead of launching a template kernel.
+        dist0 = self.nodes[0].dist
+        self._has_custom_forward = dist0.has_custom_forward()
+        self._has_custom_backward = dist0.has_custom_backward()
+        self._has_custom_em = dist0.has_custom_em()
+        self._has_custom_partition = dist0.has_custom_partition()
+
         try:
             self.post_fw_fns = self.nodes[0].dist.post_fw_fns
         except AttributeError:
@@ -264,6 +273,10 @@ class InputLayer(Layer, nn.Module):
         for i in range(len(self.tied2source_nids)):
             self.tied2source_nids[i][2] = self.tied2source_nids[i][2].to(device)
 
+        # Move any distribution-owned tensors (e.g. sparse-pattern buffers)
+        for ns in self.nodes:
+            ns.dist.move_to_device(device)
+
         self.device = device
 
     def init_param_flows(self, flows_memory: float = 1.0):
@@ -310,38 +323,45 @@ class InputLayer(Layer, nn.Module):
                 layer_num_nodes = self.fw_local_ids.size(0)
                 fw_local_ids = self.fw_local_ids
 
-            if not self.provided("_mars_kernel"):
-                if self.fw_mar_fn is not None:
-                    self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
-                else:
-                    self._mars_kernel = None
+            if self._has_custom_forward and not _apply_missing_mask_only:
+                self.nodes[0].dist.custom_forward(
+                    self, params, node_mars, data, batch_size,
+                    fw_local_ids = fw_local_ids,
+                )
+                # Post-forward hooks + missing-mask handling fall through below.
+            else:
+                if not self.provided("_mars_kernel"):
+                    if self.fw_mar_fn is not None:
+                        self._mars_kernel = self._compile_triton_kernel(self._mars_kernel_template, mar_fn = self.fw_mar_fn)
+                    else:
+                        self._mars_kernel = None
 
             BLOCK_SIZE = 1024
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if not _apply_missing_mask_only:
+            if _apply_missing_mask_only:
+                assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
+            elif not self._has_custom_forward:
                 if self._mars_kernel is not None:
                     self._mars_kernel[grid](
-                        params_ptr = self.params, 
-                        node_mars_ptr = node_mars, 
-                        data_ptr = data, 
-                        vids_ptr = self.vids, 
-                        s_pids_ptr = self.s_pids, 
-                        metadata_ptr = self.metadata, 
-                        s_mids_ptr = self.s_mids, 
+                        params_ptr = self.params,
+                        node_mars_ptr = node_mars,
+                        data_ptr = data,
+                        vids_ptr = self.vids,
+                        s_pids_ptr = self.s_pids,
+                        metadata_ptr = self.metadata,
+                        s_mids_ptr = self.s_mids,
                         fw_local_ids_ptr = fw_local_ids,
-                        layer_num_nodes = layer_num_nodes, 
-                        batch_size = batch_size, 
-                        num_vars_per_node = self.num_vars_per_node, 
+                        layer_num_nodes = layer_num_nodes,
+                        batch_size = batch_size,
+                        num_vars_per_node = self.num_vars_per_node,
                         nv_block_size = triton.next_power_of_2(self.num_vars_per_node),
-                        node_offset = node_offset, 
-                        BLOCK_SIZE = BLOCK_SIZE, 
+                        node_offset = node_offset,
+                        BLOCK_SIZE = BLOCK_SIZE,
                         partial_eval = 1 if fw_local_ids is not None else 0,
                         num_warps = 8
                     )
-            else:
-                assert missing_mask is not None, "`missing_mask` should be provided when `_apply_missing_mask_only = True`."
 
             # Apply post-processing kernels
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_fw_fns:
@@ -453,18 +473,24 @@ class InputLayer(Layer, nn.Module):
                     missing_mask_mode = 3
                     num_vars = missing_mask.size(0)
 
-            if not self.provided("_flows_kernel"):
-                if self.bk_flow_fn is not None:
-                    self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
-                else:
-                    self._flows_kernel = None
+            if self._has_custom_backward:
+                self.nodes[0].dist.custom_backward(
+                    self, params, self.param_flows, node_flows, node_mars,
+                    data, batch_size, logspace_flows = logspace_flows,
+                )
+            else:
+                if not self.provided("_flows_kernel"):
+                    if self.bk_flow_fn is not None:
+                        self._flows_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_fn)
+                    else:
+                        self._flows_kernel = None
 
             BLOCK_SIZE = 1024
             TILE_SIZE_K = 1
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if self._flows_kernel is not None:
+            if not self._has_custom_backward and self._flows_kernel is not None:
                 self._flows_kernel[grid](
                     params_ptr = self.params,
                     param_flows_ptr = self.param_flows,
@@ -694,34 +720,41 @@ class InputLayer(Layer, nn.Module):
                             raise NotImplementedError("Unsupported number of coalesced parameter flows.")
 
 
-                    layer_num_source_nodes = self.source_nids.size(0)
-
-                    if not self.provided("_em_kernel"):
-                        self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
-
-                    constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
-
-                    if hasattr(self.nodes[0].dist, "em_block_size"):
-                        BLOCK_SIZE = self.nodes[0].dist.em_block_size
+                    if self._has_custom_em:
+                        self.nodes[0].dist.custom_em(
+                            self, step_size = step_size,
+                            pseudocount = pseudocount,
+                            keep_zero_params = keep_zero_params,
+                        )
                     else:
-                        BLOCK_SIZE = 1024
+                        layer_num_source_nodes = self.source_nids.size(0)
 
-                    grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
+                        if not self.provided("_em_kernel"):
+                            self._em_kernel = self._compile_triton_kernel(self._em_kernel_template, em_fn = self.em_fn)
 
-                    self._em_kernel[grid](
-                        params_ptr = self.params,
-                        param_flows_ptr = self.param_flows,
-                        s_pids_ptr = self.s_pids,
-                        s_pfids_ptr = self.s_pfids,
-                        metadata_ptr = self.metadata,
-                        s_mids_ptr = self.s_mids,
-                        source_nids_ptr = self.source_nids,
-                        constexprs_ptr = constexprs,
-                        layer_num_source_nodes = layer_num_source_nodes,
-                        keep_zero_params = keep_zero_params,
-                        BLOCK_SIZE = BLOCK_SIZE,
-                        num_warps = 8
-                    )
+                        constexprs = torch.tensor([step_size, pseudocount], dtype = torch.float32, device = self.device)
+
+                        if hasattr(self.nodes[0].dist, "em_block_size"):
+                            BLOCK_SIZE = self.nodes[0].dist.em_block_size
+                        else:
+                            BLOCK_SIZE = 1024
+
+                        grid = (triton.cdiv(layer_num_source_nodes, BLOCK_SIZE),)
+
+                        self._em_kernel[grid](
+                            params_ptr = self.params,
+                            param_flows_ptr = self.param_flows,
+                            s_pids_ptr = self.s_pids,
+                            s_pfids_ptr = self.s_pfids,
+                            metadata_ptr = self.metadata,
+                            s_mids_ptr = self.s_mids,
+                            source_nids_ptr = self.source_nids,
+                            constexprs_ptr = constexprs,
+                            layer_num_source_nodes = layer_num_source_nodes,
+                            keep_zero_params = keep_zero_params,
+                            BLOCK_SIZE = BLOCK_SIZE,
+                            num_warps = 8
+                        )
 
                 else:
                     raise NotImplementedError("CPU minibatch em fn for input nodes is not implemented.")
@@ -742,6 +775,10 @@ class InputLayer(Layer, nn.Module):
         if "cuda" in self.device.type:
             node_offset = self._output_ind_range[0]
             layer_num_nodes = self._output_ind_range[1] - self._output_ind_range[0]
+
+            if self._has_custom_partition:
+                self.nodes[0].dist.custom_partition(self, node_mars)
+                return
 
             if not self.provided("_partition_fn_kernel"):
                 self._partition_fn_kernel = self._compile_triton_kernel(self._partition_fn_kernel_template, partition_fn = self.fw_partition_fn)

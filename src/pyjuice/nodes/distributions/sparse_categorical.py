@@ -9,30 +9,32 @@ from typing import Optional, Any
 from .distributions import Distribution
 
 
-LOG_EPS = -23.0258509299  # log(1e-10), matches MaskedCategorical convention
+LOG_EPS = -23.0258509299  # log(1e-10), used for (row, col) positions outside the sparsity pattern
 
 
 class SparseCategorical(Distribution):
     """
-    A categorical distribution over `num_cats` values whose emission matrix of shape
-    `[num_nodes, num_cats]` is sparse and stored in CSC (Compressed Sparse Column) form.
+    Sparse categorical distribution. The ``num_nodes x num_cats`` emission matrix is
+    stored in CSC (Compressed Sparse Column) form:
 
-    The sparsity pattern is a meta-parameter: it must be provided at construction time via
-    :meth:`pyjuice.nodes.InputNodes.set_meta_params` (or passed through
-    :func:`pyjuice.inputs` kwargs) and is fixed for the lifetime of the node. The
-    probability values at the nonzero positions are the learnable parameters.
+      * ``csc_indptr``  [num_cats + 1] — column pointers
+      * ``csc_indices`` [nnz]          — row ids (latent ids) per CSC entry
+      * ``csc_values``  [nnz]          — probabilities at those positions (learnable)
 
-    User-facing CSC shape: ``[num_nodes, num_cats]``. ``csc_indptr`` has length
-    ``num_cats + 1``; ``csc_indices`` has length ``nnz`` and holds row ids (node ids).
+    All kernels are CSC-native: forward and backward are per-(batch, column-slot)
+    scatter/gather kernels that load the active column in one contiguous range and write
+    log-probs or accumulate flows into exactly the latents that are active for the
+    observed token. EM and partition use per-slot kernels with atomic row reductions.
+    Positions outside the sparsity pattern are treated as probability ~``1e-10``
+    (``LOG_EPS`` in log-space), matching the convention used by ``MaskedCategorical``.
 
-    Internally, values are stored in row-major order (latents contiguous) so each
-    per-node Triton thread loads its row with contiguous accesses. A permutation from
-    the user's CSC order to this internal row-major order is cached so that callers can
-    convert CSC-ordered values via :meth:`csc_values_to_row_major`.
+    The sparsity pattern is a meta-parameter: pass ``csc_indptr`` and ``csc_indices``
+    through :func:`pyjuice.inputs` kwargs (or :meth:`InputNodes.set_meta_params`). Then
+    provide the nonzero probabilities via :meth:`InputNodes.set_params` — values must be
+    in CSC order, matching your supplied ``csc_indices``.
 
-    Forward/backward/EM/sample kernels treat positions outside the sparsity pattern as
-    if they had probability ``1e-10`` (``LOG_EPS`` in log-space) — they are not updated
-    by EM.
+    Sampling is not supported in this iteration (``sample_fn`` raises
+    ``NotImplementedError``).
     """
 
     def __init__(self, num_cats: int):
@@ -41,14 +43,11 @@ class SparseCategorical(Distribution):
         self.num_cats = num_cats
 
         # Populated by set_meta_parameters
-        self._num_nodes = None
-        self._nnz = None
-        self._row_ptr = None           # [H+1] long, cumsum0 of nnz_per_row
-        self._col_ids_row_major = None # [nnz] long, column ids in row-major order (sorted per row)
-        self._csc_to_row_perm = None   # [nnz] long, permutation from CSC order to row-major
-        self._metadata_list = None     # flat list for InputLayer: [k_0, col_0_0, ..., k_1, col_1_0, ...]
-        self._mid_offsets = None       # [H] long, per-node offsets into the group metadata slice
-        self._pid_offsets = None       # [H] long, per-node offsets into the group params slice
+        self._num_nodes = None       # H
+        self._nnz = None             # total nonzeros in the CSC matrix
+        self._csc_indptr = None      # [V+1] long, on dist's "home" device (CPU initially)
+        self._csc_indices = None     # [nnz] long
+        self._max_nnz_per_col = None # max over columns of (indptr[v+1] - indptr[v])
 
     def get_signature(self):
         return "SparseCategorical"
@@ -60,22 +59,21 @@ class SparseCategorical(Distribution):
     def set_meta_parameters(self, num_nodes: int, csc_indptr: torch.Tensor,
                             csc_indices: torch.Tensor, **kwargs):
         """
-        Attach the CSC sparsity pattern of the `num_nodes x num_cats` emission matrix.
+        Attach the CSC sparsity pattern of the ``num_nodes x num_cats`` emission matrix.
 
-        :param num_nodes: number of rows (latent nodes) — must equal ``InputNodes.num_nodes``.
-        :param csc_indptr: long tensor of shape ``[num_cats + 1]``; column pointers.
-        :param csc_indices: long tensor of shape ``[nnz]``; row indices.
-        :returns: a zero-initialized flat tensor of shape ``[nnz]`` (the storage for
-                  learnable values, in row-major order). Users should then provide the
-                  actual values via :meth:`pyjuice.nodes.InputNodes.set_params` either
-                  in row-major order or after converting via
-                  :meth:`csc_values_to_row_major`.
+        :param num_nodes: number of latent rows (H).
+        :param csc_indptr: long tensor of shape ``[num_cats + 1]``, column pointers.
+        :param csc_indices: long tensor of shape ``[nnz]``, row ids.
+        :returns: a zero-initialized ``[nnz]`` flat tensor that becomes the initial
+                  ``_params`` of the :class:`InputNodes` (to be overwritten by
+                  :meth:`InputNodes.set_params` with the actual probabilities, in CSC
+                  order).
         """
         V = self.num_cats
         H = num_nodes
 
-        csc_indptr = torch.as_tensor(csc_indptr, dtype = torch.long)
-        csc_indices = torch.as_tensor(csc_indices, dtype = torch.long)
+        csc_indptr = torch.as_tensor(csc_indptr, dtype = torch.long).contiguous()
+        csc_indices = torch.as_tensor(csc_indices, dtype = torch.long).contiguous()
         assert csc_indptr.dim() == 1 and csc_indptr.numel() == V + 1, \
             f"csc_indptr must have shape [num_cats + 1] = [{V + 1}], got {tuple(csc_indptr.shape)}."
         assert csc_indptr[0].item() == 0, "csc_indptr[0] must be 0."
@@ -86,72 +84,26 @@ class SparseCategorical(Distribution):
             assert csc_indices.min().item() >= 0 and csc_indices.max().item() < H, \
                 "csc_indices contains row ids outside [0, num_nodes)."
 
-        # Expand CSC to COO
-        col_counts = torch.diff(csc_indptr)  # [V]
-        col_ids_coo = torch.repeat_interleave(torch.arange(V, dtype = torch.long), col_counts)  # [nnz]
-        row_ids_coo = csc_indices  # [nnz]
+        col_counts = torch.diff(csc_indptr)
+        max_nnz_per_col = int(col_counts.max().item()) if V > 0 else 0
 
-        # Stable sort by (row, col) → row-major order with cols sorted within each row
-        sort_key = row_ids_coo * V + col_ids_coo
-        perm = torch.argsort(sort_key, stable = True)
-        col_ids_row = col_ids_coo[perm]
-        row_ids_row = row_ids_coo[perm]
-
-        # Per-row structure
-        nnz_per_row = torch.bincount(row_ids_row, minlength = H)          # [H]
-        row_ptr = torch.cat([torch.zeros(1, dtype = torch.long), nnz_per_row.cumsum(0)])  # [H+1]
-
-        # Per-node offsets
-        pid_offsets = row_ptr[:-1].clone()                                # [H]
-        # Metadata layout per row: [k_n, col_0, ..., col_{k_n-1}] → size (1 + k_n)
-        row_meta_sizes = nnz_per_row + 1                                  # [H]
-        mid_offsets = torch.cat([torch.zeros(1, dtype = torch.long),
-                                 row_meta_sizes.cumsum(0)])[:-1]          # [H]
-
-        # Flat metadata list for InputLayer
-        metadata_list = []
-        for h in range(H):
-            k_h = int(nnz_per_row[h].item())
-            metadata_list.append(float(k_h))
-            if k_h > 0:
-                rs = int(row_ptr[h].item())
-                re = int(row_ptr[h + 1].item())
-                metadata_list.extend(col_ids_row[rs:re].tolist())
-
-        # Cache everything
         self._num_nodes = H
         self._nnz = nnz
-        self._row_ptr = row_ptr
-        self._col_ids_row_major = col_ids_row.contiguous()
-        self._csc_to_row_perm = perm.contiguous()
-        self._metadata_list = metadata_list
-        self._mid_offsets = mid_offsets.contiguous()
-        self._pid_offsets = pid_offsets.contiguous()
+        self._csc_indptr = csc_indptr
+        self._csc_indices = csc_indices
+        self._max_nnz_per_col = max(max_nnz_per_col, 1)  # >= 1 to keep Triton tiles non-degenerate
 
-        # Return zero-initialized values (row-major)
         return torch.zeros(max(nnz, 1), dtype = torch.float32)
 
-    def csc_values_to_row_major(self, csc_values: torch.Tensor) -> torch.Tensor:
-        """Permute a CSC-ordered value tensor to the internal row-major order."""
-        assert self._csc_to_row_perm is not None, "Sparsity pattern not set."
-        assert csc_values.numel() == self._nnz
-        return csc_values.reshape(-1)[self._csc_to_row_perm]
-
-    def row_major_to_csc_values(self, row_values: torch.Tensor) -> torch.Tensor:
-        """Inverse of :meth:`csc_values_to_row_major`."""
-        assert self._csc_to_row_perm is not None, "Sparsity pattern not set."
-        assert row_values.numel() == self._nnz
-        out = torch.empty_like(row_values.reshape(-1))
-        out[self._csc_to_row_perm] = row_values.reshape(-1)
-        return out
+    # --- Distribution protocol ----------------------------------------
 
     def get_metadata(self):
-        assert self._metadata_list is not None, "Sparsity pattern not set."
-        return list(self._metadata_list)
+        # All CSC state lives on `self`, not in the layer's metadata buffer.
+        return []
 
     def num_parameters(self):
-        # Per-node parameter count is not well defined for variable sparsity; the
-        # InputLayer routes through num_parameters_total / compute_pid_offsets instead.
+        # Per-node parameter count isn't meaningful for variable-nnz CSC; InputLayer
+        # routes through num_parameters_total and the compute_*_offsets hooks.
         return 1
 
     def num_param_flows(self):
@@ -166,34 +118,29 @@ class SparseCategorical(Distribution):
         return self.num_parameters_total(num_nodes)
 
     def compute_pid_offsets(self, num_nodes: int) -> torch.Tensor:
-        assert self._pid_offsets is not None, "Sparsity pattern not set."
-        assert num_nodes == self._num_nodes
-        return self._pid_offsets.clone()
+        # All latents in a group share the same CSC base (the group's _param_range[0]).
+        # Per-latent s_pids are unused by the custom kernels, but we set them to 0 so
+        # downstream code that still loads s_pids_ptr gets a consistent value.
+        return torch.zeros(num_nodes, dtype = torch.long)
 
     def compute_pfid_offsets(self, num_nodes: int) -> torch.Tensor:
-        return self.compute_pid_offsets(num_nodes)
+        return torch.zeros(num_nodes, dtype = torch.long)
 
     def compute_mid_offsets(self, num_nodes: int) -> torch.Tensor:
-        assert self._mid_offsets is not None, "Sparsity pattern not set."
-        assert num_nodes == self._num_nodes
-        return self._mid_offsets.clone()
+        return torch.zeros(num_nodes, dtype = torch.long)
 
     def normalize_parameters(self, params: torch.Tensor):
-        """Row-wise normalize values so each latent's active probabilities sum to 1."""
-        assert self._row_ptr is not None, "Sparsity pattern not set."
+        """Row-wise normalize values (in CSC order) so each latent's active probabilities sum to 1."""
+        assert self._csc_indices is not None, "Sparsity pattern not set."
         params = params.reshape(-1).clone()
-        row_ptr = self._row_ptr
+        if self._nnz == 0:
+            return params
+        row_ids = self._csc_indices
         H = self._num_nodes
-        for h in range(H):
-            rs = int(row_ptr[h].item())
-            re = int(row_ptr[h + 1].item())
-            if re > rs:
-                s = params[rs:re].sum()
-                if s > 0:
-                    params[rs:re] = params[rs:re] / s
-                else:
-                    params[rs:re] = 1.0 / (re - rs)
-        return params
+        row_sums = torch.zeros(H, dtype = params.dtype)
+        row_sums.scatter_add_(0, row_ids, params)
+        row_sums = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
+        return params / row_sums[row_ids]
 
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0,
                         params: Optional[torch.Tensor] = None, **kwargs):
@@ -203,7 +150,9 @@ class SparseCategorical(Distribution):
             assert isinstance(params, torch.Tensor)
             assert params.numel() == max(self._nnz, 1)
             return params.reshape(-1)
-        vals = torch.exp(torch.rand(max(self._nnz, 1), dtype = torch.float32) * -perturbation)
+        if self._nnz == 0:
+            return torch.zeros(1, dtype = torch.float32)
+        vals = torch.exp(torch.rand(self._nnz, dtype = torch.float32) * -perturbation)
         return self.normalize_parameters(vals)
 
     def get_data_dtype(self):
@@ -215,119 +164,346 @@ class SparseCategorical(Distribution):
     def _need_2nd_kernel_dim(self):
         return True
 
-    # -----------------------------------------------------------------
-    # Triton kernels
-    # -----------------------------------------------------------------
+    def move_to_device(self, device):
+        if self._csc_indptr is not None:
+            self._csc_indptr = self._csc_indptr.to(device)
+            self._csc_indices = self._csc_indices.to(device)
+
+    # --- Unused template kernels (required to not compile the default path) ---
 
     @staticmethod
-    def fw_mar_fn(local_offsets, data, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask,
-                  num_vars_per_node, BLOCK_SIZE):
-        # Load row header: k_n = number of nonzeros in this row.
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        k_n = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
-
-        max_k = tl.max(k_n, axis = 0)
-
-        LOG_EPS_VAL = -23.0258509299
-        log_probs = tl.zeros([BLOCK_SIZE], dtype = tl.float32) + LOG_EPS_VAL
-
-        # Linear scan over row-n's column ids, looking for a match with `data`.
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            col_id = tl.load(metadata_ptr + s_mids + 1 + i, mask = slot_mask, other = 0).to(tl.int64)
-            hit_mask = slot_mask & (col_id == data)
-            val = tl.load(params_ptr + s_pids + i, mask = hit_mask, other = 0)
-            log_probs = tl.where(hit_mask, tl.log(val), log_probs)
-
-        return log_probs
+    def fw_mar_fn(*args, **kwargs):
+        raise NotImplementedError("SparseCategorical uses a custom forward kernel.")
 
     @staticmethod
-    def bk_flow_fn(local_offsets, ns_offsets, data, flows, node_mars_ptr, params_ptr,
-                   param_flows_ptr, s_pids, s_pfids, metadata_ptr, s_mids_ptr, mask,
-                   num_vars_per_node, BLOCK_SIZE):
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        k_n = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
-
-        max_k = tl.max(k_n, axis = 0)
-
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            col_id = tl.load(metadata_ptr + s_mids + 1 + i, mask = slot_mask, other = 0).to(tl.int64)
-            hit_mask = slot_mask & (col_id == data)
-            tl.atomic_add(param_flows_ptr + s_pfids + i, flows, mask = hit_mask)
+    def bk_flow_fn(*args, **kwargs):
+        raise NotImplementedError("SparseCategorical uses a custom backward kernel.")
 
     @staticmethod
-    def sample_fn(samples_ptr, local_offsets, batch_offsets, vids, s_pids, params_ptr,
-                  metadata_ptr, s_mids_ptr, mask, batch_size, BLOCK_SIZE, seed):
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        k_n = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
-
-        max_k = tl.max(k_n, axis = 0)
-
-        rnd_val = tl.rand(seed, tl.arange(0, BLOCK_SIZE))
-        sampled_col = tl.zeros([BLOCK_SIZE], dtype = tl.int64) - 1
-        cum_param = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
-
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            val = tl.load(params_ptr + s_pids + i, mask = slot_mask, other = 0)
-            cum_param += val
-            col_id = tl.load(metadata_ptr + s_mids + 1 + i, mask = slot_mask, other = 0).to(tl.int64)
-            pick = slot_mask & (cum_param >= rnd_val) & (sampled_col == -1)
-            sampled_col = tl.where(pick, col_id, sampled_col)
-
-        sampled_col = tl.where(sampled_col == -1, 0, sampled_col)
-
-        sample_offsets = vids * batch_size + batch_offsets
-        tl.store(samples_ptr + sample_offsets, sampled_col, mask = mask)
+    def em_fn(*args, **kwargs):
+        raise NotImplementedError("SparseCategorical uses a custom EM kernel.")
 
     @staticmethod
-    def em_fn(local_offsets, params_ptr, param_flows_ptr, s_pids, s_pfids, metadata_ptr,
-              s_mids_ptr, mask, step_size, pseudocount, BLOCK_SIZE):
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        k_n = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+    def partition_fn(*args, **kwargs):
+        raise NotImplementedError("SparseCategorical uses a custom partition kernel.")
 
-        max_k = tl.max(k_n, axis = 0)
+    # --- Custom dispatch flags ----------------------------------------
 
-        # Pass 1: cumulate flows within each row.
-        cum_flow = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            flow = tl.load(param_flows_ptr + s_pfids + i, mask = slot_mask, other = 0)
-            if keep_zero_params:
-                param = tl.load(params_ptr + s_pids + i, mask = slot_mask, other = 0)
-                k_n_f = k_n.to(tl.float32)
-                cum_flow += tl.where(param < 1e-12, 0.0, flow + pseudocount / k_n_f)
-            else:
-                cum_flow += flow
+    def has_custom_forward(self) -> bool:
+        return True
 
-        cum_flow += pseudocount
+    def has_custom_backward(self) -> bool:
+        return True
 
-        # Pass 2: update parameters (row-wise normalization).
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            param = tl.load(params_ptr + s_pids + i, mask = slot_mask, other = 0)
-            flow = tl.load(param_flows_ptr + s_pfids + i, mask = slot_mask, other = 0)
-            k_n_f = k_n.to(tl.float32)
-            if keep_zero_params:
-                new_param = (1.0 - step_size) * param + step_size * (flow + pseudocount / k_n_f) / (cum_flow - pseudocount)
-                new_param = tl.where(param < 1e-12, 0.0, new_param)
-            else:
-                new_param = (1.0 - step_size) * param + step_size * (flow + pseudocount / k_n_f) / cum_flow
-            tl.store(params_ptr + s_pids + i, new_param, mask = slot_mask)
+    def has_custom_em(self) -> bool:
+        return True
 
-    @staticmethod
-    def partition_fn(local_offsets, params_ptr, s_pids, metadata_ptr, s_mids_ptr, mask,
-                     BLOCK_SIZE, TILE_SIZE_K):
-        s_mids = tl.load(s_mids_ptr + local_offsets, mask = mask, other = 0)
-        k_n = tl.load(metadata_ptr + s_mids, mask = mask, other = 0).to(tl.int64)
+    def has_custom_partition(self) -> bool:
+        return True
 
-        max_k = tl.max(k_n, axis = 0)
+    # --- Custom kernel implementations --------------------------------
 
-        partial = tl.zeros([BLOCK_SIZE], dtype = tl.float32)
-        for i in range(max_k):
-            slot_mask = mask & (i < k_n)
-            val = tl.load(params_ptr + s_pids + i, mask = slot_mask, other = 0)
-            partial += val
+    def custom_forward(self, layer, params, node_mars, data, batch_size,
+                       fw_local_ids = None):
+        """Pre-fill this layer's output rows with LOG_EPS, then column-scatter per group."""
+        assert fw_local_ids is None, "SparseCategorical does not support partial_eval yet."
+        sid, eid = layer._output_ind_range
+        node_mars[sid:eid].fill_(LOG_EPS)
 
-        return tl.log(partial)
+        BLOCK_B = 64
+        BLOCK_K = max(triton.next_power_of_2(self._max_nnz_per_col), 4)
+
+        for ns in layer.nodes:
+            dist = ns.dist
+            assert isinstance(dist, SparseCategorical)
+            if dist._nnz == 0:
+                continue
+            var_id = ns.scope.to_list()[0]
+            node_offset = ns._output_ind_range[0]
+            param_base = ns._param_range[0]
+
+            grid = (triton.cdiv(batch_size, BLOCK_B),
+                    triton.cdiv(dist._max_nnz_per_col, BLOCK_K))
+
+            _sparse_cat_forward_kernel[grid](
+                data_ptr = data,
+                node_mars_ptr = node_mars,
+                params_ptr = params,
+                csc_indptr_ptr = dist._csc_indptr,
+                csc_indices_ptr = dist._csc_indices,
+                var_id = var_id,
+                node_offset = node_offset,
+                param_base = param_base,
+                batch_size = batch_size,
+                BLOCK_B = BLOCK_B,
+                BLOCK_K = BLOCK_K,
+            )
+
+    def custom_backward(self, layer, params, param_flows, node_flows, node_mars,
+                        data, batch_size, logspace_flows: bool = False):
+        BLOCK_B = 64
+        BLOCK_K = max(triton.next_power_of_2(self._max_nnz_per_col), 4)
+
+        for ns in layer.nodes:
+            dist = ns.dist
+            if dist._nnz == 0:
+                continue
+            var_id = ns.scope.to_list()[0]
+            node_offset = ns._output_ind_range[0]
+            # Flows accumulate into the param-flow range. For tied nodes, this range
+            # points to their own accumulator (later reduced into the source's range by
+            # `_pflow_accum_kernel`).
+            pflow_base = ns._param_flow_range[0]
+
+            grid = (triton.cdiv(batch_size, BLOCK_B),
+                    triton.cdiv(dist._max_nnz_per_col, BLOCK_K))
+
+            _sparse_cat_backward_kernel[grid](
+                data_ptr = data,
+                node_flows_ptr = node_flows,
+                param_flows_ptr = param_flows,
+                csc_indptr_ptr = dist._csc_indptr,
+                csc_indices_ptr = dist._csc_indices,
+                var_id = var_id,
+                node_offset = node_offset,
+                pflow_base = pflow_base,
+                batch_size = batch_size,
+                logspace_flows = 1 if logspace_flows else 0,
+                BLOCK_B = BLOCK_B,
+                BLOCK_K = BLOCK_K,
+            )
+
+    def custom_em(self, layer, step_size: float, pseudocount: float,
+                  keep_zero_params: bool = True):
+        # One EM pass per source InputNodes group (tied duplicates share the source's
+        # param range, and their flows were already accumulated into the source's
+        # parflow range by `_pflow_accum_kernel` before this call).
+        for ns in layer.nodes:
+            if ns.is_tied():
+                continue
+            dist = ns.dist
+            if dist._nnz == 0:
+                continue
+            param_base = ns._param_range[0]
+            pflow_base = ns._param_flow_range[0]
+            H = dist._num_nodes
+            nnz = dist._nnz
+
+            row_sums = torch.zeros(H, dtype = torch.float32, device = layer.device)
+
+            BLOCK = 1024
+            grid = (triton.cdiv(nnz, BLOCK),)
+
+            _sparse_cat_em_row_sum_kernel[grid](
+                params_ptr = layer.params,
+                param_flows_ptr = layer.param_flows,
+                csc_indices_ptr = dist._csc_indices,
+                row_sums_ptr = row_sums,
+                param_base = param_base,
+                pflow_base = pflow_base,
+                nnz = nnz,
+                pseudocount = pseudocount,
+                keep_zero_params = 1 if keep_zero_params else 0,
+                BLOCK = BLOCK,
+            )
+
+            _sparse_cat_em_update_kernel[grid](
+                params_ptr = layer.params,
+                param_flows_ptr = layer.param_flows,
+                csc_indices_ptr = dist._csc_indices,
+                row_sums_ptr = row_sums,
+                param_base = param_base,
+                pflow_base = pflow_base,
+                nnz = nnz,
+                step_size = step_size,
+                pseudocount = pseudocount,
+                keep_zero_params = 1 if keep_zero_params else 0,
+                BLOCK = BLOCK,
+            )
+
+    def custom_partition(self, layer, node_mars):
+        sid, eid = layer._output_ind_range
+        # Per-latent partition = log(sum of row values). Compute via atomic row sums.
+        for ns in layer.nodes:
+            dist = ns.dist
+            if dist._nnz == 0:
+                node_mars[ns._output_ind_range[0]:ns._output_ind_range[1]] = LOG_EPS
+                continue
+            param_base = ns._param_range[0]
+            node_offset = ns._output_ind_range[0]
+            H = dist._num_nodes
+            nnz = dist._nnz
+
+            row_sums = torch.zeros(H, dtype = torch.float32, device = layer.device)
+
+            BLOCK = 1024
+            grid_nnz = (triton.cdiv(nnz, BLOCK),)
+            _sparse_cat_partition_accum_kernel[grid_nnz](
+                params_ptr = layer.params,
+                csc_indices_ptr = dist._csc_indices,
+                row_sums_ptr = row_sums,
+                param_base = param_base,
+                nnz = nnz,
+                BLOCK = BLOCK,
+            )
+
+            grid_h = (triton.cdiv(H, BLOCK),)
+            _sparse_cat_partition_write_kernel[grid_h](
+                node_mars_ptr = node_mars,
+                row_sums_ptr = row_sums,
+                node_offset = node_offset,
+                H = H,
+                BLOCK = BLOCK,
+            )
+
+
+# =====================================================================
+# Triton kernels (module-level so @triton.jit can find them)
+# =====================================================================
+
+
+@triton.jit
+def _sparse_cat_forward_kernel(
+    data_ptr, node_mars_ptr, params_ptr,
+    csc_indptr_ptr, csc_indices_ptr,
+    var_id, node_offset, param_base,
+    batch_size,
+    BLOCK_B: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_b = offs_b < batch_size
+
+    # Observed category per batch item.
+    v = tl.load(data_ptr + var_id * batch_size + offs_b, mask = mask_b, other = 0)
+    col_start = tl.load(csc_indptr_ptr + v, mask = mask_b, other = 0)
+    col_end = tl.load(csc_indptr_ptr + v + 1, mask = mask_b, other = 0)
+    k_v = col_end - col_start
+
+    slot_mask = mask_b[:, None] & (offs_k[None, :] < k_v[:, None])
+    slot_idx = col_start[:, None] + offs_k[None, :]
+    row_id = tl.load(csc_indices_ptr + slot_idx, mask = slot_mask, other = 0)
+    val = tl.load(params_ptr + param_base + slot_idx, mask = slot_mask, other = 1.0)
+    log_val = tl.log(val)
+
+    mars_offs = (node_offset + row_id) * batch_size + offs_b[:, None]
+    tl.store(node_mars_ptr + mars_offs, log_val, mask = slot_mask)
+
+
+@triton.jit
+def _sparse_cat_backward_kernel(
+    data_ptr, node_flows_ptr, param_flows_ptr,
+    csc_indptr_ptr, csc_indices_ptr,
+    var_id, node_offset, pflow_base,
+    batch_size,
+    logspace_flows: tl.constexpr,
+    BLOCK_B: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    pid_b = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_b = offs_b < batch_size
+
+    v = tl.load(data_ptr + var_id * batch_size + offs_b, mask = mask_b, other = 0)
+    col_start = tl.load(csc_indptr_ptr + v, mask = mask_b, other = 0)
+    col_end = tl.load(csc_indptr_ptr + v + 1, mask = mask_b, other = 0)
+    k_v = col_end - col_start
+
+    slot_mask = mask_b[:, None] & (offs_k[None, :] < k_v[:, None])
+    slot_idx = col_start[:, None] + offs_k[None, :]
+    row_id = tl.load(csc_indices_ptr + slot_idx, mask = slot_mask, other = 0)
+
+    flow_offs = (node_offset + row_id) * batch_size + offs_b[:, None]
+    flow = tl.load(node_flows_ptr + flow_offs, mask = slot_mask, other = 0)
+    if logspace_flows:
+        flow = tl.exp(flow)
+
+    tl.atomic_add(param_flows_ptr + pflow_base + slot_idx, flow, mask = slot_mask)
+
+
+@triton.jit
+def _sparse_cat_em_row_sum_kernel(
+    params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
+    param_base, pflow_base, nnz,
+    pseudocount,
+    keep_zero_params: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Pass 1 of EM: per CSC slot, atomically add (flow + pseudocount) to its row's
+    # accumulator. This way row_sums[n] = sum over n's active slots of
+    # (flow + pseudocount), which equals the denominator used by the update kernel —
+    # so the updated row normalizes back to 1 exactly.
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+
+    flow = tl.load(param_flows_ptr + pflow_base + offs, mask = mask, other = 0.0)
+    row_id = tl.load(csc_indices_ptr + offs, mask = mask, other = 0)
+    contribution = flow + pseudocount
+
+    if keep_zero_params:
+        param = tl.load(params_ptr + param_base + offs, mask = mask, other = 0.0)
+        contribution = tl.where(param < 1e-12, 0.0, contribution)
+
+    tl.atomic_add(row_sums_ptr + row_id, contribution, mask = mask)
+
+
+@triton.jit
+def _sparse_cat_em_update_kernel(
+    params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
+    param_base, pflow_base, nnz,
+    step_size, pseudocount,
+    keep_zero_params: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+
+    param = tl.load(params_ptr + param_base + offs, mask = mask, other = 0.0)
+    flow = tl.load(param_flows_ptr + pflow_base + offs, mask = mask, other = 0.0)
+    row_id = tl.load(csc_indices_ptr + offs, mask = mask, other = 0)
+    row_sum = tl.load(row_sums_ptr + row_id, mask = mask, other = 1.0)
+
+    # Guard against degenerate (pseudocount=0 and no observations) rows — leave params
+    # alone in that case.
+    denom = tl.where(row_sum > 0, row_sum, 1.0)
+    new_param = (1.0 - step_size) * param + step_size * (flow + pseudocount) / denom
+
+    if keep_zero_params:
+        new_param = tl.where(param < 1e-12, 0.0, new_param)
+
+    tl.store(params_ptr + param_base + offs, new_param, mask = mask)
+
+
+@triton.jit
+def _sparse_cat_partition_accum_kernel(
+    params_ptr, csc_indices_ptr, row_sums_ptr,
+    param_base, nnz,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < nnz
+
+    val = tl.load(params_ptr + param_base + offs, mask = mask, other = 0.0)
+    row_id = tl.load(csc_indices_ptr + offs, mask = mask, other = 0)
+    tl.atomic_add(row_sums_ptr + row_id, val, mask = mask)
+
+
+@triton.jit
+def _sparse_cat_partition_write_kernel(
+    node_mars_ptr, row_sums_ptr,
+    node_offset, H,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < H
+    s = tl.load(row_sums_ptr + offs, mask = mask, other = 1.0)
+    tl.store(node_mars_ptr + node_offset + offs, tl.log(s), mask = mask)

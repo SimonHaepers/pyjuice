@@ -45,7 +45,8 @@ def _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device):
             0, num_node_blocks = 1, dist = sparse_dist,
             csc_indptr = csc_indptr, csc_indices = csc_indices,
         )
-        ni.set_params(sparse_dist.csc_values_to_row_major(csc_values), normalize = False)
+        # Values are in CSC order (matching the user-supplied csc_indices).
+        ni.set_params(csc_values, normalize = False)
         root = summate(ni, num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 0.0)
 
@@ -80,7 +81,7 @@ def test_sparse_categorical_forward():
 
 
 def test_sparse_categorical_backward_flows():
-    """Backward only writes flows into active sparse slots."""
+    """Backward accumulates expected posterior mass into the CSC slots."""
     device = torch.device("cuda:0")
     H, V = 8, 16
     mask_hv, dense_probs, csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, seed = 7)
@@ -97,32 +98,24 @@ def test_sparse_categorical_backward_flows():
 
     il = pc.input_layer_group[0]
     par_start, par_end = ni._param_range
-    pf = il.param_flows[par_start:par_end].detach().cpu()  # [nnz], row-major
+    pf = il.param_flows[par_start:par_end].detach().cpu()  # [nnz], CSC order
 
-    # Expected per-(row, col) flow in sparse order:
-    # For each batch item b: node n receives flow_n,b iff it's an "active" latent
-    # (here, root is uniform over latents), and the flow accumulates at (n, data[b]).
-    # Since every sparse forward value > 0, every latent contributes.
+    # Posterior: with uniform root weights, p(n | v) = p(v | n) / sum_n' p(v | n').
     dense_probs_safe = torch.where(mask_hv, dense_probs, torch.full_like(dense_probs, 1e-10))
-    # Mixture posterior: p(n | data=v) = p(n) p(v|n) / sum_n' p(n') p(v|n')
-    # With uniform root weights, p(n) = 1/H.
-    priors = dense_probs_safe / H                                     # [H, V]
-    posteriors = priors / priors.sum(dim = 0, keepdim = True)          # [H, V]
+    priors = dense_probs_safe / H
+    posteriors = priors / priors.sum(dim = 0, keepdim = True)     # [H, V]
     expected_dense_flow = torch.zeros(H, V)
     for b in range(batch_size):
         v = int(data_cpu[b, 0].item())
         expected_dense_flow[:, v] += posteriors[:, v]
 
-    # Reorder expected into row-major (same order as pf)
-    H_range = torch.arange(H)
-    row_ids_row_major = torch.repeat_interleave(H_range, torch.diff(ni.dist._row_ptr))
-    col_ids_row_major = ni.dist._col_ids_row_major
-    expected_row_major = expected_dense_flow[row_ids_row_major, col_ids_row_major]
+    # Read expected flow at each CSC slot, in the same order as pf.
+    expected_csc = expected_dense_flow[csc_indices, torch.repeat_interleave(
+        torch.arange(V), torch.diff(csc_indptr),
+    )]
 
-    # Sparse-padded positions should have flows only at active slots — our pf IS the
-    # flows at active slots. Check they match.
-    assert torch.allclose(pf, expected_row_major, atol = 1e-4, rtol = 1e-3), \
-        f"max flow diff = {(pf - expected_row_major).abs().max().item():.3e}"
+    assert torch.allclose(pf, expected_csc, atol = 1e-4, rtol = 1e-3), \
+        f"max flow diff = {(pf - expected_csc).abs().max().item():.3e}"
 
 
 def test_sparse_categorical_em_renormalizes():
@@ -139,28 +132,29 @@ def test_sparse_categorical_em_renormalizes():
 
     pc(data)
     pc.backward(data)
-    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.0, keep_zero_params = False)
+    pc.mini_batch_em(step_size = 0.5, pseudocount = 0.1, keep_zero_params = False)
 
     il = pc.input_layer_group[0]
     par_start, par_end = ni._param_range
-    row_major_vals = il.params.data[par_start:par_end].detach().cpu()
-    row_ptr = ni.dist._row_ptr
+    csc_vals = il.params.data[par_start:par_end].detach().cpu()
+
+    # Row sums over CSC-ordered values, grouped by row id.
+    row_sums = torch.zeros(H)
+    row_sums.scatter_add_(0, csc_indices, csc_vals)
     for h in range(H):
-        rs, re = int(row_ptr[h].item()), int(row_ptr[h + 1].item())
-        row_sum = row_major_vals[rs:re].sum().item()
-        assert math.isclose(row_sum, 1.0, abs_tol = 1e-4), \
-            f"row {h} sum is {row_sum}, expected ~1"
+        assert math.isclose(row_sums[h].item(), 1.0, abs_tol = 1e-4), \
+            f"row {h} sum is {row_sums[h].item()}, expected ~1"
 
 
 def test_sparse_categorical_partition_fn():
-    """Per-latent partition = log(sum_row_values) = log(1) = 0 (after row-normalization)."""
+    """Per-latent partition = log(sum_row_values) = log(1) = 0 after row-normalization."""
     device = torch.device("cuda:0")
     H, V = 8, 16
     _, _, csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, seed = 13)
 
     pc, ni, _ = _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device)
 
-    # Trigger compilation / allocation of pc.node_mars via a dummy forward.
+    # Trigger allocation of pc.node_mars via a dummy forward.
     data = torch.zeros(1, 1, dtype = torch.long, device = device)
     pc(data)
 

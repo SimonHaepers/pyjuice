@@ -96,6 +96,50 @@ class Distribution():
         """
         return torch.zeros(num_nodes, dtype = torch.long)
 
+    # -----------------------------------------------------------------
+    # Custom-kernel dispatch
+    # -----------------------------------------------------------------
+    # Distributions whose native structure doesn't fit the default
+    # per-(node, batch) kernel template (e.g. sparse layouts that want
+    # per-(batch, slot) scatter kernels) can opt out of the template by
+    # returning True from the `has_custom_*` hooks and implementing the
+    # corresponding `custom_*` method. `InputLayer` will dispatch to the
+    # distribution instead of launching the template kernel.
+
+    def has_custom_forward(self) -> bool:
+        return False
+
+    def has_custom_backward(self) -> bool:
+        return False
+
+    def has_custom_em(self) -> bool:
+        return False
+
+    def has_custom_partition(self) -> bool:
+        return False
+
+    def custom_forward(self, layer, params, node_mars, data, batch_size,
+                       fw_local_ids = None):
+        raise NotImplementedError("Distribution did not provide a custom forward kernel.")
+
+    def custom_backward(self, layer, params, param_flows, node_flows, node_mars,
+                        data, batch_size, logspace_flows: bool = False):
+        raise NotImplementedError("Distribution did not provide a custom backward kernel.")
+
+    def custom_em(self, layer, step_size: float, pseudocount: float,
+                  keep_zero_params: bool = True):
+        raise NotImplementedError("Distribution did not provide a custom EM kernel.")
+
+    def custom_partition(self, layer, node_mars):
+        raise NotImplementedError("Distribution did not provide a custom partition kernel.")
+
+    def move_to_device(self, device):
+        """
+        Hook for moving any distribution-owned tensors to `device`. Called from
+        :meth:`InputLayer.to`. Default no-op.
+        """
+        pass
+
     def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
         """
         Randomly initialize node parameters.
