@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import torch
-from typing import Sequence, Union, Type
+from typing import Sequence, Union, Type, Optional
 from copy import deepcopy
 from functools import reduce
 
@@ -31,8 +31,9 @@ class SumNodes(CircuitNodes):
     :type block_size: int
     """
 
-    def __init__(self, num_node_blocks: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Union[Tensor,Sequence[Tensor]]] = None, 
-                 params: Optional[Tensor] = None, zero_param_mask: Optional[Tensor] = None, block_size: int = 0, **kwargs) -> None:
+    def __init__(self, num_node_blocks: int, chs: Sequence[CircuitNodes], edge_ids: Optional[Union[Tensor,Sequence[Tensor]]] = None,
+                 params: Optional[Tensor] = None, zero_param_mask: Optional[Tensor] = None, block_size: int = 0,
+                 _presanitised_edge_ids: Optional[Tensor] = None, **kwargs) -> None:
 
         assert len(chs) > 0, "`SumNodes` must have at least one child."
         for i in range(1, len(chs)):
@@ -50,8 +51,17 @@ class SumNodes(CircuitNodes):
         # Block size of the children
         self.ch_block_size = self.chs[0].block_size
 
-        # Construct sum edges
-        self._construct_edges(edge_ids)
+        # Construct sum edges. The ``_presanitised_edge_ids`` shortcut lets
+        # ``duplicate(tie_params=True)`` share the source's ``edge_ids`` tensor
+        # by reference *and* skip the expensive ``torch.unique`` / range
+        # validation inside ``_construct_edges`` — the source already went
+        # through validation, and at HMM scales (e.g. ``H=32k, bs=1`` →
+        # ``edge_ids`` of ~1B entries, ~16 GB) re-running it once per tied
+        # duplicate costs tens of GB of transient CPU scratch + many seconds.
+        if _presanitised_edge_ids is not None:
+            self.edge_ids = _presanitised_edge_ids
+        else:
+            self._construct_edges(edge_ids)
 
         # Set zero parameter mask
         if zero_param_mask is not None:
@@ -112,15 +122,27 @@ class SumNodes(CircuitNodes):
                 assert old_c.num_node_blocks == new_c.num_node_blocks, f"Child node size not match: (`num_node_blocks`: {new_c.num_node_blocks} != {old_c.num_node_blocks})."
                 assert old_c.block_size == new_c.block_size, f"Child node size not match: (`block_size`: {new_c.block_size} != {old_c.block_size})."
 
-        edge_ids = self.edge_ids.clone()
-
         if hasattr(self, "_params") and self._params is not None and not tie_params:
             params = self._params.clone()
         else:
             # We also do not copy parameters explicitly if this is a tied node
             params = None
 
-        return SumNodes(self.num_node_blocks, chs, edge_ids, params = params, block_size = self.block_size, source_node = self if tie_params else None)
+        if tie_params:
+            # Share the source's already-validated ``edge_ids`` tensor. No
+            # clone (avoids duplicating ~16 GB per tied copy at
+            # ``H=32k, bs=1``), and no re-validation (``torch.unique`` on ~1B
+            # entries costs ~8 GB scratch and multiple seconds).
+            return SumNodes(
+                self.num_node_blocks, chs, edge_ids = None,
+                params = params, block_size = self.block_size,
+                source_node = self,
+                _presanitised_edge_ids = self.edge_ids,
+            )
+
+        return SumNodes(self.num_node_blocks, chs, self.edge_ids.clone(),
+                        params = params, block_size = self.block_size,
+                        source_node = None)
 
     def get_params(self, as_matrix: bool = False):
         """
@@ -260,7 +282,8 @@ class SumNodes(CircuitNodes):
 
         self._params = None # Clear parameters
 
-    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
+    def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True,
+                        device: Optional[torch.device] = None, **kwargs):
         """
         Randomly initialize node parameters.
 
@@ -269,20 +292,29 @@ class SumNodes(CircuitNodes):
 
         :param recursive: whether to recursively apply the function to child nodes
         :type recursive: bool
+
+        :param device: optional target device for the random init — threaded by
+            ``TensorCircuit._init_parameters`` to avoid a multi-GB CPU allocation
+            for the ``[num_edges, bs, bs]`` transition tensor (``H²`` floats at
+            realistic HMM sizes).
         """
         if self._source_node is None:
-            self._params = torch.exp(torch.rand([self.edge_ids.size(1), self.block_size, self.ch_block_size]) * -perturbation)
+            self._params = torch.exp(
+                torch.rand([self.edge_ids.size(1), self.block_size, self.ch_block_size],
+                           device = device) * -perturbation
+            )
 
             if self.provided("zero_param_mask"):
                 self._params[self._zero_param_mask] = 0.0
 
-            normalize_ns_parameters(self._params, self.edge_ids[0,:], block_size = self.block_size, 
+            normalize_ns_parameters(self._params, self.edge_ids[0,:].to(self._params.device), block_size = self.block_size,
                                     ch_block_size = self.ch_block_size, pseudocount = 0.0)
 
         super(SumNodes, self).init_parameters(
-            perturbation = perturbation, 
-            recursive = recursive, 
-            is_root = is_root, 
+            perturbation = perturbation,
+            recursive = recursive,
+            is_root = is_root,
+            device = device,
             **kwargs
         )
 

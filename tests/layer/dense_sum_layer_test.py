@@ -53,15 +53,35 @@ def test_flag_off_falls_back(device):
     assert dense_n == 0
 
 
-def test_tied_params_stay_on_sparse_path(device):
-    _, pc = _build_pair(seed=3, K=64, T=6, V=8, homogeneous=True, device=device)
-    for lg in pc.inner_layer_groups:
+def test_tied_params_use_dense_path(device):
+    """Homogeneous (tied) HMMs must land on ``DenseSumLayer`` too — it's the
+    dispatch target that makes realistic H×H transitions affordable (a single
+    shared param range instead of T-1 CPU-cloned copies). ``DenseSumLayer``
+    reuses the tied source's ``_param_range`` so the flat params tensor
+    stays at the source's size."""
+    pc_plain, pc_dense = _build_pair(
+        seed=3, K=64, T=6, V=8, homogeneous=True, device=device,
+    )
+    dense_n, _ = _counts(pc_dense)
+    assert dense_n > 0, "homogeneous HMM should still dispatch to DenseSumLayer"
+
+    tied_seen = False
+    for lg in pc_dense.inner_layer_groups:
         for l in lg.layers:
             if isinstance(l, DenseSumLayer):
                 for n in l.nodes:
-                    assert not n.is_tied(), (
-                        f"tied node {n} ended up on DenseSumLayer"
-                    )
+                    if n.is_tied():
+                        tied_seen = True
+    assert tied_seen, "expected tied duplicates on DenseSumLayer for a homogeneous HMM"
+
+    # Forward parity with the plain SumLayer baseline — tied alias logic
+    # must produce identical LLs.
+    torch.manual_seed(11)
+    data = torch.randint(0, 8, (1, 6), device=device)
+    ll_plain = pc_plain(data).detach().cpu()
+    ll_dense = pc_dense(data).detach().cpu()
+    assert torch.allclose(ll_plain, ll_dense, atol=1e-5, rtol=1e-5), \
+        f"tied DenseSumLayer LL mismatch: {(ll_plain - ll_dense).abs().max().item():.3e}"
 
 
 @pytest.mark.parametrize("K", [32, 256, 1024])

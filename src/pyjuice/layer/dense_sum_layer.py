@@ -28,7 +28,14 @@ class DenseSumLayer(SumLayer):
     Only supports:
       * ``SumNodes`` with ``is_block_dense == True``
       * ``num_chs == 1`` per ``SumNodes`` (children contiguous in element_mars)
-      * ``not is_tied()``
+
+    Tied ``SumNodes`` are fine — the layer reuses the source's
+    ``_param_range`` so the flat params buffer stays at the source's size
+    (critical for homogeneous HMMs: one shared H×H transition instead of
+    ``T-1`` copies). The tied source must appear in an earlier depth in the
+    same circuit so its ``_param_range`` is already set by the time the
+    tied duplicates compile.
+
     Parameter flow accumulation (learning) is not implemented; callers must
     pass ``param_flows=None`` to :meth:`backward`.
     """
@@ -58,9 +65,13 @@ class DenseSumLayer(SumLayer):
                 "DenseSumLayer currently requires num_chs == 1 per SumNodes "
                 "(so children are contiguous in element_mars)."
             )
-            assert not ns.is_tied(), (
-                "DenseSumLayer does not support tied parameters yet."
-            )
+            if ns.is_tied():
+                source_ns = ns.get_source_ns()
+                assert source_ns.provided("_param_range"), (
+                    "DenseSumLayer: tied sum node encountered before its "
+                    "source was compiled. The source must appear in an "
+                    "earlier depth — check the DAG topo order."
+                )
 
         layer_nid_start = global_nid_start
         layer_pid_start = global_pid_start
@@ -92,10 +103,23 @@ class DenseSumLayer(SumLayer):
             ns._output_ind_range = (curr_nid, curr_nid + ns.num_nodes)
 
             # Param range (linear-domain params, NB * NB_ch * cbs * bs scalars).
-            pid_end = curr_pid + ns.num_edges
-            pfid_end = curr_pfid + ns.num_edges
-            ns._param_range = (curr_pid, pid_end)
-            ns._param_flow_range = (curr_pfid, pfid_end)
+            # Tied nodes alias the source's range — do not advance curr_pid /
+            # curr_pfid. The flat params tensor stays at the source's size.
+            if ns.is_tied():
+                source_ns = ns.get_source_ns()
+                block_pid_start, _ = source_ns._param_range
+                block_pfid_start, _ = source_ns._param_flow_range
+                ns._param_range = source_ns._param_range
+                ns._param_flow_range = source_ns._param_flow_range
+            else:
+                pid_end = curr_pid + ns.num_edges
+                pfid_end = curr_pfid + ns.num_edges
+                ns._param_range = (curr_pid, pid_end)
+                ns._param_flow_range = (curr_pfid, pfid_end)
+                block_pid_start = curr_pid
+                block_pfid_start = curr_pfid
+                curr_pid = pid_end
+                curr_pfid = pfid_end
 
             # Establish the inverse-permutation used by ``gather_parameters``
             # so ``TensorCircuit._init_parameters`` can copy user-provided
@@ -117,22 +141,24 @@ class DenseSumLayer(SumLayer):
             edge_lin_ids = edge_ids[0] * NB_ch + edge_ids[1]
             # Rebuild ``_param_ids`` / ``_inverse_param_ids`` the same way the
             # block-sparse path does during compilation.
-            ns._param_ids = curr_pid + edge_lin_ids * bs * cbs
+            ns._param_ids = block_pid_start + edge_lin_ids * bs * cbs
             ns._inverse_param_ids = torch.argsort(edge_lin_ids)
 
             blocks.append((
                 curr_nid,                      # nid_start in node_mars
                 cs._output_ind_range[0],       # cid_start in element_mars
-                curr_pid,                      # pid_start in flat params
-                curr_pfid,                     # pfid_start (unused for inference)
+                block_pid_start,               # pid_start in flat params
+                block_pfid_start,              # pfid_start (unused for inference)
                 NB, NB_ch, bs, cbs,
             ))
 
             curr_nid += ns.num_nodes
-            curr_pid = pid_end
-            curr_pfid = pfid_end
             layer_num_nodes += ns.num_nodes
-            layer_num_edges += ns.num_edges
+            # Tied nodes contribute no new edges to the flat params — only the
+            # source ns's num_edges counts (and that was counted by the layer
+            # group that owns the source).
+            if not ns.is_tied():
+                layer_num_edges += ns.num_edges
 
         self.num_nodes = layer_num_nodes
         self.num_edges = layer_num_edges

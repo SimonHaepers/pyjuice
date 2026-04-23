@@ -205,17 +205,22 @@ class SparseCategorical(Distribution):
 
     def custom_forward(self, layer, params, node_mars, data, batch_size,
                        fw_local_ids = None):
-        """Pre-fill this layer's output rows with LOG_EPS, then column-scatter per group."""
+        """Per-ns LOG_EPS fill + CSC scatter, skipping nodes claimed by a
+        downstream ``SparseProdLayer`` (``_skip_input_forward`` flag)."""
         assert fw_local_ids is None, "SparseCategorical does not support partial_eval yet."
-        sid, eid = layer._output_ind_range
-        node_mars[sid:eid].fill_(LOG_EPS)
 
         BLOCK_B = 64
         BLOCK_K = max(triton.next_power_of_2(self._max_nnz_per_col), 4)
 
         for ns in layer.nodes:
+            if getattr(ns, "_skip_input_forward", False):
+                continue
+
             dist = ns.dist
             assert isinstance(dist, SparseCategorical)
+            sid, eid = ns._output_ind_range
+            node_mars[sid:eid].fill_(LOG_EPS)
+
             if dist._nnz == 0:
                 continue
             var_id = ns.scope.to_list()[0]
@@ -241,10 +246,20 @@ class SparseCategorical(Distribution):
 
     def custom_backward(self, layer, params, param_flows, node_flows, node_mars,
                         data, batch_size, logspace_flows: bool = False):
+        if param_flows is None:
+            # compute_param_flows=False at TensorCircuit.backward — no flow
+            # buffer was allocated. Nothing to accumulate into; no-op.
+            return
+
         BLOCK_B = 64
         BLOCK_K = max(triton.next_power_of_2(self._max_nnz_per_col), 4)
 
         for ns in layer.nodes:
+            if getattr(ns, "_skip_input_backward", False):
+                # Param-flow accumulation for this ns is handled by the
+                # SparseProdLayer's custom_backward_sparse path.
+                continue
+
             dist = ns.dist
             if dist._nnz == 0:
                 continue
@@ -272,6 +287,39 @@ class SparseCategorical(Distribution):
                 BLOCK_B = BLOCK_B,
                 BLOCK_K = BLOCK_K,
             )
+
+    def custom_backward_sparse(self, input_layer, sparse_flow,
+                                csc_pflows_base: int,
+                                logspace_flows: bool = False):
+        """
+        Accumulate parameter flows from a jagged ``SparseNodeValues`` produced
+        by ``SparseProdLayer`` (one entry per active CSC slot, per batch item).
+
+        Atomically adds ``sparse_flow.values[j]`` to
+        ``input_layer.param_flows[csc_pflows_base + sparse_flow.csc_slots[j]]``.
+        If ``logspace_flows`` is set the values are ``tl.exp``'d before adding.
+        """
+        total_nnz = sparse_flow.total_nnz
+        if total_nnz == 0 or self._nnz == 0:
+            return
+        if input_layer.param_flows is None:
+            # compute_param_flows=False at TensorCircuit.backward — the input
+            # layer's flow buffer wasn't allocated and there's nothing for us
+            # to accumulate into. Matches the behaviour of the standard
+            # input-layer backward path for this mode.
+            return
+
+        BLOCK = 256
+        grid = (triton.cdiv(total_nnz, BLOCK),)
+        _sparse_cat_backward_sparse_kernel[grid](
+            csc_slots_ptr = sparse_flow.csc_slots,
+            values_ptr = sparse_flow.values,
+            param_flows_ptr = input_layer.param_flows,
+            csc_pflows_base = csc_pflows_base,
+            total_nnz = total_nnz,
+            logspace_flows = 1 if logspace_flows else 0,
+            BLOCK = BLOCK,
+        )
 
     def custom_em(self, layer, step_size: float, pseudocount: float,
                   keep_zero_params: bool = True):
@@ -424,6 +472,28 @@ def _sparse_cat_backward_kernel(
         flow = tl.exp(flow)
 
     tl.atomic_add(param_flows_ptr + pflow_base + slot_idx, flow, mask = slot_mask)
+
+
+@triton.jit
+def _sparse_cat_backward_sparse_kernel(
+    csc_slots_ptr, values_ptr,
+    param_flows_ptr, csc_pflows_base, total_nnz,
+    logspace_flows: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """Consume a jagged ``SparseNodeValues`` of per-CSC-slot flows and
+    atomically accumulate them into ``param_flows`` at
+    ``csc_pflows_base + csc_slots[j]``."""
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < total_nnz
+
+    csc_slot = tl.load(csc_slots_ptr + offs, mask = mask, other = 0)
+    flow = tl.load(values_ptr + offs, mask = mask, other = 0.0)
+    if logspace_flows:
+        flow = tl.exp(flow)
+
+    tl.atomic_add(param_flows_ptr + csc_pflows_base + csc_slot, flow, mask = mask)
 
 
 @triton.jit

@@ -51,17 +51,21 @@ class Categorical(Distribution):
         """
         return self.num_cats
 
-    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None, **kwargs):
+    def init_parameters(self, num_nodes: int, perturbation: float = 2.0, params: Optional[Any] = None,
+                        device: Optional[torch.device] = None, **kwargs):
         """
         Initialize parameters for `num_nodes` nodes.
         Returned parameters should be flattened into a vector.
+
+        If ``device`` is given, the returned tensor is allocated there directly.
+        Without that, a H·V float tensor (4 GB at H=V=32k) lands on CPU.
         """
         if params is not None:
             assert isinstance(params, torch.Tensor)
             assert params.numel() == num_nodes * self.num_parameters()
             return params
 
-        params = torch.exp(torch.rand([num_nodes, self.num_cats]) * -perturbation)
+        params = torch.exp(torch.rand([num_nodes, self.num_cats], device = device) * -perturbation)
         params /= params.sum(dim = 1, keepdim = True)
 
         return params.reshape(-1)

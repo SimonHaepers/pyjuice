@@ -12,7 +12,11 @@ from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
-from pyjuice.layer import Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SumLayer, DenseSumLayer, LayerGroup
+from pyjuice.nodes.distributions import SparseCategorical
+from pyjuice.layer import (
+    Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
+    SumLayer, DenseSumLayer, SparseInputSumLayer, LayerGroup,
+)
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -123,6 +127,8 @@ class TensorCircuit(nn.Module):
                  device: Optional[Union[int,torch.device]] = None,
                  use_dense_sum_layer: bool = False,
                  use_dense_categorical_input_layer: bool = False,
+                 use_sparse_prod_layer: bool = False,
+                 use_sparse_sum_layer: bool = False,
                  param_dtype: torch.dtype = torch.float32,
                  verbose: bool = True) -> None:
 
@@ -143,6 +149,8 @@ class TensorCircuit(nn.Module):
 
         self.use_dense_sum_layer = use_dense_sum_layer
         self.use_dense_categorical_input_layer = use_dense_categorical_input_layer
+        self.use_sparse_prod_layer = use_sparse_prod_layer
+        self.use_sparse_sum_layer = use_sparse_sum_layer
         self.param_dtype = param_dtype
 
         self._init_layers(
@@ -152,7 +160,8 @@ class TensorCircuit(nn.Module):
             force_gpu_compilation = force_gpu_compilation,
             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
             device = device,
-            verbose = verbose
+            verbose = verbose,
+            _user_requested_device = device is not None,
         )
         
         # Hyperparameters for backward pass
@@ -273,19 +282,24 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
 
+            # SparseProdLayer needs `data` to look up per-batch active CSC
+            # columns; stash a reference so the inner loop + the re-forward
+            # inside backward both see it.
+            self._run_data = inputs
+
             # Inner layers
             def _run_inner_layers():
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group(self.node_mars, self.element_mars)
+                        layer_group(self.node_mars, self.element_mars, data = self._run_data)
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        layer_group(self.node_mars, self.element_mars, self.params, 
+                        layer_group(self.node_mars, self.element_mars, self.params,
                                     force_use_bf16 = force_use_bf16,
-                                    force_use_fp32 = force_use_fp32, 
-                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                    force_use_fp32 = force_use_fp32,
+                                    propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                     **kwargs)
 
                     else:
@@ -391,6 +405,10 @@ class TensorCircuit(nn.Module):
             assert inputs.dim() == 2 and inputs.size(1) == self.num_vars
             inputs = inputs.permute(1, 0)
 
+        # Keep `data` accessible to inner-layer backward + re-forward paths
+        # (SparseProdLayer consumes it to look up per-batch active CSC columns).
+        self._run_data = inputs
+
         with device_grad_controller(device = self.device, no_grad = True):
 
             B = self.node_mars.size(1)
@@ -445,13 +463,15 @@ class TensorCircuit(nn.Module):
 
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group.backward(self.node_flows, self.element_flows, logspace_flows = logspace_flows)
+                        layer_group.backward(self.node_flows, self.element_flows,
+                                             logspace_flows = logspace_flows,
+                                             data = self._run_data)
 
                     elif layer_group.is_sum():
                         # Sum layer
 
                         # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True)
+                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True, data = self._run_data)
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -929,8 +949,9 @@ class TensorCircuit(nn.Module):
         return num_vars
 
     def _init_layers(self, layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None,
-                     disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False, 
-                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None):
+                     disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False,
+                     max_tied_ns_per_parflow_block: int = 8, verbose: bool = True, device: Optional[Union[str,torch.device]] = None,
+                     _user_requested_device: bool = False):
 
         if hasattr(self, "input_layer_group") or hasattr(self, "inner_layer_groups"):
             raise ValueError("Attempting to initialize a TensorCircuit for the second time. " + \
@@ -1018,31 +1039,116 @@ class TensorCircuit(nn.Module):
                     assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
                         "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
 
-                    # Product layer(s)
+                    # Product layer(s): group by (block_size, sparse-eligibility).
+                    #
+                    # A ProdNodes is sparse-eligible when it has exactly one
+                    # SparseCategorical-input child, identity block-sparse edges
+                    # on that slot, matching num_node_blocks/block_size, and is
+                    # the *sole consumer* of that sparse input (demote otherwise
+                    # — the input layer must still populate node_mars for shared
+                    # consumers like the initial summate over ns_input in HMM).
+                    def _sparse_prod_eligible(ns):
+                        if not self.use_sparse_prod_layer:
+                            return False
+                        if not isinstance(ns, ProdNodes) or not ns.is_block_sparse():
+                            return False
+                        # Need at least one non-sparse child to benefit from
+                        # sparsity propagation — skip 1-child wrappers inserted
+                        # by SumNodes._standardize_chs around input children.
+                        if len(ns.chs) < 2:
+                            return False
+                        sparse_chs = [
+                            i for i, cs in enumerate(ns.chs)
+                            if isinstance(cs, InputNodes)
+                            and isinstance(cs.dist, SparseCategorical)
+                        ]
+                        if len(sparse_chs) != 1:
+                            return False
+                        sci = sparse_chs[0]
+                        sc = ns.chs[sci]
+                        if ns.block_size != sc.block_size:
+                            return False
+                        if ns.num_node_blocks != sc.num_node_blocks:
+                            return False
+                        if not torch.equal(
+                            ns.edge_ids[:, sci].to(torch.long),
+                            torch.arange(ns.num_node_blocks, dtype=torch.long),
+                        ):
+                            return False
+                        # Rest must be non-input.
+                        for i in range(len(ns.chs)):
+                            if i == sci:
+                                continue
+                            if isinstance(ns.chs[i], InputNodes):
+                                return False
+                        return True
+
+                    eligible = {
+                        id(ns) for ns in depth2nodes[depth]["prod"]
+                        if _sparse_prod_eligible(ns)
+                    }
+                    if eligible:
+                        # Sole-consumer claim pass: count references per sparse
+                        # input across prod + sum nodes at this depth.
+                        from collections import defaultdict as _dd
+                        total_refs = _dd(int)
+                        claim_count = _dd(int)
+                        for ns in depth2nodes[depth]["prod"]:
+                            for cs in ns.chs:
+                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                                    total_refs[id(cs)] += 1
+                                    if id(ns) in eligible:
+                                        claim_count[id(cs)] += 1
+                        for ns in depth2nodes[depth]["sum"]:
+                            for cs in ns.chs:
+                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                                    total_refs[id(cs)] += 1
+                        # Demote any ns whose sparse child is ALSO referenced by
+                        # a non-sparse-prod consumer.
+                        demoted = set()
+                        for ns in depth2nodes[depth]["prod"]:
+                            if id(ns) not in eligible:
+                                continue
+                            for cs in ns.chs:
+                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                                    if total_refs[id(cs)] > claim_count[id(cs)]:
+                                        demoted.add(id(ns))
+                                        break
+                        eligible -= demoted
+
                     gsize2prod_nodes = dict()
                     for ns in depth2nodes[depth]["prod"]:
-                        gsize = ns.block_size
-                        if gsize not in gsize2prod_nodes:
-                            gsize2prod_nodes[gsize] = []
-                        gsize2prod_nodes[gsize].append(ns)
-                    
+                        key = (ns.block_size, id(ns) in eligible)
+                        gsize2prod_nodes.setdefault(key, []).append(ns)
+
                     layer_num_elements = max_node_block_size
                     prod_layers = []
-                    for gsize, nodes in gsize2prod_nodes.items():
-                        prod_layer = ProdLayer(
-                            nodes = nodes, 
-                            global_nid_start = layer_num_elements,
-                            layer_sparsity_tol = layer_sparsity_tol,
-                            max_num_partitions = max_num_partitions,
-                            disable_gpu_compilation = disable_gpu_compilation,
-                            force_gpu_compilation = force_gpu_compilation
-                        )
+                    for (gsize, is_sparse), nodes in gsize2prod_nodes.items():
+                        if is_sparse:
+                            prod_layer = SparseProdLayer(
+                                nodes = nodes,
+                                global_nid_start = layer_num_elements,
+                                layer_sparsity_tol = layer_sparsity_tol,
+                                max_num_partitions = max_num_partitions,
+                                disable_gpu_compilation = disable_gpu_compilation,
+                                force_gpu_compilation = force_gpu_compilation,
+                                input_layer_group = self.input_layer_group,
+                            )
+                        else:
+                            prod_layer = ProdLayer(
+                                nodes = nodes,
+                                global_nid_start = layer_num_elements,
+                                layer_sparsity_tol = layer_sparsity_tol,
+                                max_num_partitions = max_num_partitions,
+                                disable_gpu_compilation = disable_gpu_compilation,
+                                force_gpu_compilation = force_gpu_compilation
+                            )
 
                         layer_num_elements += prod_layer.num_nodes
                         num_edges += prod_layer.num_edges
 
                         prod_layers.append(prod_layer)
-                    
+
                     prod_layer_group = LayerGroup(prod_layers)
                     self.inner_layer_groups.append(prod_layer_group)
                     self.add_module(f"prod_layer_{layer_id}", prod_layer_group)
@@ -1057,19 +1163,60 @@ class TensorCircuit(nn.Module):
                     # state with the block-sparse path we cannot round-trip
                     # through yet).
                     def _dense_eligible(ns):
+                        # Tied nodes are fine here: both DenseSumLayer and
+                        # SparseInputSumLayer are inference-only and just need
+                        # ``_param_range`` (which a tied ns aliases from its
+                        # source). Supporting tied is what makes homogeneous
+                        # HMMs at realistic sizes feasible — untied builds
+                        # duplicate H×H transitions × (T-1) on the CPU at DAG
+                        # construction.
                         return (self.use_dense_sum_layer
                                 and ns.is_block_dense
-                                and len(ns.chs) == 1
-                                and not ns.is_tied())
+                                and len(ns.chs) == 1)
+
+                    # Sparse-input-sum eligibility: needs the block-dense +
+                    # single-child structure (same as dense-eligible)
+                    # INDEPENDENT of `use_dense_sum_layer`, plus the single
+                    # child ProdNodes must have been compiled to a
+                    # SparseProdLayer at an earlier depth in this same build.
+                    def _sparse_sum_eligible(ns):
+                        if not self.use_sparse_sum_layer:
+                            return False
+                        if not (ns.is_block_dense
+                                and len(ns.chs) == 1):
+                            return False
+                        cs = ns.chs[0]
+                        for lg in self.inner_layer_groups:
+                            if not lg.is_prod():
+                                continue
+                            for layer in lg:
+                                if isinstance(layer, SparseProdLayer):
+                                    if cs in layer.nodes:
+                                        return True
+                        return False
 
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        key = (ns.block_size, _dense_eligible(ns))
+                        if _sparse_sum_eligible(ns):
+                            mode = "sparse_dense"
+                        elif _dense_eligible(ns):
+                            mode = "dense"
+                        else:
+                            mode = "plain"
+                        key = (ns.block_size, mode)
                         gsize2sum_nodes.setdefault(key, []).append(ns)
 
                     sum_layers = []
-                    for (gsize, dense), nodes in gsize2sum_nodes.items():
-                        layer_cls = DenseSumLayer if dense else SumLayer
+                    for (gsize, mode), nodes in gsize2sum_nodes.items():
+                        if mode == "sparse_dense":
+                            layer_cls = SparseInputSumLayer
+                            extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
+                        elif mode == "dense":
+                            layer_cls = DenseSumLayer
+                            extra_kwargs = {}
+                        else:
+                            layer_cls = SumLayer
+                            extra_kwargs = {}
                         sum_layer = layer_cls(
                             nodes = nodes,
                             global_nid_start = num_nodes,
@@ -1080,7 +1227,8 @@ class TensorCircuit(nn.Module):
                             max_num_partitions = max_num_partitions,
                             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
                             disable_gpu_compilation = disable_gpu_compilation,
-                            force_gpu_compilation = force_gpu_compilation
+                            force_gpu_compilation = force_gpu_compilation,
+                            **extra_kwargs,
                         )
 
                         num_nodes += sum_layer.num_nodes
@@ -1102,6 +1250,10 @@ class TensorCircuit(nn.Module):
         self.num_sum_params = num_parameters
         self.num_param_flows = num_param_flows
 
+        # Post-pass: mark any SparseProdLayer whose every consumer is a
+        # SparseInputSumLayer so its forward can skip scatter-to-dense.
+        self._mark_sparse_prod_scatter_skip()
+
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)
         
@@ -1112,18 +1264,87 @@ class TensorCircuit(nn.Module):
         self.num_root_nodes = self.root_ns.num_nodes
         self._root_node_range = (self.num_nodes - self.num_root_nodes, self.num_nodes)
 
+        # When the caller passed ``device=`` explicitly, move compiled state
+        # (input layers, par_update_kwargs, parflow kwargs) to the target GPU
+        # device BEFORE parameter init, so the flat params tensor and
+        # per-layer ``self.params`` buffers get allocated directly on GPU.
+        # Without this, ``_init_parameters`` would allocate ~H² + H·V floats
+        # on CPU (multi-GB at realistic HMM sizes), run ``normalize_parameters``
+        # on the CPU/numba path, and the user's subsequent ``.to(device)``
+        # would PCIe-transfer everything — tripling peak CPU footprint.
+        #
+        # If ``device`` was left default, preserve the legacy
+        # ``TensorCircuit(root)`` CPU-residence semantics so tests / code that
+        # inspect ``.input_layer_group`` buffers before ``.to(device)`` keep
+        # working.
+        if _user_requested_device:
+            target_device = torch.device(f"cuda:{device}")
+            self.to(target_device)
+
         # Initialize parameters
         self._init_parameters()
+
+    def _mark_sparse_prod_scatter_skip(self):
+        """For each :class:`SparseProdLayer`, set ``_skip_scatter=True`` iff
+        *every* consumer (sum node that references any of its ProdNodes) is
+        a :class:`SparseInputSumLayer` — those consumers read the
+        :class:`SparseNodeValues` directly, so the O(H·B) scatter-to-dense
+        into ``element_mars`` can be elided. On a B>1 fallback inside
+        :class:`SparseInputSumLayer`, the scatter is run on demand before
+        handing off to :meth:`DenseSumLayer.forward/backward`."""
+        # Build: prod ProdNodes id -> list of (consumer sum layer) references.
+        prod_consumers: Dict[int, list] = dict()
+        for lg in self.inner_layer_groups:
+            if lg.is_prod():
+                continue
+            for layer in lg:
+                for sum_ns in layer.nodes:
+                    for cs in sum_ns.chs:
+                        prod_consumers.setdefault(id(cs), []).append(layer)
+
+        for lg in self.inner_layer_groups:
+            if not lg.is_prod():
+                continue
+            for layer in lg:
+                if not isinstance(layer, SparseProdLayer):
+                    continue
+                all_sparse_consumers = True
+                for ns in layer.nodes:
+                    consumers = prod_consumers.get(id(ns), [])
+                    if not consumers:
+                        # No direct consumer recorded — can't prove it's safe
+                        # to skip, keep scattering.
+                        all_sparse_consumers = False
+                        break
+                    for consumer in consumers:
+                        if not isinstance(consumer, SparseInputSumLayer):
+                            all_sparse_consumers = False
+                            break
+                    if not all_sparse_consumers:
+                        break
+                layer._skip_scatter = all_sparse_consumers
 
     def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
         for ns in self.root_ns:
             if not ns.is_tied() and (ns.is_sum() or ns.is_input()) and not ns.has_params():
-                ns.init_parameters(perturbation = perturbation, recursive = False)
+                # Thread ``device`` so distributions that accept it (e.g.
+                # ``Categorical``) allocate their [H, V] emission tensor on
+                # GPU directly instead of on CPU. Distributions that don't
+                # advertise ``device`` absorb it via ``**kwargs``.
+                ns.init_parameters(
+                    perturbation = perturbation, recursive = False,
+                    device = self.device,
+                )
 
-        params = torch.exp(torch.rand([self.num_sum_params]) * -perturbation)
+        # Allocate the flat params tensor on whichever device ``self`` is
+        # currently on (``_init_layers`` eagerly moves us to GPU before this
+        # runs). For an H²-size transition buffer this is the difference
+        # between a multi-GB CPU alloc + PCIe copy and an in-place GPU alloc.
+        params = torch.exp(torch.rand([self.num_sum_params], device = self.device) * -perturbation)
         params[:self.num_dummy_params] = 0.0
 
-        # Copy initial parameters if provided
+        # Copy initial parameters if provided (``gather_parameters`` does its
+        # own ``.to(params.device)`` internally, so this is safe on GPU).
         for ns in self.root_ns:
             if ns.is_sum() and not ns.is_tied() and ns.has_params():
                 ns.gather_parameters(params)

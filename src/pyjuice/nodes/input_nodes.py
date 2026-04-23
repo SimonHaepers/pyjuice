@@ -78,7 +78,16 @@ class InputNodes(CircuitNodes):
 
         dist = deepcopy(self.dist)
 
-        ns = InputNodes(self.num_node_blocks, scope = scope, dist = dist, block_size = self.block_size, source_node = self if tie_params else None)
+        # The deepcopied dist already carries any meta-parameter state (e.g.
+        # SparseCategorical's CSC buffers); tell InputNodes.__init__ to skip
+        # the re-run of set_meta_params which would otherwise require the
+        # original meta kwargs.
+        ns = InputNodes(
+            self.num_node_blocks, scope = scope, dist = dist,
+            block_size = self.block_size,
+            source_node = self if tie_params else None,
+            _no_set_meta_params = True,
+        )
 
         if hasattr(self, "_params") and self._params is not None and not tie_params:
             ns._params = self._params.clone()
