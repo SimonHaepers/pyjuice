@@ -12,7 +12,7 @@ from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
-from pyjuice.layer import Layer, InputLayer, ProdLayer, SumLayer, DenseSumLayer, LayerGroup
+from pyjuice.layer import Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SumLayer, DenseSumLayer, LayerGroup
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -122,6 +122,7 @@ class TensorCircuit(nn.Module):
                  max_tied_ns_per_parflow_block: int = 8,
                  device: Optional[Union[int,torch.device]] = None,
                  use_dense_sum_layer: bool = False,
+                 use_dense_categorical_input_layer: bool = False,
                  param_dtype: torch.dtype = torch.float32,
                  verbose: bool = True) -> None:
 
@@ -141,6 +142,7 @@ class TensorCircuit(nn.Module):
         self.param_flows = None
 
         self.use_dense_sum_layer = use_dense_sum_layer
+        self.use_dense_categorical_input_layer = use_dense_categorical_input_layer
         self.param_dtype = param_dtype
 
         self._init_layers(
@@ -986,7 +988,10 @@ class TensorCircuit(nn.Module):
                     input_layer_id = 0
                     input_layers = []
                     for signature, nodes in signature2nodes.items():
-                        input_layer = InputLayer(
+                        input_layer_cls = InputLayer
+                        if self.use_dense_categorical_input_layer and signature == "Categorical":
+                            input_layer_cls = DenseCategoricalInputLayer
+                        input_layer = input_layer_cls(
                             nodes = nodes, cum_nodes = num_nodes,
                             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
                             pc_num_vars = pc_num_vars

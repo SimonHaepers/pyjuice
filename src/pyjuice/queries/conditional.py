@@ -8,6 +8,7 @@ from functools import partial
 
 from pyjuice.nodes import CircuitNodes
 from pyjuice.model import TensorCircuit
+from pyjuice.layer import DenseCategoricalInputLayer
 from pyjuice.nodes.methods import get_subsumed_scopes
 from pyjuice.utils import BitSet
 from pyjuice.utils.kernel_launcher import FastJITFunction
@@ -288,6 +289,14 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
     if params is None:
         params = layer.params
 
+    # Dense fast-path: the layer class knows its layout is `[V, K, C]` and
+    # replaces the atomic-add scatter kernel with a single bmm/matmul.
+    if isinstance(layer, DenseCategoricalInputLayer):
+        return layer.dense_conditional_backward(
+            node_flows = node_flows, params = params,
+            target_vars = kwargs.get("target_vars", None),
+        )
+
     sid, eid = layer._output_ind_range[0], layer._output_ind_range[1]
 
     num_nodes = eid - sid
@@ -295,8 +304,10 @@ def _categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
     num_cats = int(layer.metadata[layer.s_mids].max().item())
     batch_size = node_flows.size(1)
 
-    if "target_vars" in kwargs and kwargs["target_vars"] is not None:
-        target_vars = kwargs["target_vars"]
+    target_vars_arg = kwargs.get("target_vars", None)
+
+    if target_vars_arg is not None:
+        target_vars = target_vars_arg
 
         rev_vars_mapping = torch.zeros([num_vars], dtype = torch.long)
         for i, var in enumerate(target_vars):
