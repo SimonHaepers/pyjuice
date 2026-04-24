@@ -1331,6 +1331,13 @@ class TensorCircuit(nn.Module):
                         # to skip, keep scattering.
                         all_sparse_consumers = False
                         break
+                    # The backward fast path writes sv_flow directly onto this
+                    # ns without an accumulate protocol, so a second sparse
+                    # consumer would overwrite the first's contribution. Keep
+                    # multi-consumer topologies on the dense element_flows path.
+                    if len(consumers) != 1:
+                        all_sparse_consumers = False
+                        break
                     for consumer in consumers:
                         if not isinstance(consumer, SparseInputSumLayer):
                             all_sparse_consumers = False

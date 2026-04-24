@@ -9,6 +9,7 @@ import triton.language as tl
 
 from pyjuice.nodes import SumNodes
 from .dense_sum_layer import DenseSumLayer
+from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
 
 
@@ -20,6 +21,17 @@ The forward kernel reduces over ``total_nnz`` active child slots. Keeping
 independent of per-call nnz — so we can ship AOT-compiled kernels for
 deployment on platforms without a Triton JIT. Tuning knob: larger = fewer
 inner-loop iterations but more register pressure per program.
+"""
+
+
+_BWD_SV_BLOCK_P = 128
+"""Parent-chunk tile size for :func:`_sparse_input_sum_backward_sv_kernel`.
+
+Each program handles one active child ``c_k`` and reduces serially over all
+``NB * BS`` parents. At ``bs=1024``, a single-tile load of the full parent
+block would spill registers; chunking by ``BLOCK_P`` keeps live tiles
+bounded at ``BLOCK_P`` floats for ``nflows``, ``W[:, c_k]``, and (optionally)
+``nmars``. Compiled once — runtime handles any ``BS`` that's a multiple.
 """
 
 
@@ -208,6 +220,66 @@ class SparseInputSumLayer(DenseSumLayer):
             f"SparseInputSumLayer.bwd(n_blocks={len(self._dense_blocks)})"
         )
 
+        # Fast path: every upstream SparseProdLayer has _skip_scatter=True, so
+        # it doesn't need element_flows and we can write sv_flow directly onto
+        # the prod. Mixed-consumer topologies take the dense path below.
+        all_skip = all(
+            sp._skip_scatter for sp, _ in self._sparse_input_refs
+        )
+        if all_skip:
+            if accumulate_ch_flows:
+                raise NotImplementedError(
+                    "SparseInputSumLayer (skip_scatter) backward does not "
+                    "support accumulate_ch_flows=True; the sparse fast path "
+                    "writes sv_flow straight into the upstream prod layer."
+                )
+            for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
+                self._dense_blocks, self._sparse_input_refs,
+            )):
+                nid_start, _cid_start, pid_start, _pfid_start, NB, NB_ch, BS, CBS = block
+                sv = sparse_prod._sparse_outputs[ns_idx]
+                total_nnz = sv.total_nnz
+
+                # Mirror sv's pattern so SparseProdLayer.backward (sparse path)
+                # can find the flow. The prod layer will pop this slot.
+                sv_flow = SparseNodeValues(
+                    col_start=sv.col_start, total_nnz=total_nnz,
+                    indices=sv.indices,
+                    values=torch.empty_like(sv.values),
+                    num_rows=sv.num_rows,
+                )
+                sparse_prod._sparse_flows[ns_idx] = sv_flow
+
+                if total_nnz == 0:
+                    continue
+
+                torch.cuda.nvtx.range_push(
+                    f"block[{blk_idx}]/_sparse_input_sum_bwd_sv_kernel(nnz={total_nnz})"
+                )
+                grid = (total_nnz,)
+                _sparse_input_sum_backward_sv_kernel[grid](
+                    node_flows_ptr=node_flows,
+                    node_mars_ptr=node_mars,
+                    mparams_ptr=params,
+                    indices_ptr=sv.indices,
+                    values_ptr=sv.values,
+                    flow_out_ptr=sv_flow.values,
+                    nid_start=nid_start,
+                    pid_start=pid_start,
+                    batch_size=batch_size,
+                    NB=NB,
+                    NB_ch=NB_ch,
+                    BS=BS,
+                    CBS=CBS,
+                    BLOCK_P=_BWD_SV_BLOCK_P,
+                    allow_modify_flows=1 if allow_modify_flows else 0,
+                )
+                torch.cuda.nvtx.range_pop()
+
+            torch.cuda.nvtx.range_pop()
+            return None
+
+        # Dense fallback: write to element_flows with the atomic-add kernel.
         # Zero the child range unless we're explicitly accumulating — matches
         # DenseSumLayer's accumulate_ch_flows contract (the kernel uses
         # atomic_add, so we must clear beforehand when NOT accumulating).
@@ -390,3 +462,71 @@ def _sparse_input_sum_backward_kernel(
         element_flows_ptr + (cid_start + child_id) * batch_size,
         partial_flow,
     )
+
+
+@triton.jit(
+    do_not_specialize=["nid_start", "pid_start"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr", "flow_out_ptr"],
+)
+def _sparse_input_sum_backward_sv_kernel(
+    node_flows_ptr, node_mars_ptr, mparams_ptr,
+    indices_ptr, values_ptr, flow_out_ptr,
+    nid_start, pid_start,
+    batch_size: tl.constexpr,
+    NB: tl.constexpr, NB_ch: tl.constexpr,
+    BS: tl.constexpr, CBS: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+    allow_modify_flows: tl.constexpr,
+):
+    """
+    Sparse-fast-path backward: writes ``flow_out[k] = Σ_p nflow[p] · W[p, c_k]
+    · exp(log_val_k - nmars[p])`` for each active child ``c_k = indices[k]``.
+    No atomics — the grid ``(total_nnz,)`` gives each program exclusive
+    ownership of one output slot. Parent reduction is serial over ``NB``
+    blocks × ``BS / BLOCK_P`` inner tiles so register pressure stays bounded
+    at ``bs=1024``.
+
+    When ``allow_modify_flows`` is set, ``nflow[p]`` is already the
+    pre-transformed ``log(flow) - nmars``; contribution becomes
+    ``exp(nflow + log_val_k) * W`` (matches the dense-atomic kernel above).
+    """
+    pid_k = tl.program_id(0)
+
+    child_id = tl.load(indices_ptr + pid_k)
+    log_val = tl.load(values_ptr + pid_k)
+    cblock = child_id // CBS
+    cslot = child_id % CBS
+
+    # Accumulate contributions across (pblock, p0) tiles on BLOCK_P parallel
+    # lanes; final reduction via tl.sum folds into one scalar per program.
+    acc = tl.zeros([BLOCK_P], dtype=tl.float32)
+
+    for pblock in tl.range(0, NB):
+        # Edge block base for this (pblock, cblock).
+        edge_block_base = pid_start + (pblock * NB_ch + cblock) * CBS * BS + cslot * BS
+        # Parent-node base for this pblock (B=1 → address == nid).
+        parent_base = nid_start + pblock * BS
+
+        for p0 in tl.range(0, BS, BLOCK_P):
+            offs_p = p0 + tl.arange(0, BLOCK_P)                   # [BLOCK_P]
+            mask_p = offs_p < BS
+
+            p_addr = (parent_base + offs_p) * batch_size          # [BLOCK_P]
+            nflows = tl.load(node_flows_ptr + p_addr, mask=mask_p, other=0.0)
+            W = tl.load(
+                mparams_ptr + edge_block_base + offs_p,
+                mask=mask_p, other=0.0,
+            ).to(tl.float32)
+
+            if allow_modify_flows:
+                chunk = tl.exp(nflows + log_val) * W
+            else:
+                nmars = tl.load(
+                    node_mars_ptr + p_addr,
+                    mask=mask_p, other=0.0,
+                )
+                chunk = nflows * W * tl.exp(log_val - nmars)
+
+            acc += tl.where(mask_p, chunk, 0.0)
+
+    tl.store(flow_out_ptr + pid_k, tl.sum(acc))
