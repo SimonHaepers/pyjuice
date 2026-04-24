@@ -99,7 +99,14 @@ class SparseProdLayer(ProdLayer):
                 cs = ns.chs[ch_idx]
                 eids = ns.edge_ids[:, ch_idx].to(torch.long)
                 dense_lookups.append(cs._output_ind_range[0] + eids[h_block] * bs + h_within)
-            dense_lookup = torch.stack(dense_lookups, dim=0)  # [num_dense_chs, H]
+            if dense_lookups:
+                dense_lookup = torch.stack(dense_lookups, dim=0)  # [num_dense_chs, H]
+            else:
+                # num_dense_chs == 0: the forward kernel's static_range over
+                # NUM_DENSE_CHS = 0 compiles to no-op, but Triton still wants a
+                # valid pointer for ``dense_ch_lookup_ptr``. Register a
+                # 1-element stub that never gets dereferenced.
+                dense_lookup = torch.zeros(1, dtype=torch.long)
             buf_name = f"_dense_ch_lookup_{ns_idx}"
             self.register_buffer(buf_name, dense_lookup)
             self._dense_ch_lookups.append(buf_name)

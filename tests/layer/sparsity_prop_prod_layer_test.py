@@ -242,9 +242,11 @@ def test_sparse_prod_em_step_equivalence():
 
 
 def test_sparse_prod_skip_flag_spot_check():
-    """After compile: duplicated sparse inputs fed into a SparseProdLayer are
-    marked ``_skip_input_forward`` / ``_skip_input_backward``; the source
-    ``ns_input`` (consumed by the initial summate) is NOT marked."""
+    """After compile: every SparseCategorical input is consumed by a
+    SparseProdLayer (the duplicates via ``sparse_multiply``, the source via
+    the 1-child sparse wrap that :meth:`SumNodes._standardize_chs` now
+    emits for ``summate(sparse_input)``). All of them should be marked
+    ``_skip_input_forward`` / ``_skip_input_backward``."""
     device = torch.device("cuda:0")
     T, H, V, bs = 3, 4, 8, 4
     csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, density=0.5, seed=7)
@@ -268,21 +270,11 @@ def test_sparse_prod_skip_flag_spot_check():
     # Expect T sparse inputs: the source + (T-1) duplicates.
     assert len(sparse_inputs) == T
 
-    # The source is consumed directly by the initial summate — must NOT be skipped.
-    source = next(ns for ns in sparse_inputs if not ns.is_tied())
-    assert not getattr(source, "_skip_input_forward", False), \
-        "ns_input (consumed by summate) should NOT have _skip_input_forward."
-    assert not getattr(source, "_skip_input_backward", False), \
-        "ns_input (consumed by summate) should NOT have _skip_input_backward."
-
-    # All duplicates are consumed by a multiply only — should be skipped.
-    duplicates = [ns for ns in sparse_inputs if ns.is_tied()]
-    assert len(duplicates) == T - 1
-    for ns in duplicates:
+    for ns in sparse_inputs:
         assert getattr(ns, "_skip_input_forward", False), \
-            "duplicated curr_xs should have _skip_input_forward=True."
+            "every SparseCategorical input should have _skip_input_forward=True."
         assert getattr(ns, "_skip_input_backward", False), \
-            "duplicated curr_xs should have _skip_input_backward=True."
+            "every SparseCategorical input should have _skip_input_backward=True."
 
 
 if __name__ == "__main__":

@@ -19,7 +19,15 @@ class SparseProdNodes(ProdNodes):
     A :class:`ProdNodes` whose children satisfy the sparsity-propagating
     pattern: exactly one :class:`InputNodes` child with a
     :class:`SparseCategorical` distribution (identity block-sparse edges on
-    that slot), plus one or more non-input (sum) children.
+    that slot), plus zero or more non-input (sum) children.
+
+    The zero-dense-child case (``num_dense_chs == 0``) is the 1-child
+    wrapper used by the compiler to bridge an :class:`InputNodes` at one
+    depth to a sum at a deeper depth — mathematically an identity
+    pass-through whose output is just ``log P(x | h)``. It compiles to a
+    :class:`SparseProdLayer` whose consumer sum can pick
+    :class:`SparseInputSumLayer`, avoiding the dense-sum-over-H fallback
+    at the innermost HMM sum.
 
     Created automatically by :func:`pyjuice.multiply` when the pattern is
     detected, or explicitly via :func:`pyjuice.sparse_multiply`. The
@@ -49,8 +57,6 @@ class SparseProdNodes(ProdNodes):
             i for i in range(len(self.chs)) if i != self.sparse_ch_idx
         ]
 
-        assert len(self.dense_ch_idxs) >= 1, \
-            "SparseProdNodes requires at least one dense child."
         for i in self.dense_ch_idxs:
             assert not isinstance(self.chs[i], InputNodes), (
                 f"SparseProdNodes: dense children must be non-input; "

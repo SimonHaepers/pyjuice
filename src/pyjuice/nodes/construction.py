@@ -214,8 +214,15 @@ def _is_sparse_prod_pattern(chs) -> bool:
     in :func:`multiply`. Full invariant checks happen in
     :class:`SparseProdNodes.__init__` — this is just the cheap gate so we
     don't build a ``SparseProdNodes`` over children that obviously don't
-    match."""
-    if len(chs) < 2:
+    match.
+
+    Two acceptable shapes:
+      * ``len(chs) >= 2`` — one :class:`SparseCategorical` input + one or
+        more non-input children (the usual HMM emission × transition prod).
+      * ``len(chs) == 1`` — a single :class:`SparseCategorical` input,
+        used as the identity pass-through wrap the compiler inserts
+        between an input and a deeper-depth sum."""
+    if len(chs) == 0:
         return False
     sparse_ch_idxs = [
         i for i, cs in enumerate(chs)
