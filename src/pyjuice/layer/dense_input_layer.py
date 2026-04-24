@@ -11,8 +11,8 @@ from .input_layer import InputLayer
 class DenseCategoricalInputLayer(InputLayer):
     """Inference-only fast path for ``Categorical`` input layers whose ``InputNodes``
     form a dense ``[V, K, C]`` layout: every group has scope size 1, the same
-    ``num_nodes = K``, and the same ``num_cats = C``. Callers opt in by passing
-    ``use_dense_categorical_input_layer=True`` to ``TensorCircuit``; the class
+    ``num_nodes = K``, and the same ``num_cats = C``. Callers opt in at the DAG
+    level via the :class:`DenseCategorical` distribution marker; the class
     asserts the layout at construction and caches the view metadata that
     :func:`pyjuice.queries.conditional` consumes on the backward pass.
 
@@ -29,10 +29,10 @@ class DenseCategoricalInputLayer(InputLayer):
             max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block,
         )
 
-        if self.dist_signature != "Categorical":
+        if self.dist_signature not in ("Categorical", "DenseCategorical"):
             raise ValueError(
-                "DenseCategoricalInputLayer requires Categorical distributions; "
-                f"got {self.dist_signature}."
+                "DenseCategoricalInputLayer requires Categorical-family "
+                f"distributions; got {self.dist_signature}."
             )
 
         # All groups must share one num_cats.

@@ -118,7 +118,14 @@ class SumNodes(CircuitNodes):
         else:
             assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
             for old_c, new_c in zip(self.chs, chs):
-                assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
+                # Accept a subclass substitution in either direction (e.g. plain
+                # ``ProdNodes`` replaced by ``SparseProdNodes`` or vice versa) —
+                # the HMM builder does this when ``multiply`` auto-detects the
+                # sparse pattern on the multiply output but the first summate's
+                # child was a plain wrapped-input ProdNodes.
+                assert (isinstance(new_c, type(old_c))
+                        or isinstance(old_c, type(new_c))), (
+                    f"Child type not match: ({type(new_c)} != {type(old_c)}).")
                 assert old_c.num_node_blocks == new_c.num_node_blocks, f"Child node size not match: (`num_node_blocks`: {new_c.num_node_blocks} != {old_c.num_node_blocks})."
                 assert old_c.block_size == new_c.block_size, f"Child node size not match: (`block_size`: {new_c.block_size} != {old_c.block_size})."
 
@@ -133,16 +140,22 @@ class SumNodes(CircuitNodes):
             # clone (avoids duplicating ~16 GB per tied copy at
             # ``H=32k, bs=1``), and no re-validation (``torch.unique`` on ~1B
             # entries costs ~8 GB scratch and multiple seconds).
-            return SumNodes(
+            ns = type(self)(
                 self.num_node_blocks, chs, edge_ids = None,
                 params = params, block_size = self.block_size,
                 source_node = self,
                 _presanitised_edge_ids = self.edge_ids,
             )
-
-        return SumNodes(self.num_node_blocks, chs, self.edge_ids.clone(),
-                        params = params, block_size = self.block_size,
-                        source_node = None)
+        else:
+            ns = type(self)(self.num_node_blocks, chs, self.edge_ids.clone(),
+                            params = params, block_size = self.block_size,
+                            source_node = None)
+        # Propagate the ``_force_plain_layer`` pin set by
+        # ``construction.summate(..., _force_plain=True)``: if the source opted
+        # out of the sparse fast path, so should the duplicate.
+        if getattr(self, "_force_plain_layer", False):
+            ns._force_plain_layer = True
+        return ns
 
     def get_params(self, as_matrix: bool = False):
         """

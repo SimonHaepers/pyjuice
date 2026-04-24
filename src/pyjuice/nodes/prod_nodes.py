@@ -102,7 +102,11 @@ class ProdNodes(CircuitNodes):
             assert self.num_chs == len(chs), f"Number of new children ({len(chs)}) must match the number of original children ({self.num_chs})."
             for old_c, new_c in zip(self.chs, chs):
                 if not allow_type_mismatch:
-                    assert type(old_c) == type(new_c), f"Child type not match: ({type(new_c)} != {type(old_c)})."
+                    # Accept subclass substitution in either direction; matches
+                    # ``SumNodes.duplicate``'s relaxed check.
+                    assert (isinstance(new_c, type(old_c))
+                            or isinstance(old_c, type(new_c))), (
+                        f"Child type not match: ({type(new_c)} != {type(old_c)}).")
                 else:
                     assert not new_c.is_prod(), f"Cannot connect a product node to another."
                 assert old_c.num_node_blocks == new_c.num_node_blocks, f"Child node size not match: (`num_node_blocks`: {new_c.num_node_blocks} != {old_c.num_node_blocks})."
@@ -110,7 +114,10 @@ class ProdNodes(CircuitNodes):
 
         edge_ids = self.edge_ids.clone()
 
-        return ProdNodes(self.num_node_blocks, chs, edge_ids, block_size = self.block_size, source_node = self if tie_params else None)
+        ns = type(self)(self.num_node_blocks, chs, edge_ids, block_size = self.block_size, source_node = self if tie_params else None)
+        if getattr(self, "_force_plain_layer", False):
+            ns._force_plain_layer = True
+        return ns
 
     def init_parameters(self, perturbation: float = 2.0, recursive: bool = True, is_root: bool = True, **kwargs):
         """

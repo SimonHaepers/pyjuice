@@ -1,31 +1,51 @@
 """Correctness test: ``DenseCategoricalInputLayer`` conditional backward must
 match the base-``InputLayer`` atomic-add kernel output on HMM circuits.
 
-The class is opt-in via ``TensorCircuit(..., use_dense_categorical_input_layer=True)``.
-We build the same HMM twice with the same seed (so parameters match), once with
-each InputLayer implementation, and compare ``juice.queries.conditional(...)``.
+The class is opt-in at the DAG level via the ``DenseCategorical`` distribution
+marker. We build the same HMM twice with the same seed (so parameters match),
+once with each InputLayer implementation, and compare
+``juice.queries.conditional(...)``.
 """
 import torch
 import pytest
 
 import pyjuice as juice
+import pyjuice.nodes.distributions as dists
+from pyjuice.nodes import inputs, multiply, summate, set_block_size
 from pyjuice.layer import DenseCategoricalInputLayer, InputLayer
+
+
+def _build_hmm_with_dist(T, K, V, homogeneous, dist_cls):
+    """Inline HMM builder so we can swap in ``DenseCategorical`` on the dense
+    path. Mirrors :func:`pyjuice.structures.HMM` with the simplifications the
+    test needs (no alpha/beta/gamma injection)."""
+    block_size = min(32, K)
+    num_node_blocks = K // block_size
+    with set_block_size(block_size=block_size):
+        ns_input = inputs(
+            T - 1, num_node_blocks=num_node_blocks, dist=dist_cls(num_cats=V),
+        )
+        ns_sum = None
+        curr_zs = ns_input
+        for var in range(T - 2, -1, -1):
+            curr_xs = ns_input.duplicate(var, tie_params=homogeneous)
+            if ns_sum is None:
+                ns = summate(curr_zs, num_node_blocks=num_node_blocks)
+                ns_sum = ns
+            else:
+                ns = ns_sum.duplicate(curr_zs, tie_params=homogeneous)
+            curr_zs = multiply(curr_xs, ns)
+        return summate(curr_zs, num_node_blocks=1, block_size=1)
 
 
 def _build_pair(T, K, V, homogeneous, device, seed):
     torch.manual_seed(seed)
-    ns_a = juice.structures.HMM(
-        seq_length=T, num_latents=K, num_emits=V, homogeneous=homogeneous,
-    )
+    ns_a = _build_hmm_with_dist(T, K, V, homogeneous, dists.Categorical)
     pc_ref = juice.TensorCircuit(ns_a, verbose=False).to(device)
 
     torch.manual_seed(seed)
-    ns_b = juice.structures.HMM(
-        seq_length=T, num_latents=K, num_emits=V, homogeneous=homogeneous,
-    )
-    pc_dense = juice.TensorCircuit(
-        ns_b, use_dense_categorical_input_layer=True, verbose=False,
-    ).to(device)
+    ns_b = _build_hmm_with_dist(T, K, V, homogeneous, dists.DenseCategorical)
+    pc_dense = juice.TensorCircuit(ns_b, verbose=False).to(device)
     pc_dense.params.data.copy_(pc_ref.params.data)
 
     return pc_ref, pc_dense
@@ -63,19 +83,16 @@ def test_dense_categorical_input_layer_matches_base(homogeneous, target_subset):
 
 def test_dense_categorical_input_layer_rejects_heterogeneous_num_cats():
     """The class asserts uniform ``num_cats`` at construction. Building a PC
-    with two Categorical InputNodes of different ``num_cats`` and requesting
-    ``use_dense_categorical_input_layer=True`` must raise.
+    with two ``DenseCategorical`` InputNodes of different ``num_cats`` must
+    raise when the circuit compiles.
     """
-    import pyjuice.nodes.distributions as dists
-    from pyjuice.nodes import inputs, multiply, summate
-
-    ni0 = inputs(0, num_nodes=2, dist=dists.Categorical(num_cats=2))
-    ni1 = inputs(1, num_nodes=2, dist=dists.Categorical(num_cats=4))
+    ni0 = inputs(0, num_nodes=2, dist=dists.DenseCategorical(num_cats=2))
+    ni1 = inputs(1, num_nodes=2, dist=dists.DenseCategorical(num_cats=4))
     m   = multiply(ni0, ni1)
     n   = summate(m, num_nodes=1)
 
     with pytest.raises(ValueError, match="uniform num_cats"):
-        juice.TensorCircuit(n, use_dense_categorical_input_layer=True, verbose=False)
+        juice.TensorCircuit(n, verbose=False)
 
 
 if __name__ == "__main__":

@@ -485,7 +485,7 @@ def _discrete_logistic_backward(layer, inputs: torch.Tensor, node_flows: torch.T
 
 
 def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
-    if layer.dist_signature == "Categorical":
+    if layer.dist_signature in ("Categorical", "DenseCategorical"):
         _categorical_forward(layer, inputs, node_mars, **kwargs)
 
     elif layer.dist_signature == "DiscreteLogistic":
@@ -499,7 +499,7 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
 
 
 def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = None, **kwargs):
-    if layer.dist_signature == "Categorical":
+    if layer.dist_signature in ("Categorical", "DenseCategorical"):
         outputs.append(
             _categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
         )

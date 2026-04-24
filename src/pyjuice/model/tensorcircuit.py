@@ -11,7 +11,7 @@ from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, foreach, summate, multiply
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, SparseProdNodes, SparseSumNodes, foreach, summate, multiply
 from pyjuice.nodes.distributions import SparseCategorical
 from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
@@ -126,9 +126,6 @@ class TensorCircuit(nn.Module):
                  max_tied_ns_per_parflow_block: int = 8,
                  device: Optional[Union[int,torch.device]] = None,
                  use_dense_sum_layer: bool = False,
-                 use_dense_categorical_input_layer: bool = False,
-                 use_sparse_prod_layer: bool = False,
-                 use_sparse_sum_layer: bool = False,
                  param_dtype: torch.dtype = torch.float32,
                  verbose: bool = True) -> None:
 
@@ -148,9 +145,6 @@ class TensorCircuit(nn.Module):
         self.param_flows = None
 
         self.use_dense_sum_layer = use_dense_sum_layer
-        self.use_dense_categorical_input_layer = use_dense_categorical_input_layer
-        self.use_sparse_prod_layer = use_sparse_prod_layer
-        self.use_sparse_sum_layer = use_sparse_sum_layer
         self.param_dtype = param_dtype
 
         self._init_layers(
@@ -1010,7 +1004,7 @@ class TensorCircuit(nn.Module):
                     input_layers = []
                     for signature, nodes in signature2nodes.items():
                         input_layer_cls = InputLayer
-                        if self.use_dense_categorical_input_layer and signature == "Categorical":
+                        if signature == "DenseCategorical":
                             input_layer_cls = DenseCategoricalInputLayer
                         input_layer = input_layer_cls(
                             nodes = nodes, cum_nodes = num_nodes,
@@ -1041,51 +1035,16 @@ class TensorCircuit(nn.Module):
 
                     # Product layer(s): group by (block_size, sparse-eligibility).
                     #
-                    # A ProdNodes is sparse-eligible when it has exactly one
-                    # SparseCategorical-input child, identity block-sparse edges
-                    # on that slot, matching num_node_blocks/block_size, and is
-                    # the *sole consumer* of that sparse input (demote otherwise
-                    # — the input layer must still populate node_mars for shared
-                    # consumers like the initial summate over ns_input in HMM).
-                    def _sparse_prod_eligible(ns):
-                        if not self.use_sparse_prod_layer:
-                            return False
-                        if not isinstance(ns, ProdNodes) or not ns.is_block_sparse():
-                            return False
-                        # Need at least one non-sparse child to benefit from
-                        # sparsity propagation — skip 1-child wrappers inserted
-                        # by SumNodes._standardize_chs around input children.
-                        if len(ns.chs) < 2:
-                            return False
-                        sparse_chs = [
-                            i for i, cs in enumerate(ns.chs)
-                            if isinstance(cs, InputNodes)
-                            and isinstance(cs.dist, SparseCategorical)
-                        ]
-                        if len(sparse_chs) != 1:
-                            return False
-                        sci = sparse_chs[0]
-                        sc = ns.chs[sci]
-                        if ns.block_size != sc.block_size:
-                            return False
-                        if ns.num_node_blocks != sc.num_node_blocks:
-                            return False
-                        if not torch.equal(
-                            ns.edge_ids[:, sci].to(torch.long),
-                            torch.arange(ns.num_node_blocks, dtype=torch.long),
-                        ):
-                            return False
-                        # Rest must be non-input.
-                        for i in range(len(ns.chs)):
-                            if i == sci:
-                                continue
-                            if isinstance(ns.chs[i], InputNodes):
-                                return False
-                        return True
-
+                    # A ProdNodes is sparse-eligible iff it is a
+                    # :class:`SparseProdNodes` (all structural invariants were
+                    # checked at DAG-build time) AND is the *sole consumer* of
+                    # its sparse input child — demote otherwise, since the
+                    # input layer must still populate ``node_mars`` for other
+                    # consumers (e.g. the initial ``summate`` over ``ns_input``
+                    # in the HMM builder).
                     eligible = {
                         id(ns) for ns in depth2nodes[depth]["prod"]
-                        if _sparse_prod_eligible(ns)
+                        if isinstance(ns, SparseProdNodes)
                     }
                     if eligible:
                         # Sole-consumer claim pass: count references per sparse
@@ -1174,16 +1133,23 @@ class TensorCircuit(nn.Module):
                                 and ns.is_block_dense
                                 and len(ns.chs) == 1)
 
-                    # Sparse-input-sum eligibility: needs the block-dense +
-                    # single-child structure (same as dense-eligible)
-                    # INDEPENDENT of `use_dense_sum_layer`, plus the single
-                    # child ProdNodes must have been compiled to a
-                    # SparseProdLayer at an earlier depth in this same build.
+                    # Sparse-input-sum eligibility: either the DAG builder
+                    # explicitly marked this as :class:`SparseSumNodes`, OR the
+                    # structural pattern holds — block-dense single-child sum
+                    # whose child was compiled as a :class:`SparseProdLayer`.
+                    #
+                    # The structural fallback matters because the HMM builder's
+                    # intermediate summates come from ``ns_sum.duplicate(...)``,
+                    # which preserves the *source* class (plain ``SumNodes`` —
+                    # the source's first child was the standardized wrapper
+                    # around ``ns_input``, before any multiply output existed).
+                    # Auto-promoting in ``duplicate`` would fight ``_force_plain``,
+                    # so we stick with source-class-preserving duplication and
+                    # let the compiler structurally detect the fast path.
                     def _sparse_sum_eligible(ns):
-                        if not self.use_sparse_sum_layer:
+                        if getattr(ns, "_force_plain_layer", False):
                             return False
-                        if not (ns.is_block_dense
-                                and len(ns.chs) == 1):
+                        if not (ns.is_block_dense and len(ns.chs) == 1):
                             return False
                         cs = ns.chs[0]
                         for lg in self.inner_layer_groups:

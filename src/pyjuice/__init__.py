@@ -16,7 +16,8 @@ from pyjuice.model import compile, TensorCircuit
 from pyjuice.layer import InputLayer, ProdLayer, SumLayer
 
 # Construction methods
-from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties
+from pyjuice.nodes import multiply, summate, inputs, set_block_size, structural_properties, sparse_multiply, sparse_summate
+from pyjuice.nodes import SparseProdNodes, SparseSumNodes
 
 # Distributions
 from pyjuice.nodes import distributions

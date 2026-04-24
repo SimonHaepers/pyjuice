@@ -1,5 +1,5 @@
 from .distributions import Distribution
-from .categorical import Categorical
+from .categorical import Categorical, DenseCategorical
 from .literal import Literal
 from .indicator import Indicator
 from .bernoulli import Bernoulli

@@ -11,7 +11,9 @@ from .nodes import CircuitNodes
 from .input_nodes import InputNodes
 from .prod_nodes import ProdNodes
 from .sum_nodes import SumNodes
-from .distributions import Distribution
+from .sparse_prod_nodes import SparseProdNodes
+from .sparse_sum_nodes import SparseSumNodes
+from .distributions import Distribution, SparseCategorical
 from pyjuice.graph import RegionGraph
 
 Tensor = Union[np.ndarray,torch.Tensor]
@@ -66,7 +68,8 @@ def inputs(var: Union[int,Sequence[int]], num_node_blocks: int = 0, dist: Distri
     )
 
 
-def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, sparse_edges: bool = False, **kwargs) -> ProdNodes:
+def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, sparse_edges: bool = False,
+             _force_plain: bool = False, **kwargs) -> ProdNodes:
     """
     Construct a vector of product nodes given a list of children PCs defined on disjoint sets of variables.
 
@@ -116,12 +119,17 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
             num_node_blocks = edge_ids.shape[0]
         assert edge_ids.shape[0] == num_node_blocks or edge_ids.shape[0] == num_node_blocks * block_size
 
-    return ProdNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
+    cls = SparseProdNodes if (not _force_plain and _is_sparse_prod_pattern(chs)) else ProdNodes
+    ns = cls(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
+    if _force_plain:
+        ns._force_plain_layer = True
+    return ns
 
 
 def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0,
-            edge_ids: Optional[Tensor] = None, block_size: int = 0, 
-            sum_edge_ids_constructor: Optional[Callable] = None, **kwargs) -> SumNodes:
+            edge_ids: Optional[Tensor] = None, block_size: int = 0,
+            sum_edge_ids_constructor: Optional[Callable] = None,
+            _force_plain: bool = False, **kwargs) -> SumNodes:
     """
     Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
 
@@ -187,7 +195,72 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
             assert nodes.scope == scope, "Children of a `SumNodes` should have the same scope."
         chs.append(nodes)
 
-    return SumNodes(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
+    cls = SumNodes
+    if (not _force_plain) and len(chs) == 1 and isinstance(chs[0], SparseProdNodes):
+        cls = SparseSumNodes
+    ns = cls(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
+    if _force_plain:
+        # Pin this node so the compile-time structural fallback in
+        # ``TensorCircuit._sparse_sum_eligible`` does not promote it to the
+        # :class:`SparseInputSumLayer` fast path. Used by tests that need
+        # param-flow accumulation through the sums (the sparse sum layer is
+        # inference-only).
+        ns._force_plain_layer = True
+    return ns
+
+
+def _is_sparse_prod_pattern(chs) -> bool:
+    """Structural detector for the sparse-prod pattern used by auto-dispatch
+    in :func:`multiply`. Full invariant checks happen in
+    :class:`SparseProdNodes.__init__` — this is just the cheap gate so we
+    don't build a ``SparseProdNodes`` over children that obviously don't
+    match."""
+    if len(chs) < 2:
+        return False
+    sparse_ch_idxs = [
+        i for i, cs in enumerate(chs)
+        if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical)
+    ]
+    if len(sparse_ch_idxs) != 1:
+        return False
+    return all(not isinstance(cs, InputNodes)
+               for i, cs in enumerate(chs) if i != sparse_ch_idxs[0])
+
+
+def sparse_multiply(nodes1: ProdNodesChs, *args, **kwargs) -> SparseProdNodes:
+    """
+    Explicit sparse counterpart of :func:`multiply` — asserts that the resulting
+    :class:`ProdNodes` is a :class:`SparseProdNodes`. Useful when you want to
+    fail loudly if the children don't satisfy the sparse-propagation pattern
+    (one :class:`SparseCategorical` input + ≥1 non-input sibling, matching
+    block sizes, identity edges on the sparse slot).
+
+    Identical to ``multiply`` for eligible children; raises a clear error
+    otherwise.
+    """
+    ns = multiply(nodes1, *args, **kwargs)
+    assert isinstance(ns, SparseProdNodes), (
+        "sparse_multiply: children do not match the sparse-prod pattern "
+        "(need exactly one SparseCategorical input child + ≥1 non-input "
+        "sibling). Use `multiply` instead, or adjust the children."
+    )
+    return ns
+
+
+def sparse_summate(nodes1: SumNodesChs, *args, **kwargs) -> SparseSumNodes:
+    """
+    Explicit sparse counterpart of :func:`summate` — asserts that the resulting
+    :class:`SumNodes` is a :class:`SparseSumNodes`. A ``SparseSumNodes`` is
+    only produced when the single child is a :class:`SparseProdNodes` with
+    block-dense edges.
+    """
+    ns = summate(nodes1, *args, **kwargs)
+    assert isinstance(ns, SparseSumNodes), (
+        "sparse_summate: the single child must be a `SparseProdNodes` "
+        "(built via `multiply` / `sparse_multiply` over a SparseCategorical "
+        "input)."
+    )
+    return ns
 
 
 class set_block_size(_DecoratorContextManager):

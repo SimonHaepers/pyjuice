@@ -278,3 +278,20 @@ class Categorical(Distribution):
 
     def _need_2nd_kernel_dim(self):
         return True
+
+
+class DenseCategorical(Categorical):
+    """
+    Marker subclass of :class:`Categorical` signalling that the compiled
+    :class:`~pyjuice.layer.InputLayer` should use
+    :class:`~pyjuice.layer.DenseCategoricalInputLayer` (with a ``[V, K, C]``
+    parameter layout and a bmm-based backward). Math and on-the-wire params
+    are identical to ``Categorical``; only ``get_signature()`` differs so
+    the layer dispatcher picks the fast-path class.
+    """
+
+    def get_signature(self):
+        return "DenseCategorical"
+
+    def _get_constructor(self):
+        return DenseCategorical, {"num_cats": self.num_cats}
