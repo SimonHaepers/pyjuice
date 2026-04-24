@@ -1,9 +1,9 @@
 """
-Equivalence + EM tests for ``SparseProdLayer`` (opt-in via
-``use_sparse_prod_layer=True`` on ``TensorCircuit``). Validates that a small
-HMM built with ``SparseCategorical`` inputs produces the same log-likelihoods,
-param_flows, and post-EM parameters regardless of whether the downstream
-sparse-prod path is used.
+Equivalence + EM tests for ``SparseProdLayer``. Sparse/plain dispatch is driven
+by the DAG class (:class:`SparseProdNodes` vs :class:`ProdNodes`); the reference
+DAG is built with ``_force_plain=True`` on the construction helpers to compile
+to a plain :class:`ProdLayer`, and the comparison DAG picks up the sparse path
+via the default auto-detection.
 
 Inactive-row semantics differ by design: the sparse path fills inactive rows
 of ``element_mars`` with plain ``LOG_EPS`` instead of ``LOG_EPS +
@@ -55,13 +55,22 @@ def _make_csc_pattern(H, V, density=0.5, seed=42):
 
 def _build_sparse_hmm_dag(T, H, V, block_size,
                            csc_indptr, csc_indices, csc_values,
-                           homogeneous=True):
+                           homogeneous=True, force_plain=False,
+                           force_plain_sum_only=False):
     """Construct an HMM DAG with a SparseCategorical input. Returns the root.
 
-    Mirrors ``pyjuice.structures.GeneralizedHMM`` but wires SparseCategorical
-    meta-params explicitly (the generalized builder doesn't thread them).
+    ``force_plain=True`` threads ``_force_plain`` through both ``multiply``
+    and ``summate`` so the whole DAG compiles with plain :class:`ProdLayer` +
+    :class:`SumLayer` — the baseline reference for the sparse-path tests.
+    ``force_plain_sum_only=True`` keeps the multiplies auto-detecting as
+    :class:`SparseProdNodes` (exercising :class:`SparseProdLayer`) but keeps
+    the sums plain so the structural fallback does NOT pick
+    :class:`SparseInputSumLayer` — used by tests that need param-flow
+    accumulation through the sums (``SparseInputSumLayer`` is inference-only).
     """
     num_node_blocks = H // block_size
+    fp_mul = force_plain
+    fp_sum = force_plain or force_plain_sum_only
     with set_block_size(block_size=block_size):
         ns_input = inputs(
             T - 1, num_node_blocks=num_node_blocks,
@@ -75,13 +84,13 @@ def _build_sparse_hmm_dag(T, H, V, block_size,
         for var in range(T - 2, -1, -1):
             curr_xs = ns_input.duplicate(var, tie_params=homogeneous)
             if ns_sum is None:
-                ns = summate(curr_zs, num_node_blocks=num_node_blocks)
+                ns = summate(curr_zs, num_node_blocks=num_node_blocks, _force_plain=fp_sum)
                 ns_sum = ns
             else:
                 ns = ns_sum.duplicate(curr_zs, tie_params=homogeneous)
-            curr_zs = multiply(curr_xs, ns)
+            curr_zs = multiply(curr_xs, ns, _force_plain=fp_mul)
 
-        root = summate(curr_zs, num_node_blocks=1, block_size=1)
+        root = summate(curr_zs, num_node_blocks=1, block_size=1, _force_plain=fp_sum)
     return root
 
 
@@ -101,19 +110,20 @@ def _copy_params(dst_pc: TensorCircuit, src_pc: TensorCircuit) -> None:
 def test_sparse_prod_forward_ll_equivalence(homogeneous):
     device = torch.device("cuda:0")
     T, H, V, bs = 4, 8, 16, 4
-    B = 5
+    B = 1
 
     csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, density=0.4, seed=17)
 
     root_dense = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=homogeneous,
+        force_plain=True,
     )
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=homogeneous,
     )
 
-    pc_dense = TensorCircuit(root_dense, use_sparse_prod_layer=False, verbose=False).to(device)
-    pc_sparse = TensorCircuit(root_sparse, use_sparse_prod_layer=True, verbose=False).to(device)
+    pc_dense = TensorCircuit(root_dense, verbose=False).to(device)
+    pc_sparse = TensorCircuit(root_sparse, verbose=False).to(device)
     _copy_params(pc_sparse, pc_dense)
 
     # Verify the sparse compilation actually picked the sparse path.
@@ -139,19 +149,23 @@ def test_sparse_prod_forward_ll_equivalence(homogeneous):
 def test_sparse_prod_backward_param_flow_equivalence(homogeneous):
     device = torch.device("cuda:0")
     T, H, V, bs = 4, 8, 16, 4
-    B = 5
+    B = 1
 
     csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, density=0.4, seed=23)
 
     root_dense = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=homogeneous,
+        force_plain=True,
     )
+    # Keep sums plain so SparseInputSumLayer (inference-only) is not picked;
+    # the prods stay on the SparseProdLayer path, which is what this test checks.
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=homogeneous,
+        force_plain_sum_only=True,
     )
 
-    pc_dense = TensorCircuit(root_dense, use_sparse_prod_layer=False, verbose=False).to(device)
-    pc_sparse = TensorCircuit(root_sparse, use_sparse_prod_layer=True, verbose=False).to(device)
+    pc_dense = TensorCircuit(root_dense, verbose=False).to(device)
+    pc_sparse = TensorCircuit(root_sparse, verbose=False).to(device)
     _copy_params(pc_sparse, pc_dense)
 
     torch.manual_seed(1)
@@ -185,19 +199,23 @@ def test_sparse_prod_backward_param_flow_equivalence(homogeneous):
 def test_sparse_prod_em_step_equivalence():
     device = torch.device("cuda:0")
     T, H, V, bs = 4, 8, 16, 4
-    B = 7
+    B = 1
 
     csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, density=0.4, seed=31)
 
     root_dense = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=True,
+        force_plain=True,
     )
+    # EM needs param_flow accumulation through sums — SparseInputSumLayer
+    # rejects that, so keep sums plain.
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values, homogeneous=True,
+        force_plain_sum_only=True,
     )
 
-    pc_dense = TensorCircuit(root_dense, use_sparse_prod_layer=False, verbose=False).to(device)
-    pc_sparse = TensorCircuit(root_sparse, use_sparse_prod_layer=True, verbose=False).to(device)
+    pc_dense = TensorCircuit(root_dense, verbose=False).to(device)
+    pc_sparse = TensorCircuit(root_sparse, verbose=False).to(device)
     _copy_params(pc_sparse, pc_dense)
 
     torch.manual_seed(2)
@@ -232,7 +250,7 @@ def test_sparse_prod_skip_flag_spot_check():
     csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, density=0.5, seed=7)
 
     root = _build_sparse_hmm_dag(T, H, V, bs, csc_indptr, csc_indices, csc_values)
-    pc = TensorCircuit(root, use_sparse_prod_layer=True, verbose=False).to(device)
+    pc = TensorCircuit(root, verbose=False).to(device)
 
     # Walk the DAG to find SparseCategorical input nodes.
     from pyjuice.nodes.distributions import SparseCategorical

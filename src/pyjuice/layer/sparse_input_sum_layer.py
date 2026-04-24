@@ -8,24 +8,30 @@ import triton
 import triton.language as tl
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils.kernel_launcher import triton_jit
 from .dense_sum_layer import DenseSumLayer
 from .sparse_prod_layer import SparseProdLayer
-from .sparse_node_values import SparseNodeValues
+
+
+_FWD_BLOCK_K = 64
+"""Fixed K-axis tile size for :func:`_sparse_input_sum_forward_kernel`.
+
+The forward kernel reduces over ``total_nnz`` active child slots. Keeping
+``BLOCK_K`` a module-level constant means the kernel compiles **once** —
+independent of per-call nnz — so we can ship AOT-compiled kernels for
+deployment on platforms without a Triton JIT. Tuning knob: larger = fewer
+inner-loop iterations but more register pressure per program.
+"""
 
 
 class SparseInputSumLayer(DenseSumLayer):
     """
     Block-dense sum layer whose single child is a :class:`SparseProdLayer`.
-    When ``batch_size == 1`` + propagation_alg is LL + logspace_flows off +
-    negate_pflows off, forward/backward take a sparse fast path that reads the
-    upstream ``SparseNodeValues`` directly (O(nnz·M)) instead of the full
-    element_mars tile (O(H·M)). Other configurations fall back to the
-    inherited :class:`DenseSumLayer` path transparently — :class:`SparseProdLayer`
-    always materialises a dense ``element_mars`` via its scatter-to-dense step,
-    so the fallback is correctness-safe.
+    Forward/backward read the upstream :class:`SparseNodeValues` directly
+    (O(nnz·M)) instead of the full element_mars tile (O(H·M)).
 
-    Inference-only, matching :class:`DenseSumLayer`'s contract (``param_flows=None``).
+    Inference-only + **batch_size == 1 only** (the underlying sparse fast path
+    is B=1 by design, matching :class:`SparseProdLayer`). For B>1 circuits,
+    build with plain `summate` / `multiply` (or ``_force_plain=True``).
     """
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
@@ -57,10 +63,11 @@ class SparseInputSumLayer(DenseSumLayer):
         self._build_sparse_input_refs(inner_layer_groups)
 
     def _build_sparse_input_refs(self, inner_layer_groups: list) -> None:
-        """For each SumNodes in ``self.nodes``, store
-        ``(sparse_prod_layer, ns_idx_in_prod, max_nnz_per_col)`` so forward/
-        backward can fetch the per-call :class:`SparseNodeValues`."""
-        self._sparse_input_refs: List[Tuple[SparseProdLayer, int, int]] = []
+        """For each :class:`SparseSumNodes` in ``self.nodes``, store
+        ``(sparse_prod_layer, ns_idx_in_prod)`` so forward/backward can fetch
+        the per-call :class:`SparseNodeValues`.
+        """
+        self._sparse_input_refs: List[Tuple[SparseProdLayer, int]] = []
 
         for ns in self.nodes:
             assert len(ns.chs) == 1, \
@@ -76,8 +83,7 @@ class SparseInputSumLayer(DenseSumLayer):
                         continue
                     for idx, prod_ns in enumerate(layer.nodes):
                         if prod_ns is cs:
-                            max_k = layer._sparse_meta[idx]["max_nnz_per_col"]
-                            found = (layer, idx, max_k)
+                            found = (layer, idx)
                             break
                     if found is not None:
                         break
@@ -98,39 +104,6 @@ class SparseInputSumLayer(DenseSumLayer):
         )
 
     # ------------------------------------------------------------------ #
-    # Fast-path gate
-    # ------------------------------------------------------------------ #
-
-    def _sparse_path_eligible(self, batch_size: int, propagation_alg: str,
-                               logspace_flows: bool, negate_pflows: bool,
-                               allow_neg_flows: bool) -> bool:
-        return (
-            batch_size == 1
-            and propagation_alg == "LL"
-            and not logspace_flows
-            and not negate_pflows
-            and not allow_neg_flows
-        )
-
-    def _ensure_element_mars_populated(self, element_mars: torch.Tensor) -> None:
-        """If any upstream :class:`SparseProdLayer` was flagged to skip its
-        scatter-to-dense step, materialise ``element_mars`` at its output
-        range now — required before handing off to the inherited
-        :meth:`DenseSumLayer.forward`/``backward`` (which reads element_mars
-        densely)."""
-        from .sparse_node_values import LOG_EPS as _LOG_EPS
-        for block, (sparse_prod, ns_idx, _max_k) in zip(
-            self._dense_blocks, self._sparse_input_refs,
-        ):
-            if not getattr(sparse_prod, "_skip_scatter", False):
-                continue
-            sv = sparse_prod._sparse_outputs.get(ns_idx)
-            if sv is None:
-                continue
-            output_base = sparse_prod._sparse_meta[ns_idx]["output_ind_base"]
-            sv.scatter_to_dense(element_mars, output_base, fill_value=_LOG_EPS)
-
-    # ------------------------------------------------------------------ #
     # Forward
     # ------------------------------------------------------------------ #
 
@@ -139,42 +112,46 @@ class SparseInputSumLayer(DenseSumLayer):
                 force_use_fp32: bool = False, propagation_alg: str = "LL",
                 **kwargs) -> None:
         batch_size = node_mars.size(1)
-        if not self._sparse_path_eligible(
-            batch_size=batch_size, propagation_alg=propagation_alg,
-            logspace_flows=False, negate_pflows=False, allow_neg_flows=False,
-        ):
-            self._ensure_element_mars_populated(element_mars)
-            return super().forward(
-                node_mars=node_mars, element_mars=element_mars, params=params,
-                force_use_bf16=force_use_bf16, force_use_fp32=force_use_fp32,
-                propagation_alg=propagation_alg, **kwargs,
-            )
+        assert batch_size == 1, (
+            "SparseInputSumLayer is B=1 only. Build with plain `summate` "
+            "(or `_force_plain=True`) for B>1."
+        )
+        assert propagation_alg == "LL", (
+            "SparseInputSumLayer requires propagation_alg == 'LL'."
+        )
 
         assert params.dim() == 1
 
-        for block, (sparse_prod, ns_idx, max_k) in zip(
+        torch.cuda.nvtx.range_push(
+            f"SparseInputSumLayer.fwd(n_blocks={len(self._dense_blocks)})"
+        )
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
-        ):
+        )):
             nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, BS, CBS = block
             sv = sparse_prod._sparse_outputs[ns_idx]
             total_nnz = sv.total_nnz
             if total_nnz == 0:
                 # Empty active column: log(0) = -inf for all parents.
+                torch.cuda.nvtx.range_push(f"block[{blk_idx}]/empty_col_fill")
                 node_mars[nid_start:nid_start + NB * BS, 0].fill_(float("-inf"))
+                torch.cuda.nvtx.range_pop()
                 continue
 
+            torch.cuda.nvtx.range_push(f"block[{blk_idx}]")
             # Per-call max of sparse values (for linear-sum numerical stability).
             # `values` is already length `total_nnz` (no padding); scalar reduction
             # on device keeps the kernel pure.
+            torch.cuda.nvtx.range_push("values.max()")
             max_val = sv.values.max()
+            torch.cuda.nvtx.range_pop()
 
-            BLOCK_K = max(triton.next_power_of_2(int(max_k)), 4)
             # Tile parents: TILE_M divides BS and is a power of 2.
             TILE_M = min(BS, 32)
-            # Force power-of-2 and BS-divisibility.
             while BS % TILE_M != 0 and TILE_M > 1:
                 TILE_M //= 2
 
+            torch.cuda.nvtx.range_push(f"_sparse_input_sum_fwd_kernel(nnz={total_nnz})")
             grid = (NB * (BS // TILE_M),)
             _sparse_input_sum_forward_kernel[grid](
                 node_mars_ptr=node_mars,
@@ -190,8 +167,11 @@ class SparseInputSumLayer(DenseSumLayer):
                 BS=BS,
                 CBS=CBS,
                 TILE_M=TILE_M,
-                BLOCK_K=BLOCK_K,
+                BLOCK_K=_FWD_BLOCK_K,
             )
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
 
         return None
 
@@ -214,41 +194,44 @@ class SparseInputSumLayer(DenseSumLayer):
             )
 
         batch_size = node_mars.size(1)
-        if not self._sparse_path_eligible(
-            batch_size=batch_size, propagation_alg=propagation_alg,
-            logspace_flows=logspace_flows, negate_pflows=negate_pflows,
-            allow_neg_flows=allow_neg_flows,
-        ):
-            self._ensure_element_mars_populated(element_mars)
-            return super().backward(
-                node_flows=node_flows, element_flows=element_flows,
-                node_mars=node_mars, element_mars=element_mars, params=params,
-                param_flows=param_flows, allow_modify_flows=allow_modify_flows,
-                propagation_alg=propagation_alg, logspace_flows=logspace_flows,
-                negate_pflows=negate_pflows, accumulate_ch_flows=accumulate_ch_flows,
-                allow_neg_flows=allow_neg_flows, force_use_fp32=force_use_fp32,
-                **kwargs,
-            )
+        assert batch_size == 1, (
+            "SparseInputSumLayer is B=1 only. Build with plain `summate` "
+            "(or `_force_plain=True`) for B>1."
+        )
+        assert propagation_alg == "LL" and not logspace_flows and not negate_pflows \
+               and not allow_neg_flows, (
+            "SparseInputSumLayer backward requires propagation_alg='LL' + "
+            "logspace_flows=False + negate_pflows=False + allow_neg_flows=False."
+        )
+
+        torch.cuda.nvtx.range_push(
+            f"SparseInputSumLayer.bwd(n_blocks={len(self._dense_blocks)})"
+        )
 
         # Zero the child range unless we're explicitly accumulating — matches
         # DenseSumLayer's accumulate_ch_flows contract (the kernel uses
         # atomic_add, so we must clear beforehand when NOT accumulating).
         if not accumulate_ch_flows:
-            for block, (sparse_prod, ns_idx, _) in zip(
+            torch.cuda.nvtx.range_push("zero_child_ranges(pytorch .zero_())")
+            for block, (sparse_prod, ns_idx) in zip(
                 self._dense_blocks, self._sparse_input_refs,
             ):
                 _nid_start, cid_start, _pid_start, _pfid_start, _NB, NB_ch, _BS, CBS = block
                 element_flows[cid_start:cid_start + NB_ch * CBS, 0].zero_()
+            torch.cuda.nvtx.range_pop()
 
-        for block, (sparse_prod, ns_idx, _max_k) in zip(
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
-        ):
+        )):
             nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, BS, CBS = block
             sv = sparse_prod._sparse_outputs[ns_idx]
             total_nnz = sv.total_nnz
             if total_nnz == 0:
                 continue
 
+            torch.cuda.nvtx.range_push(
+                f"block[{blk_idx}]/_sparse_input_sum_bwd_kernel(nnz={total_nnz})"
+            )
             grid = (total_nnz, NB)
             _sparse_input_sum_backward_kernel[grid](
                 node_flows_ptr=node_flows,
@@ -266,7 +249,9 @@ class SparseInputSumLayer(DenseSumLayer):
                 CBS=CBS,
                 allow_modify_flows=1 if allow_modify_flows else 0,
             )
+            torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_pop()
         return None
 
 
@@ -275,11 +260,14 @@ class SparseInputSumLayer(DenseSumLayer):
 # =====================================================================
 
 
-@triton_jit
+@triton.jit(
+    do_not_specialize=["nid_start", "pid_start", "total_nnz"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr", "max_val_ptr"],
+)
 def _sparse_input_sum_forward_kernel(
     node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, max_val_ptr,
-    nid_start: tl.constexpr, pid_start: tl.constexpr,
+    nid_start, pid_start,
     batch_size: tl.constexpr,
     total_nnz,
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
@@ -288,12 +276,19 @@ def _sparse_input_sum_forward_kernel(
     """
     Forward for one SparseInputSumLayer block, gated to batch_size == 1.
 
+    Split-K reduction: the kernel compiles once for a fixed ``BLOCK_K`` and
+    loops over ``ceil(total_nnz / BLOCK_K)`` chunks at runtime — the grid is
+    purely parent-tile-shaped, so ``total_nnz`` never drives a recompile.
+    ``nid_start`` / ``pid_start`` are runtime ints for the same reason
+    (they change per layer block and we want one compiled kernel across all
+    of them).
+
     Per-program (parent tile) math:
 
-      v_k = exp(log_values[k] - max_val)                       [BLOCK_K]
+      v_k = exp(log_values[k] - max_val)                       [per-chunk]
       W[m, k] = mparams[pid_start + (pblock * NB_ch + cblock_k) * CBS * BS
-                                   + cslot_k * BS + parent_m]   [TILE_M, BLOCK_K]
-      acc_sum[m] = Σ_k W[m, k] · v_k                            [TILE_M]
+                                   + cslot_k * BS + parent_m]
+      acc_sum[m] += Σ_{k ∈ chunk} W[m, k] · v_k                 [TILE_M]
       node_mars[nid_start + pblock * BS + parent_m, 0]
           = log(acc_sum[m] + 1e-24) + max_val
 
@@ -306,29 +301,32 @@ def _sparse_input_sum_forward_kernel(
     offs_node = tl.arange(0, TILE_M) + ntile_id * TILE_M          # [TILE_M]
     off_nid = nid_start + pblock_id * BS + offs_node              # [TILE_M]
 
-    offs_k = tl.arange(0, BLOCK_K)                                # [BLOCK_K]
-    mask_k = offs_k < total_nnz
-
-    child_ids = tl.load(indices_ptr + offs_k, mask=mask_k, other=0)
-    log_vals = tl.load(values_ptr + offs_k, mask=mask_k, other=-float("inf"))
-
     max_val = tl.load(max_val_ptr)                                # scalar
-    v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)       # [BLOCK_K]
 
-    cblock = child_ids // CBS                                     # [BLOCK_K]
-    cslot = child_ids % CBS                                       # [BLOCK_K]
+    acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
+    for k0 in tl.range(0, total_nnz, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)                       # [BLOCK_K]
+        mask_k = offs_k < total_nnz
 
-    # W[TILE_M, BLOCK_K]
-    W_ptr_off = (
-        pid_start
-        + (pblock_id * NB_ch + cblock[None, :]) * CBS * BS
-        + cslot[None, :] * BS
-        + offs_node[:, None]
-    )
-    W = tl.load(mparams_ptr + W_ptr_off, mask=mask_k[None, :], other=0.0).to(tl.float32)
+        child_ids = tl.load(indices_ptr + offs_k, mask=mask_k, other=0)
+        log_vals = tl.load(values_ptr + offs_k, mask=mask_k,
+                           other=-float("inf"))
 
-    # acc_sum[TILE_M] = Σ_k W[m, k] · v_k
-    acc_sum = tl.sum(W * v_k[None, :], axis=1)                    # [TILE_M]
+        v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)   # [BLOCK_K]
+
+        cblock = child_ids // CBS
+        cslot = child_ids % CBS
+
+        W_ptr_off = (
+            pid_start
+            + (pblock_id * NB_ch + cblock[None, :]) * CBS * BS
+            + cslot[None, :] * BS
+            + offs_node[:, None]
+        )
+        W = tl.load(mparams_ptr + W_ptr_off,
+                    mask=mask_k[None, :], other=0.0).to(tl.float32)
+
+        acc_sum += tl.sum(W * v_k[None, :], axis=1)               # [TILE_M]
 
     result = tl.log(acc_sum + 1e-24) + max_val
 
@@ -336,11 +334,14 @@ def _sparse_input_sum_forward_kernel(
     tl.store(node_mars_ptr + off_nid * batch_size, result)
 
 
-@triton_jit
+@triton.jit(
+    do_not_specialize=["nid_start", "cid_start", "pid_start"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr"],
+)
 def _sparse_input_sum_backward_kernel(
     node_flows_ptr, node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, element_flows_ptr,
-    nid_start: tl.constexpr, cid_start: tl.constexpr, pid_start: tl.constexpr,
+    nid_start, cid_start, pid_start,
     batch_size: tl.constexpr,
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     allow_modify_flows: tl.constexpr,

@@ -247,8 +247,10 @@ class TensorCircuit(nn.Module):
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
+                torch.cuda.nvtx.range_push("fwd/buffer_init")
                 self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
                 self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+                torch.cuda.nvtx.range_pop()
 
             # Load cached node marginals
             if self._buffer_matches(name = "node_mars", cache = cache):
@@ -258,6 +260,7 @@ class TensorCircuit(nn.Module):
 
             # Input layers
             if not _inner_layers_only:
+                torch.cuda.nvtx.range_push("fwd/input_layers")
                 for idx, layer in enumerate(self.input_layer_group):
                     if input_layer_fn is None:
                         layer(inputs, self.node_mars, **kwargs)
@@ -275,26 +278,42 @@ class TensorCircuit(nn.Module):
 
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
+                torch.cuda.nvtx.range_pop()  # fwd/input_layers
 
             # SparseProdLayer needs `data` to look up per-batch active CSC
             # columns; stash a reference so the inner loop + the re-forward
-            # inside backward both see it.
+            # inside backward both see it. We also cache a CPU mirror so the
+            # O(T) per-timestep host reads in
+            # :meth:`SparseCategorical.build_sparse_pattern` don't each trigger
+            # a full host<->device sync — one ``.cpu()`` here amortises into
+            # every SparseProdLayer.forward within this call. Skip the copy
+            # for dense-only circuits and when ``inputs`` is already on CPU.
             self._run_data = inputs
+            if self._has_sparse_prod and inputs.device.type != "cpu":
+                self._run_data_cpu = inputs.cpu()
+            else:
+                self._run_data_cpu = inputs
 
             # Inner layers
             def _run_inner_layers():
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
-                        layer_group(self.node_mars, self.element_mars, data = self._run_data)
+                        torch.cuda.nvtx.range_push(f"fwd/layer[{layer_id}]/prod")
+                        layer_group(self.node_mars, self.element_mars,
+                                    data = self._run_data,
+                                    data_cpu = self._run_data_cpu)
+                        torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
                         # Sum layer
+                        torch.cuda.nvtx.range_push(f"fwd/layer[{layer_id}]/sum")
                         layer_group(self.node_mars, self.element_mars, self.params,
                                     force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32,
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                     **kwargs)
+                        torch.cuda.nvtx.range_pop()
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -401,7 +420,13 @@ class TensorCircuit(nn.Module):
 
         # Keep `data` accessible to inner-layer backward + re-forward paths
         # (SparseProdLayer consumes it to look up per-batch active CSC columns).
+        # Matching the forward, also cache a CPU mirror so the re-forward of
+        # SparseProdLayer doesn't pay T host<->device syncs per backward.
         self._run_data = inputs
+        if self._has_sparse_prod and inputs.device.type != "cpu":
+            self._run_data_cpu = inputs.cpu()
+        else:
+            self._run_data_cpu = inputs
 
         with device_grad_controller(device = self.device, no_grad = True):
 
@@ -410,8 +435,10 @@ class TensorCircuit(nn.Module):
             ## Initialize buffers for backward pass ##
 
             if not _disable_buffer_init:
+                torch.cuda.nvtx.range_push("bwd/buffer_init")
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+                torch.cuda.nvtx.range_pop()
 
             # Set root node flows
             def _set_root_node_flows():
@@ -457,19 +484,29 @@ class TensorCircuit(nn.Module):
 
                     if layer_group.is_prod():
                         # Prod layer
+                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/prod")
                         layer_group.backward(self.node_flows, self.element_flows,
                                              logspace_flows = logspace_flows,
-                                             data = self._run_data)
+                                             data = self._run_data,
+                                             data_cpu = self._run_data_cpu)
+                        torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
                         # Sum layer
 
                         # First recompute the previous product layer
-                        self.inner_layer_groups[layer_id-1].forward(self.node_mars, self.element_mars, _for_backward = True, data = self._run_data)
+                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/sum_reforward_prod")
+                        self.inner_layer_groups[layer_id-1].forward(
+                            self.node_mars, self.element_mars,
+                            _for_backward = True,
+                            data = self._run_data,
+                            data_cpu = self._run_data_cpu,
+                        )
+                        torch.cuda.nvtx.range_pop()
 
                         # Execute pre-backward callback
                         layer_group.callback(
-                            sum_layer_pre_backward_callback, 
+                            sum_layer_pre_backward_callback,
                             node_flows = self.node_flows,
                             element_flows = self.element_flows,
                             node_mars = self.node_mars,
@@ -479,11 +516,13 @@ class TensorCircuit(nn.Module):
                         )
 
                         # Backward sum layer
-                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
+                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/sum")
+                        layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
                                              param_flows = self.param_flows if compute_param_flows else None,
-                                             allow_modify_flows = allow_modify_flows, 
-                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id], 
+                                             allow_modify_flows = allow_modify_flows,
+                                             propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
+                        torch.cuda.nvtx.range_pop()
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -1219,6 +1258,16 @@ class TensorCircuit(nn.Module):
         # Post-pass: mark any SparseProdLayer whose every consumer is a
         # SparseInputSumLayer so its forward can skip scatter-to-dense.
         self._mark_sparse_prod_scatter_skip()
+
+        # Cache whether this circuit contains any SparseProdLayer. Only then
+        # does ``forward`` need the CPU mirror of ``data`` for per-timestep
+        # host reads in ``SparseCategorical.build_sparse_pattern``; skipping
+        # the ``.cpu()`` copy for dense-only circuits avoids a pointless
+        # per-forward allocation on the non-sparse path.
+        self._has_sparse_prod = any(
+            isinstance(layer, SparseProdLayer)
+            for lg in self.inner_layer_groups for layer in lg
+        )
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)

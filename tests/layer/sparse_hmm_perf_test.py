@@ -42,7 +42,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
-from pyjuice.nodes import inputs, multiply, summate, set_block_size
+from pyjuice.nodes import inputs, multiply, summate, sparse_multiply, sparse_summate, set_block_size
 from pyjuice.model import TensorCircuit
 
 
@@ -106,12 +106,14 @@ def _make_csc_emissions(H: int, V: int, density: float, seed: int,
 
 
 def _build_dense_hmm_dag(T: int, H: int, V: int, bs: int):
-    """Homogeneous (tied) HMM with a dense ``Categorical`` input."""
+    """Homogeneous (tied) HMM with a dense ``Categorical`` input; uses the
+    ``DenseCategorical`` marker so the compiler picks
+    :class:`DenseCategoricalInputLayer`."""
     num_node_blocks = H // bs
     with set_block_size(block_size=bs):
         ns_input = inputs(
             T - 1, num_node_blocks=num_node_blocks,
-            dist=dists.Categorical(num_cats=V),
+            dist=dists.DenseCategorical(num_cats=V),
         )
         ns_sum = None
         curr_zs = ns_input
@@ -132,7 +134,10 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
                            csc_indices: torch.Tensor,
                            csc_values: torch.Tensor):
     """Same topology as ``_build_dense_hmm_dag`` but with a
-    ``SparseCategorical`` input carrying the supplied CSC pattern."""
+    ``SparseCategorical`` input carrying the supplied CSC pattern. Uses the
+    explicit ``sparse_multiply`` / ``sparse_summate`` builders so ineligible
+    children would raise a clear error; relies on ``duplicate()`` preserving
+    the ``SparseProdNodes`` / ``SparseSumNodes`` subclass for tied copies."""
     num_node_blocks = H // bs
     with set_block_size(block_size=bs):
         ns_input = inputs(
@@ -150,8 +155,8 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
                 ns_sum = ns
             else:
                 ns = ns_sum.duplicate(curr_zs, tie_params=True)
-            curr_zs = multiply(curr_xs, ns)
-        root = summate(curr_zs, num_node_blocks=1, block_size=1)
+            curr_zs = sparse_multiply(curr_xs, ns)
+        root = sparse_summate(curr_zs, num_node_blocks=1, block_size=1)
     return root
 
 
@@ -182,15 +187,23 @@ def _time_pc(pc: TensorCircuit, data: torch.Tensor, label: str,
     region to the prod/sum work — where the dense-vs-sparse difference
     actually lives — and makes the two paths directly comparable.
     """
-    # Warmup — compile Triton kernels, capture any cudagraphs.
-    for _ in range(n_warmup):
+    # Warmup — compile Triton kernels, capture any cudagraphs. Wrapped in its
+    # own NVTX range so the (usually long) first-iteration JIT cost is easy
+    # to separate from the timed loop in nsys.
+    _nvtx_push(f"{label}_warmup(n={n_warmup})")
+    for i in range(n_warmup):
+        _nvtx_push(f"{label}_warmup_fwd_{i}")
         pc(data)
+        _nvtx_pop()
         if do_backward:
+            _nvtx_push(f"{label}_warmup_bwd_{i}")
             pc.backward(
                 data, compute_param_flows=False, allow_modify_flows=False,
                 _inner_layers_only=True,
             )
+            _nvtx_pop()
     torch.cuda.synchronize()
+    _nvtx_pop()
 
     fwd_events = [(torch.cuda.Event(enable_timing=True),
                    torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
@@ -255,9 +268,6 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     pc_dense = TensorCircuit(
         root_dense,
         use_dense_sum_layer=True,
-        use_dense_categorical_input_layer=True,
-        use_sparse_prod_layer=False,
-        use_sparse_sum_layer=False,
         device=device,
         verbose=False,
     )
@@ -272,9 +282,7 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     )
     pc_sparse = TensorCircuit(
         root_sparse,
-        use_sparse_prod_layer=True,
         use_dense_sum_layer=True,
-        use_sparse_sum_layer=True,
         device=device,
         verbose=False,
     )

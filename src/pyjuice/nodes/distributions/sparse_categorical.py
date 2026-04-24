@@ -166,6 +166,11 @@ class SparseCategorical(Distribution):
 
     def move_to_device(self, device):
         if self._csc_indptr is not None:
+            # Keep a persistent CPU copy of ``_csc_indptr`` (only V+1 longs —
+            # ~256 KB at V=32k) so :meth:`build_sparse_pattern` can look up
+            # column bounds without a host<->device sync per call.
+            if not hasattr(self, "_csc_indptr_cpu") or self._csc_indptr_cpu is None:
+                self._csc_indptr_cpu = self._csc_indptr.cpu().contiguous()
             self._csc_indptr = self._csc_indptr.to(device)
             self._csc_indices = self._csc_indices.to(device)
 
@@ -288,15 +293,81 @@ class SparseCategorical(Distribution):
                 BLOCK_K = BLOCK_K,
             )
 
+    def build_sparse_pattern(self, data: torch.Tensor, var_id: int,
+                              num_rows: int,
+                              device: torch.device):
+        """
+        Construct a :class:`SparseNodeValues` for the observed token at
+        ``var_id`` (B=1 only). ``indices`` is a *view* into ``_csc_indices``
+        — no per-call allocation — and ``values`` is an empty buffer sized
+        ``total_nnz`` for the consumer (``SparseProdLayer``) to fill.
+
+        ``data`` can live on **CPU or GPU**, but callers in the perf-critical
+        sparse HMM path should pass it on CPU: no GPU kernel ever dereferences
+        it (the input layer skips every sparse ns via ``_skip_input_forward``
+        and :class:`SparseInputSumLayer` reads from cached
+        :class:`SparseNodeValues`), so a CPU tensor turns the per-timestep
+        lookup into a plain Python-int coercion and eliminates the
+        host<->device sync that dominates wall-clock otherwise. A GPU
+        ``data`` falls back to a single ``.item()`` sync per call — correct
+        but slow (one full device drain per timestep).
+        """
+        # Import lazily to avoid circular dep between nodes/distributions and
+        # layer/sparse_node_values.
+        from pyjuice.layer.sparse_node_values import SparseNodeValues
+
+        assert data.size(1) == 1, (
+            "SparseCategorical.build_sparse_pattern requires batch_size == 1 "
+            "(sparse path is inference-only + B=1)."
+        )
+
+        if data.device.type == "cpu":
+            # Fast path: plain host read, zero CUDA involvement.
+            torch.cuda.nvtx.range_push("data[var_id,0]_cpu_read")
+            v = int(data[var_id, 0])
+            torch.cuda.nvtx.range_pop()
+        else:
+            # Slow path: full host<->device sync. Pass `data` on CPU to avoid.
+            torch.cuda.nvtx.range_push("data[var_id,0].item()[SYNC]")
+            v = int(data[var_id, 0].item())
+            torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("csc_indptr_cpu_lookup")
+        indptr_cpu = self._csc_indptr_cpu
+        col_start = int(indptr_cpu[v].item())
+        col_end = int(indptr_cpu[v + 1].item())
+        total_nnz = col_end - col_start
+        torch.cuda.nvtx.range_pop()
+
+        if total_nnz == 0:
+            empty_long = self._csc_indices[0:0]
+            return SparseNodeValues(
+                col_start=col_start, total_nnz=0,
+                indices=empty_long,
+                values=torch.empty(0, dtype=torch.float32, device=device),
+                num_rows=num_rows,
+            )
+
+        torch.cuda.nvtx.range_push(f"indices_view+values_alloc(nnz={total_nnz})")
+        indices = self._csc_indices[col_start:col_end]             # view
+        values = torch.empty(total_nnz, dtype=torch.float32, device=device)
+        sv = SparseNodeValues(
+            col_start=col_start, total_nnz=total_nnz,
+            indices=indices, values=values, num_rows=num_rows,
+        )
+        torch.cuda.nvtx.range_pop()
+        return sv
+
     def custom_backward_sparse(self, input_layer, sparse_flow,
                                 csc_pflows_base: int,
                                 logspace_flows: bool = False):
         """
-        Accumulate parameter flows from a jagged ``SparseNodeValues`` produced
-        by ``SparseProdLayer`` (one entry per active CSC slot, per batch item).
+        Accumulate parameter flows from a :class:`SparseNodeValues` produced
+        by :class:`SparseProdLayer` (one entry per active CSC slot in the
+        observed column; B=1 only).
 
         Atomically adds ``sparse_flow.values[j]`` to
-        ``input_layer.param_flows[csc_pflows_base + sparse_flow.csc_slots[j]]``.
+        ``input_layer.param_flows[csc_pflows_base + sparse_flow.col_start + j]``.
         If ``logspace_flows`` is set the values are ``tl.exp``'d before adding.
         """
         total_nnz = sparse_flow.total_nnz
@@ -312,10 +383,9 @@ class SparseCategorical(Distribution):
         BLOCK = 256
         grid = (triton.cdiv(total_nnz, BLOCK),)
         _sparse_cat_backward_sparse_kernel[grid](
-            csc_slots_ptr = sparse_flow.csc_slots,
             values_ptr = sparse_flow.values,
             param_flows_ptr = input_layer.param_flows,
-            csc_pflows_base = csc_pflows_base,
+            pflow_base = csc_pflows_base + sparse_flow.col_start,
             total_nnz = total_nnz,
             logspace_flows = 1 if logspace_flows else 0,
             BLOCK = BLOCK,
@@ -476,24 +546,24 @@ def _sparse_cat_backward_kernel(
 
 @triton.jit
 def _sparse_cat_backward_sparse_kernel(
-    csc_slots_ptr, values_ptr,
-    param_flows_ptr, csc_pflows_base, total_nnz,
+    values_ptr,
+    param_flows_ptr, pflow_base, total_nnz,
     logspace_flows: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    """Consume a jagged ``SparseNodeValues`` of per-CSC-slot flows and
-    atomically accumulate them into ``param_flows`` at
-    ``csc_pflows_base + csc_slots[j]``."""
+    """Atomically accumulate per-active-slot flows into ``param_flows`` at
+    ``pflow_base + j``. ``pflow_base`` is the caller-computed sum of the
+    CSC pflow base and the column's ``col_start`` (slots within the active
+    column are contiguous)."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < total_nnz
 
-    csc_slot = tl.load(csc_slots_ptr + offs, mask = mask, other = 0)
     flow = tl.load(values_ptr + offs, mask = mask, other = 0.0)
     if logspace_flows:
         flow = tl.exp(flow)
 
-    tl.atomic_add(param_flows_ptr + csc_pflows_base + csc_slot, flow, mask = mask)
+    tl.atomic_add(param_flows_ptr + pflow_base + offs, flow, mask = mask)
 
 
 @triton.jit
