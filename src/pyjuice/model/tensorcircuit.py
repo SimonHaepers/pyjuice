@@ -288,11 +288,22 @@ class TensorCircuit(nn.Module):
             # a full host<->device sync — one ``.cpu()`` here amortises into
             # every SparseProdLayer.forward within this call. Skip the copy
             # for dense-only circuits and when ``inputs`` is already on CPU.
-            self._run_data = inputs
-            if self._has_sparse_prod and inputs.device.type != "cpu":
-                self._run_data_cpu = inputs.cpu()
+            #
+            # Downstream layers assume the permuted ``[num_vars, B]`` layout.
+            # When ``input_layer_fn`` is not supplied, the earlier branch
+            # already permuted ``inputs``. When it *is* supplied (e.g.
+            # ``juice.queries.conditional`` rewiring input-layer forward),
+            # the original ``[B, num_vars]`` still needs to be permuted here
+            # so SparseProdLayer's ``data[var_id, b]`` lookup sees the same
+            # shape either way.
+            run_data = inputs
+            if input_layer_fn is not None and run_data.dim() == 2 and run_data.size(1) == self.num_vars:
+                run_data = run_data.permute(1, 0)
+            self._run_data = run_data
+            if self._has_sparse_prod and run_data.device.type != "cpu":
+                self._run_data_cpu = run_data.cpu()
             else:
-                self._run_data_cpu = inputs
+                self._run_data_cpu = run_data
 
             # Inner layers
             def _run_inner_layers():
@@ -422,11 +433,17 @@ class TensorCircuit(nn.Module):
         # (SparseProdLayer consumes it to look up per-batch active CSC columns).
         # Matching the forward, also cache a CPU mirror so the re-forward of
         # SparseProdLayer doesn't pay T host<->device syncs per backward.
-        self._run_data = inputs
-        if self._has_sparse_prod and inputs.device.type != "cpu":
-            self._run_data_cpu = inputs.cpu()
+        # Mirror of the forward-path normalisation: when ``input_layer_fn`` is
+        # supplied the earlier ``permute`` branch was skipped, so permute here
+        # to keep the cached ``[num_vars, B]`` layout consistent.
+        run_data = inputs
+        if input_layer_fn is not None and run_data.dim() == 2 and run_data.size(1) == self.num_vars:
+            run_data = run_data.permute(1, 0)
+        self._run_data = run_data
+        if self._has_sparse_prod and run_data.device.type != "cpu":
+            self._run_data_cpu = run_data.cpu()
         else:
-            self._run_data_cpu = inputs
+            self._run_data_cpu = run_data
 
         with device_grad_controller(device = self.device, no_grad = True):
 

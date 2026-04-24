@@ -484,6 +484,156 @@ def _discrete_logistic_backward(layer, inputs: torch.Tensor, node_flows: torch.T
     return cat_probs
 
 
+## SparseCategorical layer ##
+
+
+def _sparse_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Tensor,
+                                 missing_mask: Optional[torch.Tensor] = None, **kwargs):
+    """Delegate to ``InputLayer.forward`` (which dispatches to
+    :meth:`SparseCategorical.custom_forward`) for hard evidence. Soft evidence
+    is not yet supported — the CSC kernel path would need a row-wise mixture
+    scatter that doesn't exist yet; raise explicitly so callers can either
+    pre-materialise soft evidence elsewhere or extend this function."""
+    if inputs.dim() == 2:
+        assert inputs.dtype == torch.long
+        inputs = inputs.permute(1, 0).contiguous()
+        layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask)
+    else:
+        raise NotImplementedError(
+            "SparseCategorical conditional forward currently supports only hard evidence "
+            "(`inputs.dim() == 2`). Soft evidence requires a row-wise CSC mixture kernel "
+            "that hasn't been implemented."
+        )
+
+    return None
+
+
+@triton.jit
+def _sparse_categorical_cond_backward_kernel(
+    cat_probs_ptr, node_flows_ptr, params_ptr,
+    csc_indptr_ptr, csc_indices_ptr,
+    vid_out, node_offset, param_base,
+    batch_size, num_cats,
+    BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr,
+):
+    """Per-column CSC gather: for CSC column ``pid_col``, tile its active rows
+    into ``BLOCK_K`` chunks; for each ``(row, col)`` slot read
+    ``node_flows[node_offset + row, b] * params[param_base + slot]`` and
+    accumulate into ``cat_probs[vid_out, col, b]``. Different ``pid_k`` tiles
+    write to the same output cell, so we use ``atomic_add``."""
+    pid_col = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < batch_size
+
+    col_start = tl.load(csc_indptr_ptr + pid_col)
+    col_end = tl.load(csc_indptr_ptr + pid_col + 1)
+    k_col = col_end - col_start
+    slot_mask = offs_k < k_col
+
+    slot_idx = col_start + offs_k
+    row_id = tl.load(csc_indices_ptr + slot_idx, mask = slot_mask, other = 0)
+    param = tl.load(params_ptr + param_base + slot_idx, mask = slot_mask, other = 0.0)
+
+    flow_offs = (node_offset + row_id)[:, None] * batch_size + offs_b[None, :]
+    full_mask = slot_mask[:, None] & mask_b[None, :]
+    flow = tl.load(node_flows_ptr + flow_offs, mask = full_mask, other = 0.0)
+
+    contrib = flow * param[:, None]
+    contrib_sum = tl.sum(contrib, axis = 0)  # [BLOCK_B]
+
+    cat_offs = (vid_out * num_cats + pid_col) * batch_size + offs_b
+    tl.atomic_add(cat_probs_ptr + cat_offs, contrib_sum, mask = mask_b)
+
+
+def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
+                                  node_mars: torch.Tensor,
+                                  params: Optional[torch.Tensor] = None, **kwargs):
+    """CSC-native version of :func:`_categorical_backward`. For each ``InputNodes``
+    in ``layer.nodes`` with variable ``vid`` that appears in ``target_vars``,
+    iterate over the CSC sparsity pattern and accumulate
+    ``cat_probs[vid, c, b] += node_flows[row, b] * params[(row, c) slot]``.
+
+    Rows/cols outside the CSC pattern contribute ``~1e-10 * flow`` in the
+    reference ``Categorical`` forward; we omit that constant here — it is
+    negligible (and washed out by the final per-(vid, b) renormalisation) —
+    which makes a dense-pattern sparse build compare exactly against the
+    reference up to atomic-add rounding.
+    """
+    if params is None:
+        params = layer.params
+
+    num_vars = int(layer.vids.max().item()) + 1
+    num_cats = int(layer.nodes[0].dist.num_cats)
+    batch_size = node_flows.size(1)
+
+    target_vars_arg = kwargs.get("target_vars", None)
+    if target_vars_arg is not None:
+        target_vars = list(target_vars_arg)
+        rev_vars_mapping = torch.full((num_vars,), -1, dtype = torch.long)
+        for i, var in enumerate(target_vars):
+            rev_vars_mapping[var] = i
+    else:
+        target_vars = [var for var in range(num_vars)]
+        rev_vars_mapping = torch.arange(0, num_vars, dtype = torch.long)
+
+    num_target_vars = len(target_vars)
+
+    cat_probs = torch.zeros(
+        [num_target_vars * num_cats * batch_size],
+        dtype = torch.float32, device = node_flows.device,
+    )
+
+    BLOCK_B = 64
+
+    for ns in layer.nodes:
+        var_id = ns.scope.to_list()[0]
+        vid_out = int(rev_vars_mapping[var_id].item())
+        if vid_out < 0:
+            continue
+
+        dist = ns.dist
+        if dist._nnz == 0:
+            continue
+        assert dist.num_cats == num_cats, (
+            "SparseCategorical conditional backward assumes uniform num_cats across ns."
+        )
+
+        node_offset = ns._output_ind_range[0]
+        param_base = ns._param_range[0]
+
+        BLOCK_K = max(triton.next_power_of_2(dist._max_nnz_per_col), 4)
+
+        grid = (
+            dist.num_cats,
+            triton.cdiv(dist._max_nnz_per_col, BLOCK_K),
+            triton.cdiv(batch_size, BLOCK_B),
+        )
+
+        _sparse_categorical_cond_backward_kernel[grid](
+            cat_probs_ptr = cat_probs,
+            node_flows_ptr = node_flows,
+            params_ptr = params,
+            csc_indptr_ptr = dist._csc_indptr,
+            csc_indices_ptr = dist._csc_indices,
+            vid_out = vid_out,
+            node_offset = node_offset,
+            param_base = param_base,
+            batch_size = batch_size,
+            num_cats = num_cats,
+            BLOCK_K = BLOCK_K,
+            BLOCK_B = BLOCK_B,
+        )
+
+    cat_probs = cat_probs.reshape(num_target_vars, num_cats, batch_size)
+    cat_probs /= (cat_probs.sum(dim = 1, keepdim = True) + 1e-12)
+    cat_probs = cat_probs.permute(2, 0, 1)
+    return cat_probs
+
+
 def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
     if layer.dist_signature in ("Categorical", "DenseCategorical"):
         _categorical_forward(layer, inputs, node_mars, **kwargs)
@@ -493,6 +643,9 @@ def _conditional_fw_input_fn(layer, inputs, node_mars, **kwargs):
 
     elif layer.dist_signature == "ExternProductCategorical":
         _external_categorical_forward(layer, inputs, node_mars, **kwargs)
+
+    elif layer.dist_signature == "SparseCategorical":
+        _sparse_categorical_forward(layer, inputs, node_mars, **kwargs)
 
     else:
         raise TypeError(f"Unknown/unsupported layer type {type(layer)} for the forward pass. Please implement and provide your own `fw_input_fn`.")
@@ -512,6 +665,11 @@ def _conditional_bk_input_fn(layer, inputs, node_flows, node_mars, outputs = Non
     elif layer.dist_signature == "ExternProductCategorical":
         outputs.append(
             _external_categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
+        )
+
+    elif layer.dist_signature == "SparseCategorical":
+        outputs.append(
+            _sparse_categorical_backward(layer, inputs, node_flows, node_mars, layer.params, **kwargs)
         )
 
     else:
