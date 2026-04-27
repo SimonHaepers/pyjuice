@@ -145,13 +145,23 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
 
 def _time_conditional(pc: TensorCircuit, data: torch.Tensor,
                       target_vars, label: str,
-                      n_warmup: int, n_iter: int) -> dict:
+                      n_warmup: int, n_iter: int,
+                      warmup_data: Optional[torch.Tensor] = None) -> dict:
     """Warm up JIT, then run ``n_iter`` conditional() calls under NVTX ranges
-    and return per-iter wall-clock stats."""
+    and return per-iter wall-clock stats.
+
+    ``warmup_data`` should be a *different* token sequence than ``data`` so
+    we exercise input variability — for sparse paths the per-token CSC
+    column slice differs across sequences, and reusing the timing tokens
+    during warmup risks priming caches/branches in a way the timed loop
+    wouldn't see in practice.
+    """
+    if warmup_data is None:
+        warmup_data = data
     torch.cuda.nvtx.range_push(f"{label}_warmup(n={n_warmup})")
     for i in range(n_warmup):
         torch.cuda.nvtx.range_push(f"{label}_warmup_{i}")
-        juice.queries.conditional(pc, data=data, target_vars=target_vars)
+        juice.queries.conditional(pc, data=warmup_data, target_vars=target_vars)
         torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
     torch.cuda.nvtx.range_pop()
@@ -245,14 +255,19 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
         f"{len(sparse_sum_layers)} SparseInputSumLayer(s)"
     )
 
-    # B=1 to exercise the sparse fast path.
-    torch.manual_seed(seed)
-    data = torch.randint(0, V, (1, T), device=device)
+    # B=1 to exercise the sparse fast path. Distinct warmup vs. timing
+    # sequences so warmup doesn't prime per-token caches/branches that the
+    # timed loop wouldn't otherwise hit.
+    g = torch.Generator(device=device).manual_seed(seed)
+    warmup_data = torch.randint(0, V, (1, T), generator=g, device=device)
+    data = torch.randint(0, V, (1, T), generator=g, device=device)
 
     stats_dense = _time_conditional(pc_dense, data, target_vars, "dense",
-                                     n_warmup=n_warmup, n_iter=n_iter)
+                                     n_warmup=n_warmup, n_iter=n_iter,
+                                     warmup_data=warmup_data)
     stats_sparse = _time_conditional(pc_sparse, data, target_vars, "sparse",
-                                      n_warmup=n_warmup, n_iter=n_iter)
+                                      n_warmup=n_warmup, n_iter=n_iter,
+                                      warmup_data=warmup_data)
 
     _print_summary("dense", stats_dense)
     _print_summary("sparse", stats_sparse)
@@ -279,7 +294,7 @@ if __name__ == "__main__":
     # (edge-id memory vs kernel tile size).
     _build_and_run(
         T=32,
-        H=32768,
+        H=8192,
         V=32768,
         bs=1024,
         density=0.01,

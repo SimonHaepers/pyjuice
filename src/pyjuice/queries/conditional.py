@@ -508,7 +508,13 @@ def _sparse_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Te
     return None
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["vid_out", "node_offset", "param_base",
+                        "batch_size", "num_cats"],
+    do_not_specialize_on_alignment=["cat_probs_ptr", "node_flows_ptr",
+                                     "params_ptr", "csc_indptr_ptr",
+                                     "csc_indices_ptr"],
+)
 def _sparse_categorical_cond_backward_kernel(
     cat_probs_ptr, node_flows_ptr, params_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -547,6 +553,83 @@ def _sparse_categorical_cond_backward_kernel(
 
     cat_offs = (vid_out * num_cats + pid_col) * batch_size + offs_b
     tl.atomic_add(cat_probs_ptr + cat_offs, contrib_sum, mask = mask_b)
+
+
+@triton.jit(
+    do_not_specialize=["vid_out", "param_base", "batch_size", "num_cats"],
+    do_not_specialize_on_alignment=["cat_probs_ptr", "sv_indices_ptr",
+                                     "sv_values_ptr", "params_ptr",
+                                     "csr_indptr_ptr", "csr_cols_ptr",
+                                     "csr_to_csc_ptr"],
+)
+def _sparse_categorical_cond_backward_sparse_kernel(
+    cat_probs_ptr, sv_indices_ptr, sv_values_ptr, params_ptr,
+    csr_indptr_ptr, csr_cols_ptr, csr_to_csc_ptr,
+    vid_out, param_base,
+    batch_size, num_cats,
+    BLOCK_R: tl.constexpr, BLOCK_B: tl.constexpr,
+):
+    """Sparse-native version of :func:`_sparse_categorical_cond_backward_kernel`.
+
+    Iterates over the active rows that actually carry non-zero flow (the
+    observed CSC column's active rows — the count is set by the launch
+    grid's first dim, not a kernel arg, so the same compiled binary serves
+    every input token regardless of ``total_nnz``), then for each row walks
+    its CSR slots — for each ``(row, col)`` membership do
+    ``atomic_add(cat_probs[col], flow * params[csc_slot])``. ``node_flows``
+    is never touched; flow comes straight from the
+    :class:`SparseNodeValues` packed values array.
+
+    ``sv_indices_ptr`` is a sliced view of ``dist._csc_indices`` whose
+    16-byte alignment depends on ``col_start`` parity, and the grid's first
+    dim varies with the observed token. The two ``do_not_specialize`` /
+    ``do_not_specialize_on_alignment`` lists above keep that data-dependent
+    state out of Triton's specialization key, so this kernel is JIT-compiled
+    exactly once across token sequences.
+
+    Grid: ``(K_active, ceil(max_nnz_per_row / BLOCK_R), ceil(B / BLOCK_B))``.
+    Per program covers one (active row, row-slot tile, batch tile).
+    """
+    pid_j = tl.program_id(0)
+    pid_r = tl.program_id(1)
+    pid_b = tl.program_id(2)
+
+    # Active row + flow for this program.
+    row = tl.load(sv_indices_ptr + pid_j)
+    # B=1 layout: ``sv.values`` is [K_active], no batch axis. We scalar-
+    # broadcast across the batch tile (K_active is the same set for every
+    # batch, since we only run the sparse path with B=1).
+    flow_scalar = tl.load(sv_values_ptr + pid_j)
+
+    # Walk this row's CSR slot range.
+    row_start = tl.load(csr_indptr_ptr + row)
+    row_end = tl.load(csr_indptr_ptr + row + 1)
+    row_nnz = row_end - row_start
+
+    offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
+    slot_mask = offs_r < row_nnz
+    csr_slot = row_start + offs_r
+
+    cols = tl.load(csr_cols_ptr + csr_slot, mask = slot_mask, other = 0)
+    csc_slots = tl.load(csr_to_csc_ptr + csr_slot, mask = slot_mask, other = 0)
+    params_v = tl.load(params_ptr + param_base + csc_slots,
+                       mask = slot_mask, other = 0.0)
+
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+    mask_b = offs_b < batch_size
+
+    contrib = (flow_scalar * params_v)[:, None]   # [BLOCK_R, 1]
+    contrib = tl.where(slot_mask[:, None] & mask_b[None, :], contrib, 0.0)
+
+    # cat_probs is laid out as [num_target_vars, num_cats, B] flat. Address:
+    #   (vid_out * num_cats + col) * batch_size + b
+    # Each (col, b) cell may be hit by multiple programs (different active
+    # rows that share a col), so we atomic_add.
+    base = (vid_out * num_cats + cols)[:, None] * batch_size + offs_b[None, :]
+    tl.atomic_add(
+        cat_probs_ptr + base, contrib,
+        mask = slot_mask[:, None] & mask_b[None, :],
+    )
 
 
 def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
@@ -604,6 +687,45 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
 
         node_offset = ns._output_ind_range[0]
         param_base = ns._param_range[0]
+
+        # Sparse fast path: if this ns is consumed by a SparseProdLayer
+        # AND that layer cached an ``sv_flow`` from the most recent backward,
+        # iterate over the K_active rows directly via the CSR view —
+        # ``node_flows`` is never touched. The dense path below is the
+        # fallback for plain compiles or partial backwards.
+        owner = getattr(ns, "_sparse_flow_owner", None)
+        sv_flow = None
+        if owner is not None:
+            owner_layer, owner_ns_idx = owner
+            sv_flow = owner_layer._sparse_flows[owner_ns_idx]
+
+        if sv_flow is not None and sv_flow.total_nnz > 0:
+            assert dist._csr_indptr is not None, (
+                "SparseCategorical: CSR side info not built (set_meta_parameters "
+                "should have populated _csr_indptr). Re-run set_meta_parameters."
+            )
+            BLOCK_R = max(triton.next_power_of_2(dist._max_nnz_per_row), 4)
+            grid = (
+                sv_flow.total_nnz,
+                triton.cdiv(dist._max_nnz_per_row, BLOCK_R),
+                triton.cdiv(batch_size, BLOCK_B),
+            )
+            _sparse_categorical_cond_backward_sparse_kernel[grid](
+                cat_probs_ptr = cat_probs,
+                sv_indices_ptr = sv_flow.indices,
+                sv_values_ptr = sv_flow.values,
+                params_ptr = params,
+                csr_indptr_ptr = dist._csr_indptr,
+                csr_cols_ptr = dist._csr_cols,
+                csr_to_csc_ptr = dist._csr_to_csc,
+                vid_out = vid_out,
+                param_base = param_base,
+                batch_size = batch_size,
+                num_cats = num_cats,
+                BLOCK_R = BLOCK_R,
+                BLOCK_B = BLOCK_B,
+            )
+            continue
 
         BLOCK_K = max(triton.next_power_of_2(dist._max_nnz_per_col), 4)
 

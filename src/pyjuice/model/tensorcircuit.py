@@ -15,7 +15,8 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, SparseP
 from pyjuice.nodes.distributions import SparseCategorical
 from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
-    SumLayer, DenseSumLayer, SparseInputSumLayer, LayerGroup,
+    CoSparseProdLayer, SumLayer, DenseSumLayer, SparseInputSumLayer,
+    SparseIOSumLayer, LayerGroup,
 )
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -323,6 +324,8 @@ class TensorCircuit(nn.Module):
                                     force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32,
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
+                                    data = self._run_data,
+                                    data_cpu = self._run_data_cpu,
                                     **kwargs)
                         torch.cuda.nvtx.range_pop()
 
@@ -1016,6 +1019,16 @@ class TensorCircuit(nn.Module):
         # Create layers
         depth2nodes, num_layers, max_node_block_size, max_ele_block_size = self._create_node_layers()
 
+        # DAG-level pre-pass: classify each SparseProdNodes as
+        # `cosparse`-eligible and each SumNodes as `sparse_io`-eligible. These
+        # decisions drive the prod/sum layer-class dispatch inside the compile
+        # loop below.
+        sparse_chain_info = self._classify_sparse_chains(depth2nodes, num_layers)
+        self._sparse_chain_info = sparse_chain_info
+        demoted_sparse_prods = sparse_chain_info["demoted"]
+        sparse_io_sums = sparse_chain_info["sparse_io_sums"]
+        cosparse_prods = sparse_chain_info["cosparse_prods"]
+
         self.input_layer_group = None
         self.inner_layer_groups = []
 
@@ -1089,57 +1102,46 @@ class TensorCircuit(nn.Module):
                     assert len(depth2nodes[depth]["prod"]) > 0 and len(depth2nodes[depth]["sum"]) > 0, \
                         "Depth {}: (# prod nodes: {}, # sum nodes: {})".format(depth, len(depth2nodes[depth]["prod"]), len(depth2nodes[depth]["sum"]))
 
-                    # Product layer(s): group by (block_size, sparse-eligibility).
-                    #
-                    # A ProdNodes is sparse-eligible iff it is a
-                    # :class:`SparseProdNodes` (all structural invariants were
-                    # checked at DAG-build time) AND is the *sole consumer* of
-                    # its sparse input child — demote otherwise, since the
-                    # input layer must still populate ``node_mars`` for other
-                    # consumers (e.g. the initial ``summate`` over ``ns_input``
-                    # in the HMM builder).
-                    eligible = {
-                        id(ns) for ns in depth2nodes[depth]["prod"]
-                        if isinstance(ns, SparseProdNodes)
-                    }
-                    if eligible:
-                        # Sole-consumer claim pass: count references per sparse
-                        # input across prod + sum nodes at this depth.
-                        from collections import defaultdict as _dd
-                        total_refs = _dd(int)
-                        claim_count = _dd(int)
-                        for ns in depth2nodes[depth]["prod"]:
-                            for cs in ns.chs:
-                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
-                                    total_refs[id(cs)] += 1
-                                    if id(ns) in eligible:
-                                        claim_count[id(cs)] += 1
-                        for ns in depth2nodes[depth]["sum"]:
-                            for cs in ns.chs:
-                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
-                                    total_refs[id(cs)] += 1
-                        # Demote any ns whose sparse child is ALSO referenced by
-                        # a non-sparse-prod consumer.
-                        demoted = set()
-                        for ns in depth2nodes[depth]["prod"]:
-                            if id(ns) not in eligible:
-                                continue
-                            for cs in ns.chs:
-                                if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
-                                    if total_refs[id(cs)] > claim_count[id(cs)]:
-                                        demoted.add(id(ns))
-                                        break
-                        eligible -= demoted
-
+                    # Product layer(s): group by (block_size, mode) where
+                    # mode ∈ {"plain", "sparse", "cosparse"}:
+                    #  * "cosparse" — both inputs are SparseNodeValues with
+                    #    matching indices (the HMM chain fast path); dense
+                    #    child is a :class:`SparseIOSumLayer`.
+                    #  * "sparse" — :class:`SparseProdNodes` not in the
+                    #    cosparse chain; dense child is dense.
+                    #  * "plain" — everything else, incl. demoted SparseProdNodes
+                    #    whose SparseCategorical input is shared with non-sparse
+                    #    consumers.
+                    # Demotion + cosparse classification were computed by the
+                    # DAG pre-pass in ``_classify_sparse_chains`` — see there
+                    # for the structural invariants.
                     gsize2prod_nodes = dict()
                     for ns in depth2nodes[depth]["prod"]:
-                        key = (ns.block_size, id(ns) in eligible)
+                        if isinstance(ns, SparseProdNodes) and id(ns) not in demoted_sparse_prods:
+                            if id(ns) in cosparse_prods:
+                                mode = "cosparse"
+                            else:
+                                mode = "sparse"
+                        else:
+                            mode = "plain"
+                        key = (ns.block_size, mode)
                         gsize2prod_nodes.setdefault(key, []).append(ns)
 
                     layer_num_elements = max_node_block_size
                     prod_layers = []
-                    for (gsize, is_sparse), nodes in gsize2prod_nodes.items():
-                        if is_sparse:
+                    for (gsize, mode), nodes in gsize2prod_nodes.items():
+                        if mode == "cosparse":
+                            prod_layer = CoSparseProdLayer(
+                                nodes = nodes,
+                                global_nid_start = layer_num_elements,
+                                layer_sparsity_tol = layer_sparsity_tol,
+                                max_num_partitions = max_num_partitions,
+                                disable_gpu_compilation = disable_gpu_compilation,
+                                force_gpu_compilation = force_gpu_compilation,
+                                input_layer_group = self.input_layer_group,
+                                inner_layer_groups = list(self.inner_layer_groups),
+                            )
+                        elif mode == "sparse":
                             prod_layer = SparseProdLayer(
                                 nodes = nodes,
                                 global_nid_start = layer_num_elements,
@@ -1219,7 +1221,9 @@ class TensorCircuit(nn.Module):
 
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        if _sparse_sum_eligible(ns):
+                        if id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
+                            mode = "sparse_io"
+                        elif _sparse_sum_eligible(ns):
                             mode = "sparse_dense"
                         elif _dense_eligible(ns):
                             mode = "dense"
@@ -1230,7 +1234,29 @@ class TensorCircuit(nn.Module):
 
                     sum_layers = []
                     for (gsize, mode), nodes in gsize2sum_nodes.items():
-                        if mode == "sparse_dense":
+                        if mode == "sparse_io":
+                            # Resolve per-ns consumer metadata from the DAG
+                            # pre-pass: output_sparsity_var_ids (which CSC
+                            # column defines this sum's output rows) plus the
+                            # consumer's sparse input dist + H so we can call
+                            # ``build_sparse_pattern`` at forward time without
+                            # a second DAG walk.
+                            out_var_ids = []
+                            out_dists = []
+                            out_num_rows = []
+                            for sum_ns in nodes:
+                                consumer = sparse_io_sums[id(sum_ns)]
+                                out_var_ids.append(consumer.var_id)
+                                out_dists.append(consumer.sparse_input_ns.dist)
+                                out_num_rows.append(consumer.num_nodes)
+                            layer_cls = SparseIOSumLayer
+                            extra_kwargs = {
+                                "inner_layer_groups": list(self.inner_layer_groups),
+                                "output_sparsity_var_ids": out_var_ids,
+                                "output_sparsity_dists": out_dists,
+                                "output_sparsity_num_rows": out_num_rows,
+                            }
+                        elif mode == "sparse_dense":
                             layer_cls = SparseInputSumLayer
                             extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
                         elif mode == "dense":
@@ -1276,13 +1302,14 @@ class TensorCircuit(nn.Module):
         # SparseInputSumLayer so its forward can skip scatter-to-dense.
         self._mark_sparse_prod_scatter_skip()
 
-        # Cache whether this circuit contains any SparseProdLayer. Only then
-        # does ``forward`` need the CPU mirror of ``data`` for per-timestep
-        # host reads in ``SparseCategorical.build_sparse_pattern``; skipping
-        # the ``.cpu()`` copy for dense-only circuits avoids a pointless
-        # per-forward allocation on the non-sparse path.
+        # Cache whether this circuit contains any layer that reads `data_cpu`
+        # via ``SparseCategorical.build_sparse_pattern``. Both
+        # :class:`SparseProdLayer` (at its own ns's var_id) and
+        # :class:`SparseIOSumLayer` (at the consumer's var_id, for the output
+        # sparsity pattern) need the CPU mirror; skipping the ``.cpu()`` copy
+        # for dense-only circuits avoids a pointless per-forward allocation.
         self._has_sparse_prod = any(
-            isinstance(layer, SparseProdLayer)
+            isinstance(layer, (SparseProdLayer, SparseIOSumLayer))
             for lg in self.inner_layer_groups for layer in lg
         )
 
@@ -1362,6 +1389,120 @@ class TensorCircuit(nn.Module):
                     if not all_sparse_consumers:
                         break
                 layer._skip_scatter = all_sparse_consumers
+
+    def _classify_sparse_chains(self, depth2nodes, num_layers) -> Dict:
+        """DAG-level classifier for the sparse-chain fast path. Produces:
+
+        * ``demoted``: ids of :class:`SparseProdNodes` whose SparseCategorical
+          input is *also* referenced by a non-sparse consumer at the same
+          depth — they must compile as plain :class:`ProdLayer` so the input
+          layer still populates ``node_mars``. Replaces the inline per-depth
+          demotion pass that used to live in the compile loop.
+        * ``sparse_io_sums``: dict ``id(sum_ns) -> consumer_prod_ns`` for each
+          :class:`SumNodes` eligible for :class:`SparseIOSumLayer`. Eligibility:
+            - block-dense, single child, not force_plain
+            - the child is a :class:`SparseProdNodes` and not demoted
+            - the sum has exactly one consumer in the DAG
+            - the consumer is a :class:`SparseProdNodes` with
+              ``num_dense_chs == 1`` and not demoted
+          Saving the consumer ns lets the compile loop read off
+          ``consumer.var_id``, ``consumer.sparse_input_ns.dist``, and H
+          without re-walking the DAG.
+        * ``cosparse_prods``: ids of :class:`SparseProdNodes` that should
+          compile as :class:`CoSparseProdLayer` — ``num_dense_chs == 1``, not
+          demoted, and the sole dense child is a sum in ``sparse_io_sums``.
+
+        Everything is structural on the DAG; no compiled layer state is
+        inspected here.
+        """
+        from collections import defaultdict
+
+        # Consumer map across every depth. Input nodes don't appear in any
+        # ``chs`` list so we only index prod + sum.
+        consumers: Dict[int, list] = defaultdict(list)
+        for d in range(num_layers):
+            for k in ("prod", "sum"):
+                for ns in depth2nodes[d].get(k, []):
+                    for cs in ns.chs:
+                        consumers[id(cs)].append(ns)
+
+        # Demotion pass — per-depth replica of the logic the compile loop used
+        # to do inline (see the old tensorcircuit.py:1106-1132). A SparseCat
+        # input shared across a sparse + a non-sparse consumer forces the
+        # sparse consumer back to plain ProdLayer so InputLayer still
+        # populates node_mars for the non-sparse reader.
+        demoted: set = set()
+        for d in range(1, num_layers):
+            prods = depth2nodes[d].get("prod", [])
+            sums = depth2nodes[d].get("sum", [])
+            eligible = {id(ns) for ns in prods if isinstance(ns, SparseProdNodes)}
+            if not eligible:
+                continue
+            total_refs: Dict[int, int] = defaultdict(int)
+            claim_count: Dict[int, int] = defaultdict(int)
+            for ns in prods:
+                for cs in ns.chs:
+                    if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                        total_refs[id(cs)] += 1
+                        if id(ns) in eligible:
+                            claim_count[id(cs)] += 1
+            for ns in sums:
+                for cs in ns.chs:
+                    if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                        total_refs[id(cs)] += 1
+            for ns in prods:
+                if id(ns) not in eligible:
+                    continue
+                for cs in ns.chs:
+                    if isinstance(cs, InputNodes) and isinstance(cs.dist, SparseCategorical):
+                        if total_refs[id(cs)] > claim_count[id(cs)]:
+                            demoted.add(id(ns))
+                            break
+
+        # Classify SumNodes as sparse_io-eligible.
+        sparse_io_sums: Dict[int, SparseProdNodes] = {}
+        for d in range(num_layers):
+            for ns in depth2nodes[d].get("sum", []):
+                if getattr(ns, "_force_plain_layer", False):
+                    continue
+                if not (ns.is_block_dense and len(ns.chs) == 1):
+                    continue
+                child = ns.chs[0]
+                if not isinstance(child, SparseProdNodes):
+                    continue
+                if id(child) in demoted:
+                    continue
+                cs_list = consumers.get(id(ns), [])
+                if len(cs_list) != 1:
+                    continue
+                consumer = cs_list[0]
+                if not isinstance(consumer, SparseProdNodes):
+                    continue
+                if id(consumer) in demoted:
+                    continue
+                if consumer.num_dense_chs != 1:
+                    continue
+                sparse_io_sums[id(ns)] = consumer
+
+        # Classify SparseProdNodes as cosparse.
+        cosparse_prods: set = set()
+        for d in range(num_layers):
+            for ns in depth2nodes[d].get("prod", []):
+                if not isinstance(ns, SparseProdNodes):
+                    continue
+                if id(ns) in demoted:
+                    continue
+                if ns.num_dense_chs != 1:
+                    continue
+                dense_ch = ns.chs[ns.dense_ch_idxs[0]]
+                if id(dense_ch) in sparse_io_sums:
+                    cosparse_prods.add(id(ns))
+
+        return {
+            "demoted": demoted,
+            "sparse_io_sums": sparse_io_sums,
+            "cosparse_prods": cosparse_prods,
+        }
 
     def _init_parameters(self, perturbation: float = 4.0, pseudocount: float = 0.0):
         for ns in self.root_ns:

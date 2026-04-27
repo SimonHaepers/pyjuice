@@ -48,6 +48,14 @@ class SparseCategorical(Distribution):
         self._csc_indptr = None      # [V+1] long, on dist's "home" device (CPU initially)
         self._csc_indices = None     # [nnz] long
         self._max_nnz_per_col = None # max over columns of (indptr[v+1] - indptr[v])
+        # Row-major (CSR) view of the same sparsity pattern. Used by the
+        # sparse conditional-query kernel to walk a row's columns without a
+        # dense ``node_flows`` intermediate. Allocated lazily in
+        # :meth:`set_meta_parameters` (see comment there).
+        self._csr_indptr = None      # [H+1] long
+        self._csr_cols = None        # [nnz] long — col index per CSR slot
+        self._csr_to_csc = None      # [nnz] long — CSR slot j -> CSC slot
+        self._max_nnz_per_row = None # max over rows of (csr_indptr[h+1] - csr_indptr[h])
 
     def get_signature(self):
         return "SparseCategorical"
@@ -92,6 +100,34 @@ class SparseCategorical(Distribution):
         self._csc_indptr = csc_indptr
         self._csc_indices = csc_indices
         self._max_nnz_per_col = max(max_nnz_per_col, 1)  # >= 1 to keep Triton tiles non-degenerate
+
+        # Build the row-major (CSR) view by argsort over a packed
+        # ``row*V + col`` key. ``csc_to_col[slot] = col(slot)`` recovers the
+        # column from a CSC slot via searchsorted on csc_indptr-1.
+        # Same data, transposed permutation; ~3·nnz extra longs of memory.
+        if nnz > 0:
+            csc_slots = torch.arange(nnz, dtype = torch.long)
+            csc_cols = torch.searchsorted(csc_indptr[1:], csc_slots, right = True)
+            csc_rows = csc_indices  # row id per CSC slot.
+            sort_key = csc_rows * V + csc_cols
+            csr_perm = torch.argsort(sort_key)        # CSR slot -> CSC slot
+            csr_rows_sorted = csc_rows[csr_perm]
+            row_counts = torch.bincount(csr_rows_sorted, minlength = H)
+            csr_indptr = torch.zeros(H + 1, dtype = torch.long)
+            csr_indptr[1:] = torch.cumsum(row_counts, dim = 0)
+            csr_cols = csc_cols[csr_perm].contiguous()
+            csr_to_csc = csr_perm.contiguous()
+            max_nnz_per_row = int(row_counts.max().item()) if H > 0 else 0
+        else:
+            csr_indptr = torch.zeros(H + 1, dtype = torch.long)
+            csr_cols = torch.zeros(0, dtype = torch.long)
+            csr_to_csc = torch.zeros(0, dtype = torch.long)
+            max_nnz_per_row = 0
+
+        self._csr_indptr = csr_indptr
+        self._csr_cols = csr_cols
+        self._csr_to_csc = csr_to_csc
+        self._max_nnz_per_row = max(max_nnz_per_row, 1)
 
         return torch.zeros(max(nnz, 1), dtype = torch.float32)
 
@@ -173,6 +209,10 @@ class SparseCategorical(Distribution):
                 self._csc_indptr_cpu = self._csc_indptr.cpu().contiguous()
             self._csc_indptr = self._csc_indptr.to(device)
             self._csc_indices = self._csc_indices.to(device)
+        if self._csr_indptr is not None:
+            self._csr_indptr = self._csr_indptr.to(device)
+            self._csr_cols = self._csr_cols.to(device)
+            self._csr_to_csc = self._csr_to_csc.to(device)
 
     # --- Unused template kernels (required to not compile the default path) ---
 

@@ -172,11 +172,27 @@ def test_sparse_input_sum_backward_b1_equivalence():
     pc_dense_sum.backward(data, compute_param_flows=False, allow_modify_flows=False)
     pc_sparse_sum.backward(data, compute_param_flows=False, allow_modify_flows=False)
 
-    # node_flows inside any depth should match within LOG_EPS-dominated tol.
-    nfd = pc_dense_sum.node_flows.detach().cpu()
-    nfs = pc_sparse_sum.node_flows.detach().cpu()
-    assert torch.allclose(nfd, nfs, atol=1e-3, rtol=1e-2), \
-        f"B=1 backward node_flows diff max = {(nfd - nfs).abs().max().item():.3e}"
+    # The sparse path no longer populates ``pc.node_flows`` at SparseCategorical
+    # input rows — flow is exposed via the layer's ``_sparse_flows[ns_idx]``
+    # slot, reachable through the ``_sparse_flow_owner`` back-reference on
+    # each input ns. Compare those values to the dense path's ``node_flows``
+    # at active CSC rows only (inactive rows are LOG_EPS-tiny on the dense
+    # path and absent from the sparse container by construction).
+    for in_ns_d, in_ns_s in zip(
+        pc_dense_sum.input_layer_group[0].nodes,
+        pc_sparse_sum.input_layer_group[0].nodes,
+    ):
+        owner = getattr(in_ns_s, "_sparse_flow_owner", None)
+        assert owner is not None, "expected _sparse_flow_owner on each sparse input ns"
+        sparse_layer, ns_idx = owner
+        sv_flow = sparse_layer._sparse_flows[ns_idx]
+        assert sv_flow is not None, "sparse backward should leave sv_flow populated"
+        lo_d, _ = in_ns_d._output_ind_range
+        torch.testing.assert_close(
+            sv_flow.values.cpu(),
+            pc_dense_sum.node_flows[lo_d + sv_flow.indices, 0].cpu(),
+            rtol=1e-2, atol=1e-3,
+        )
 
 
 def test_sparse_input_sum_b_gt_1_rejected():

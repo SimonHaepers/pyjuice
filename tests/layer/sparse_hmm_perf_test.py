@@ -175,9 +175,16 @@ def _nvtx_pop() -> None:
 
 def _time_pc(pc: TensorCircuit, data: torch.Tensor, label: str,
              n_warmup: int, n_iter: int,
+             warmup_data: Optional[torch.Tensor] = None,
              do_backward: bool = True) -> dict:
     """Warm up JIT, then run ``n_iter`` fwd(+bwd) under NVTX ranges and
     return per-phase wall-clock stats measured with CUDA events.
+
+    ``warmup_data`` should be a *different* token sequence than ``data`` so
+    we exercise input variability — for sparse paths the per-token CSC
+    column slice differs across sequences, and reusing the timing tokens
+    during warmup risks priming caches/branches in a way the timed loop
+    wouldn't see in practice.
 
     Backward runs with ``_inner_layers_only=True`` + ``compute_param_flows=False``
     because both ``DenseSumLayer`` and ``SparseInputSumLayer`` are
@@ -187,18 +194,20 @@ def _time_pc(pc: TensorCircuit, data: torch.Tensor, label: str,
     region to the prod/sum work — where the dense-vs-sparse difference
     actually lives — and makes the two paths directly comparable.
     """
+    if warmup_data is None:
+        warmup_data = data
     # Warmup — compile Triton kernels, capture any cudagraphs. Wrapped in its
     # own NVTX range so the (usually long) first-iteration JIT cost is easy
     # to separate from the timed loop in nsys.
     _nvtx_push(f"{label}_warmup(n={n_warmup})")
     for i in range(n_warmup):
         _nvtx_push(f"{label}_warmup_fwd_{i}")
-        pc(data)
+        pc(warmup_data)
         _nvtx_pop()
         if do_backward:
             _nvtx_push(f"{label}_warmup_bwd_{i}")
             pc.backward(
-                data, compute_param_flows=False, allow_modify_flows=False,
+                warmup_data, compute_param_flows=False, allow_modify_flows=False,
                 _inner_layers_only=True,
             )
             _nvtx_pop()
@@ -321,14 +330,19 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     )
 
     # --- Data (B=1 to exercise sparse sum fast path) -------------------- #
-    torch.manual_seed(seed)
-    data = torch.randint(0, V, (1, T), device=device)
+    # Distinct warmup vs. timing sequences so warmup doesn't prime per-token
+    # caches/branches that the timed loop wouldn't otherwise hit.
+    g = torch.Generator(device=device).manual_seed(seed)
+    warmup_data = torch.randint(0, V, (1, T), generator=g, device=device)
+    data = torch.randint(0, V, (1, T), generator=g, device=device)
 
     # --- Run ------------------------------------------------------------ #
     stats_dense = _time_pc(pc_dense, data, "dense",
-                           n_warmup=n_warmup, n_iter=n_iter)
+                           n_warmup=n_warmup, n_iter=n_iter,
+                           warmup_data=warmup_data)
     stats_sparse = _time_pc(pc_sparse, data, "sparse",
-                            n_warmup=n_warmup, n_iter=n_iter)
+                            n_warmup=n_warmup, n_iter=n_iter,
+                            warmup_data=warmup_data)
 
     _print_summary("dense", stats_dense)
     _print_summary("sparse", stats_sparse)

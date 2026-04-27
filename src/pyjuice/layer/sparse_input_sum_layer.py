@@ -233,6 +233,43 @@ class SparseInputSumLayer(DenseSumLayer):
                     "support accumulate_ch_flows=True; the sparse fast path "
                     "writes sv_flow straight into the upstream prod layer."
                 )
+            # When ``allow_modify_flows`` is True, the kernel below assumes
+            # ``node_flows[parent_rows]`` has been pre-transformed to
+            # ``log(flow) - node_mars``. DenseSumLayer.backward does this in
+            # its own body (sparse fast path skips super().backward), so we
+            # replicate the transform here. Without it, the root sum's
+            # ``node_flows=1`` would enter the kernel unmodified and the
+            # ``allow_modify_flows`` branch's ``exp(nflow + log_val)`` would
+            # be off by ``exp(1) * exp(nmars[root])`` — silently breaking the
+            # backward flow chain at the root and compounding through every
+            # downstream consumer.
+            if allow_modify_flows:
+                propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
+                propagation_alg_kwargs = self._get_propagation_alg_kwargs(
+                    propagation_alg,
+                )
+                alpha = float(propagation_alg_kwargs.get("alpha", 0.0))
+                for block in self._dense_blocks:
+                    nid_start, _cid_start, _pid_start, _pfid_start, NB, _NB_ch, bs, _cbs = block
+                    layer_n_nodes = NB * bs
+                    BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+                    BLOCK_B = min(2048, BATCH_SIZE_NP2)
+                    BLOCK_M = min(max(2048 // BLOCK_B, 1), bs)
+                    if BLOCK_M < 1:
+                        BLOCK_M = 1
+                    grid = (triton.cdiv(batch_size, BLOCK_B),
+                            triton.cdiv(layer_n_nodes, BLOCK_M))
+                    self._bk_triton_dense_modify_flow_kernel[grid](
+                        node_flows=node_flows,
+                        node_mars=node_mars,
+                        nid_start=nid_start,
+                        batch_size=batch_size,
+                        num_parents=layer_n_nodes,
+                        BLOCK_B=BLOCK_B,
+                        BLOCK_M=BLOCK_M,
+                        propagation_alg_id=propagation_alg_id,
+                        alpha=alpha,
+                    )
             for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
                 self._dense_blocks, self._sparse_input_refs,
             )):

@@ -115,6 +115,14 @@ class SparseProdLayer(ProdLayer):
             sparse_cs._skip_input_forward = True
             sparse_cs._skip_input_backward = True
 
+            # Back-reference: lets downstream consumers (e.g. the sparse
+            # conditional-query kernel) locate the owning layer's
+            # ``_sparse_flows[ns_idx]`` slot from a bare InputNodes ns,
+            # without re-walking ``inner_layer_groups``. Same convention as
+            # the gate flags above and the ``_param_range`` /
+            # ``_output_ind_range`` annotations set elsewhere on ns objects.
+            sparse_cs._sparse_flow_owner = (self, ns_idx)
+
         # One slot per ns — forward populates, backward (sum + prod) reads.
         # Lists rather than dicts because ns_idx is contiguous over
         # ``range(len(self.nodes))`` and the buffers are always fully populated
@@ -259,9 +267,13 @@ class SparseProdLayer(ProdLayer):
                     "sv_flow from the downstream SparseInputSumLayer; none "
                     "was stashed. Did the sum layer's backward run?"
                 )
-                # Consume-and-clear so stale state doesn't survive into the
-                # next training step if a future bug changes eval order.
-                self._sparse_flows[ns_idx] = None
+                # NOTE: do NOT consume-and-clear ``self._sparse_flows[ns_idx]``
+                # — leaving it populated post-backward is what lets external
+                # readers (e.g. the sparse conditional-query kernel via
+                # ``_sparse_flow_owner``) recover the per-active-row flow
+                # without rerunning backward. The next backward overwrites
+                # the slot anyway. Same contract as ``_sparse_outputs[ns_idx]``
+                # on the forward side, which also persists across passes.
 
                 torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/scatter_children")
                 self._scatter_flow_to_children(ns_idx, ns, sv_flow, node_flows)
@@ -319,35 +331,36 @@ class SparseProdLayer(ProdLayer):
     def _scatter_flow_to_children(self, ns_idx: int, ns: SparseProdNodes,
                                     sv_flow: SparseNodeValues,
                                     node_flows: torch.Tensor) -> None:
-        """Write ``sv_flow.values`` into each child's ``node_flows``.
+        """Write ``sv_flow.values`` into each dense child's ``node_flows``.
 
         Each active row ``h = sv_flow.indices[j]`` of the prod output has
-        exactly one slot in each child (same rule as ``ProdLayer.backward``:
-        ``node_flows[u_cid] = element_flows[parid]``):
-          * Dense children: scatter via ``_dense_ch_lookup[ch, h]``.
-          * Sparse input child: identity on the sparse input's row range.
-            Even though :meth:`InputLayer.backward` skips this ns (gated via
-            ``_skip_input_backward``), these posterior-marginal values at
-            active states are a useful output exposed through
-            ``pc.node_flows`` and are what the plain ProdLayer backward
-            would have written.
+        exactly one slot in each dense child (same rule as
+        ``ProdLayer.backward``: ``node_flows[u_cid] = element_flows[parid]``).
+        Scatters via ``_dense_ch_lookup[ch, h]``.
 
-        node_flows is zero-initialised at the top of ``TensorCircuit.backward``
-        and no other layer writes to these rows on the sparse path, so
-        inactive rows correctly stay at 0 (they contributed no LL path).
+        Sparse-input flow is **not** scattered into ``node_flows`` — it
+        stays in ``self._sparse_flows[ns_idx]``, which is the canonical
+        sparse-flow exposure (mirrors the forward's ``_sparse_outputs``
+        convention). Consumers like ``pyjuice.queries.conditional`` reach it
+        via the ``ns.sparse_input_ns._sparse_flow_owner`` back-reference.
+
+        ``node_flows`` is zero-initialised at the top of
+        ``TensorCircuit.backward`` and no other layer writes to these rows
+        on the sparse path, so inactive rows correctly stay at 0 (they
+        contributed no LL path).
         """
         if sv_flow.total_nnz == 0:
             return
         dense_ch_lookup = getattr(self, self._dense_ch_lookups[ns_idx])
         # dense_ch_lookup: [num_dense_chs, H]. Per ch, fetch the active rows'
         # global nid indices and scatter values. B=1: only col 0 is used.
+        torch.cuda.nvtx.range_push(
+            f"dense_ch_scatter(num_dense_chs={ns.num_dense_chs},nnz={sv_flow.total_nnz})"
+        )
         for ch in range(ns.num_dense_chs):
             target_ids = dense_ch_lookup[ch].index_select(0, sv_flow.indices)
             node_flows[target_ids, 0] = sv_flow.values
-
-        # Sparse input child: identity h → h within its _output_ind_range.
-        sparse_input_base = ns.sparse_input_ns._output_ind_range[0]
-        node_flows[sparse_input_base + sv_flow.indices, 0] = sv_flow.values
+        torch.cuda.nvtx.range_pop()
 
 
 # =====================================================================

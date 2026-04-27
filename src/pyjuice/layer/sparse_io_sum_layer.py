@@ -1,0 +1,450 @@
+from __future__ import annotations
+
+from typing import List, Optional, Sequence
+
+import torch
+import triton
+import triton.language as tl
+
+from pyjuice.nodes import SumNodes
+from .sparse_input_sum_layer import SparseInputSumLayer
+from .sparse_node_values import SparseNodeValues
+from .sparse_prod_layer import SparseProdLayer
+
+
+_FWD_BLOCK_K = 64
+"""Fixed K_in-axis tile size for :func:`_sparse_io_sum_forward_kernel`.
+Matches ``sparse_input_sum_layer._FWD_BLOCK_K``; kept as a separate constant
+so the two kernels can diverge in tuning if needed."""
+
+_BWD_BLOCK_P = 128
+"""K_out-chunk tile size for :func:`_sparse_io_sum_backward_kernel`. Chunks
+the serial reduction over K_out parents per program to bound register
+pressure at large K_out (same reasoning as the dense-parent version in
+``sparse_input_sum_layer``)."""
+
+
+class SparseIOSumLayer(SparseInputSumLayer):
+    """Sparse-in, sparse-out sum layer. Used on the interior of a sparse
+    HMM chain where this sum's sole consumer is a :class:`CoSparseProdLayer`
+    whose sparse input's CSC column defines *this* sum's output sparsity.
+
+    Reduces the dense ``H``-row sum to a ``K_out × K_in`` tile: the parameter
+    matrix is both **row-sliced** (by the consumer's emission-active rows)
+    and **column-sliced** (by the child prod's emission-active rows).
+    ``node_mars`` is never written — the consumer reads the packed
+    :class:`SparseNodeValues` directly via ``self._sparse_outputs``.
+
+    Inference-only, B=1, propagation_alg=='LL', no param_flows. Every
+    assertion inherited from :class:`SparseInputSumLayer` still holds; the
+    sparse output is purely additive.
+    """
+
+    def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
+                 global_pid_start: int, global_pfid_start: int,
+                 node2tiednodes: dict,
+                 layer_sparsity_tol: Optional[float] = None,
+                 max_num_partitions: Optional[int] = None,
+                 max_tied_ns_per_parflow_block: int = 8,
+                 disable_gpu_compilation: bool = False,
+                 force_gpu_compilation: bool = False,
+                 inner_layer_groups: Optional[list] = None,
+                 output_sparsity_var_ids: Optional[Sequence[int]] = None,
+                 **kwargs) -> None:
+        super().__init__(
+            nodes=nodes, global_nid_start=global_nid_start,
+            global_pid_start=global_pid_start, global_pfid_start=global_pfid_start,
+            node2tiednodes=node2tiednodes,
+            layer_sparsity_tol=layer_sparsity_tol,
+            max_num_partitions=max_num_partitions,
+            max_tied_ns_per_parflow_block=max_tied_ns_per_parflow_block,
+            disable_gpu_compilation=disable_gpu_compilation,
+            force_gpu_compilation=force_gpu_compilation,
+            inner_layer_groups=inner_layer_groups,
+        )
+
+        assert output_sparsity_var_ids is not None \
+               and len(output_sparsity_var_ids) == len(self.nodes), (
+            "SparseIOSumLayer requires one `output_sparsity_var_id` per sum "
+            "node — the variable whose CSC column defines this sum's output "
+            "sparsity pattern (supplied by TensorCircuit from the consumer "
+            "CoSparseProdNodes' sparse_input_ns.var_id)."
+        )
+        self._output_sparsity_var_ids: List[int] = list(output_sparsity_var_ids)
+
+        # Resolve the downstream sparse input ns for each sum ns once, so
+        # forward can call build_sparse_pattern without re-walking the DAG.
+        # We identify the consumer by iterating sibling ProdNodes in
+        # ``self.nodes[i].consumers`` — but we don't have a consumers link at
+        # ns level. Instead, the caller passes var_ids + we look up the dist
+        # on the input_layer_group via TensorCircuit's set-up.
+        # For now, we let ``build_sparse_pattern`` be called on the parent
+        # prod's sparse_input_ns.dist directly by threading the dist refs.
+        # Since the consumer resolution needs the DAG graph, TensorCircuit
+        # also passes ``output_sparsity_dists`` and ``output_sparsity_param_ranges``.
+        output_sparsity_dists = kwargs.pop("output_sparsity_dists", None)
+        output_sparsity_num_rows = kwargs.pop("output_sparsity_num_rows", None)
+        assert output_sparsity_dists is not None \
+               and len(output_sparsity_dists) == len(self.nodes), (
+            "SparseIOSumLayer requires `output_sparsity_dists` (the "
+            "SparseCategorical distribution of the consumer's sparse input) "
+            "per sum node."
+        )
+        assert output_sparsity_num_rows is not None \
+               and len(output_sparsity_num_rows) == len(self.nodes), (
+            "SparseIOSumLayer requires `output_sparsity_num_rows` (H of the "
+            "consumer prod output, == H of this sum) per sum node."
+        )
+        self._output_sparsity_dists = list(output_sparsity_dists)
+        self._output_sparsity_num_rows: List[int] = list(output_sparsity_num_rows)
+
+        # Forward-cached sv_out per ns, read by downstream CoSparseProdLayer.
+        self._sparse_outputs: List[Optional[SparseNodeValues]] = [None] * len(self.nodes)
+        # Backward flow container written by downstream CoSparseProdLayer.
+        self._sparse_flows: List[Optional[SparseNodeValues]] = [None] * len(self.nodes)
+
+    def __repr__(self) -> str:
+        return (
+            f"SparseIOSumLayer(nid_range=({self._layer_nid_range[0]}, "
+            f"{self._layer_nid_range[1]}), num_nodes={self.num_nodes}, "
+            f"num_edges={self.num_edges}, num_sum_ns={len(self._sparse_input_refs)}, "
+            f"out_vars={self._output_sparsity_var_ids})"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Forward
+    # ------------------------------------------------------------------ #
+
+    def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                params: torch.Tensor, force_use_bf16: bool = False,
+                force_use_fp32: bool = False, propagation_alg: str = "LL",
+                data: Optional[torch.Tensor] = None,
+                data_cpu: Optional[torch.Tensor] = None,
+                **kwargs) -> None:
+        batch_size = node_mars.size(1)
+        assert batch_size == 1, (
+            "SparseIOSumLayer is B=1 only (matches SparseInputSumLayer / "
+            "SparseProdLayer fast path)."
+        )
+        assert propagation_alg == "LL", (
+            "SparseIOSumLayer requires propagation_alg == 'LL'."
+        )
+        assert params.dim() == 1
+        assert data is not None, (
+            "SparseIOSumLayer.forward requires `data` (per-var observed "
+            "tokens) so it can build the output-sparsity pattern for each ns."
+        )
+
+        data_for_pattern = data_cpu if data_cpu is not None else data
+
+        torch.cuda.nvtx.range_push(
+            f"SparseIOSumLayer.fwd(n_blocks={len(self._dense_blocks)})"
+        )
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
+            self._dense_blocks, self._sparse_input_refs,
+        )):
+            nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, BS, CBS = block
+            sv_in = sparse_prod._sparse_outputs[ns_idx]
+            K_in = sv_in.total_nnz
+
+            torch.cuda.nvtx.range_push(f"block[{blk_idx}]/build_out_pattern")
+            out_dist = self._output_sparsity_dists[blk_idx]
+            out_var_id = self._output_sparsity_var_ids[blk_idx]
+            out_num_rows = self._output_sparsity_num_rows[blk_idx]
+            sv_out = out_dist.build_sparse_pattern(
+                data=data_for_pattern, var_id=out_var_id,
+                num_rows=out_num_rows, device=node_mars.device,
+            )
+            torch.cuda.nvtx.range_pop()
+
+            self._sparse_outputs[blk_idx] = sv_out
+            K_out = sv_out.total_nnz
+
+            if K_out == 0:
+                # No active output rows: downstream CoSparseProdLayer will
+                # emit a zero-length sv too.
+                continue
+
+            if K_in == 0:
+                # No active input rows: log(0) for every K_out parent.
+                sv_out.values.fill_(float("-inf"))
+                continue
+
+            torch.cuda.nvtx.range_push(f"block[{blk_idx}]")
+            torch.cuda.nvtx.range_push("in_values.max()")
+            max_val = sv_in.values.max()
+            torch.cuda.nvtx.range_pop()
+
+            TILE_M = 32
+            while TILE_M > 1 and TILE_M > K_out:
+                TILE_M //= 2
+            if TILE_M < 1:
+                TILE_M = 1
+
+            torch.cuda.nvtx.range_push(
+                f"_sparse_io_sum_fwd_kernel(K_in={K_in}, K_out={K_out})"
+            )
+            grid = (triton.cdiv(K_out, TILE_M),)
+            _sparse_io_sum_forward_kernel[grid](
+                values_out_ptr=sv_out.values,
+                mparams_ptr=params,
+                in_indices_ptr=sv_in.indices,
+                in_values_ptr=sv_in.values,
+                max_val_ptr=max_val,
+                out_indices_ptr=sv_out.indices,
+                pid_start=pid_start,
+                K_in=K_in,
+                K_out=K_out,
+                NB_ch=NB_ch,
+                BS=BS,
+                CBS=CBS,
+                TILE_M=TILE_M,
+                BLOCK_K=_FWD_BLOCK_K,
+            )
+            torch.cuda.nvtx.range_pop()
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
+        return None
+
+    # ------------------------------------------------------------------ #
+    # Backward (element flows only)
+    # ------------------------------------------------------------------ #
+
+    def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                 node_mars: torch.Tensor, element_mars: torch.Tensor,
+                 params: torch.Tensor, param_flows: Optional[torch.Tensor] = None,
+                 allow_modify_flows: bool = False, propagation_alg: str = "LL",
+                 logspace_flows: bool = False, negate_pflows: bool = False,
+                 accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
+                 force_use_fp32: bool = False, **kwargs) -> None:
+        if param_flows is not None:
+            raise NotImplementedError(
+                "SparseIOSumLayer is inference-only; parameter-flow "
+                "accumulation is not supported."
+            )
+
+        batch_size = node_mars.size(1)
+        assert batch_size == 1, "SparseIOSumLayer is B=1 only."
+        assert propagation_alg == "LL" and not logspace_flows \
+               and not negate_pflows and not allow_neg_flows, (
+            "SparseIOSumLayer.backward requires propagation_alg='LL' + "
+            "logspace_flows=False + negate_pflows=False + allow_neg_flows=False."
+        )
+        # ``allow_modify_flows`` only governs whether the upstream SparseInputSumLayer /
+        # SparseIOSumLayer pre-transforms ``node_flows`` dense cells before its
+        # kernel consumes them. We don't read from ``node_flows`` at all —
+        # our "nflow" lives in the packed ``sv_flow_out`` container produced
+        # by the downstream CoSparseProdLayer, which is always raw. Safe to
+        # ignore the flag.
+        assert not accumulate_ch_flows, (
+            "SparseIOSumLayer.backward writes sv_flow_in straight into the "
+            "upstream prod layer; accumulate_ch_flows is not supported."
+        )
+
+        torch.cuda.nvtx.range_push(
+            f"SparseIOSumLayer.bwd(n_blocks={len(self._dense_blocks)})"
+        )
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
+            self._dense_blocks, self._sparse_input_refs,
+        )):
+            _nid_start, _cid_start, pid_start, _pfid_start, _NB, NB_ch, BS, CBS = block
+
+            sv_flow_out = self._sparse_flows[blk_idx]
+            assert sv_flow_out is not None, (
+                "SparseIOSumLayer.backward expected sv_flow_out from the "
+                "downstream CoSparseProdLayer."
+            )
+            # Consume-and-clear to avoid stale state across passes.
+            self._sparse_flows[blk_idx] = None
+
+            sv_in = sparse_prod._sparse_outputs[ns_idx]
+            sv_out = self._sparse_outputs[blk_idx]
+            K_in = sv_in.total_nnz
+            K_out = sv_out.total_nnz
+
+            # Mirror sv_in pattern for the sparse flow handed to upstream prod.
+            sv_flow_in = SparseNodeValues(
+                col_start=sv_in.col_start, total_nnz=K_in,
+                indices=sv_in.indices,
+                values=torch.empty_like(sv_in.values),
+                num_rows=sv_in.num_rows,
+            )
+            sparse_prod._sparse_flows[ns_idx] = sv_flow_in
+
+            if K_in == 0 or K_out == 0:
+                continue
+
+            torch.cuda.nvtx.range_push(
+                f"block[{blk_idx}]/_sparse_io_sum_bwd_kernel(K_in={K_in},K_out={K_out})"
+            )
+            grid = (K_in,)
+            _sparse_io_sum_backward_kernel[grid](
+                flow_in_ptr=sv_flow_in.values,
+                sv_flow_out_ptr=sv_flow_out.values,
+                sv_out_values_ptr=sv_out.values,
+                mparams_ptr=params,
+                in_indices_ptr=sv_in.indices,
+                in_values_ptr=sv_in.values,
+                out_indices_ptr=sv_out.indices,
+                pid_start=pid_start,
+                K_out=K_out,
+                NB_ch=NB_ch,
+                BS=BS,
+                CBS=CBS,
+                BLOCK_P=_BWD_BLOCK_P,
+            )
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.nvtx.range_pop()
+        return None
+
+
+# =====================================================================
+# Triton kernels
+# =====================================================================
+#
+# NOTE: These kernels mirror ``_sparse_input_sum_{forward,backward_sv}_kernel``
+# in ``sparse_input_sum_layer.py`` but gather parent rows from ``out_indices``
+# instead of iterating contiguously over ``NB * BS`` dense parents, and write
+# to packed ``values_out`` / read from packed ``sv_flow_out`` / ``sv_out.values``
+# instead of ``node_mars`` / ``node_flows`` / ``node_mars`` respectively.
+# Keep the logsumexp math in sync with the sibling kernels.
+
+
+@triton.jit(
+    do_not_specialize=["pid_start", "K_in", "K_out"],
+    do_not_specialize_on_alignment=[
+        "in_indices_ptr", "in_values_ptr", "max_val_ptr",
+        "out_indices_ptr", "values_out_ptr",
+    ],
+)
+def _sparse_io_sum_forward_kernel(
+    values_out_ptr,
+    mparams_ptr,
+    in_indices_ptr, in_values_ptr, max_val_ptr,
+    out_indices_ptr,
+    pid_start,
+    K_in,
+    K_out,
+    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+    TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
+):
+    """Forward for one SparseIOSumLayer block. Grid = ``(cdiv(K_out, TILE_M),)``.
+
+    Per-program (K_out-tile) math:
+
+      v_k = exp(log_in_values[k] - max_val)                    [per K_in chunk]
+      h_m   = out_indices[m]                                   [TILE_M gather]
+      pblock_m, within_m = h_m // BS, h_m % BS
+      cblock_k, cslot_k  = in_indices[k] // CBS, in_indices[k] % CBS
+      W[m, k] = mparams[pid_start + (pblock_m*NB_ch + cblock_k)*CBS*BS
+                                   + cslot_k*BS + within_m]
+      acc_sum[m] += Σ_{k ∈ chunk} W[m, k] · v_k                [TILE_M]
+      values_out[m] = log(acc_sum[m] + 1e-24) + max_val
+    """
+    pid_m = tl.program_id(0)
+
+    offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)              # [TILE_M]
+    mask_m = offs_m < K_out
+
+    h_m = tl.load(out_indices_ptr + offs_m, mask=mask_m, other=0)
+    pblock_m = h_m // BS                                        # [TILE_M]
+    within_m = h_m % BS                                         # [TILE_M]
+
+    max_val = tl.load(max_val_ptr)                              # scalar
+
+    acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
+    for k0 in tl.range(0, K_in, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)                     # [BLOCK_K]
+        mask_k = offs_k < K_in
+
+        child_ids = tl.load(in_indices_ptr + offs_k, mask=mask_k, other=0)
+        log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
+                           other=-float("inf"))
+
+        v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
+
+        cblock = child_ids // CBS
+        cslot = child_ids % CBS
+
+        W_ptr_off = (
+            pid_start
+            + (pblock_m[:, None] * NB_ch + cblock[None, :]) * CBS * BS
+            + cslot[None, :] * BS
+            + within_m[:, None]
+        )
+        combined_mask = mask_m[:, None] & mask_k[None, :]
+        W = tl.load(mparams_ptr + W_ptr_off, mask=combined_mask,
+                    other=0.0).to(tl.float32)
+
+        acc_sum += tl.sum(W * v_k[None, :], axis=1)
+
+    result = tl.log(acc_sum + 1e-24) + max_val
+    tl.store(values_out_ptr + offs_m, result, mask=mask_m)
+
+
+@triton.jit(
+    do_not_specialize=["pid_start", "K_out"],
+    do_not_specialize_on_alignment=[
+        "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
+        "in_indices_ptr", "in_values_ptr", "out_indices_ptr",
+    ],
+)
+def _sparse_io_sum_backward_kernel(
+    flow_in_ptr,
+    sv_flow_out_ptr, sv_out_values_ptr,
+    mparams_ptr,
+    in_indices_ptr, in_values_ptr, out_indices_ptr,
+    pid_start,
+    K_out,
+    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+    BLOCK_P: tl.constexpr,
+):
+    """Backward for one SparseIOSumLayer block. Grid = ``(K_in,)``.
+
+    Per-program (one active K_in slot) math:
+
+      c_k, log_val_k = in_indices[k], in_values[k]
+      cblock, cslot  = c_k // CBS, c_k % CBS
+      for j in chunks of K_out:
+        h_j         = out_indices[j]
+        pblock_j    = h_j // BS,  within_j = h_j % BS
+        nflow_j     = sv_flow_out[j]           # packed K_out flow
+        nmars_j     = sv_out_values[j]         # packed K_out forward result
+        W_j         = mparams[pid_start + (pblock_j*NB_ch + cblock)*CBS*BS
+                                        + cslot*BS + within_j]
+        chunk       = nflow_j * W_j * exp(log_val_k - nmars_j)
+        acc        += chunk
+      flow_in[k] = Σ acc
+    """
+    pid_k = tl.program_id(0)
+
+    child_id = tl.load(in_indices_ptr + pid_k)
+    log_val = tl.load(in_values_ptr + pid_k)
+    cblock = child_id // CBS
+    cslot = child_id % CBS
+
+    acc = tl.zeros([BLOCK_P], dtype=tl.float32)
+
+    for j0 in tl.range(0, K_out, BLOCK_P):
+        offs_j = j0 + tl.arange(0, BLOCK_P)                     # [BLOCK_P]
+        mask_j = offs_j < K_out
+
+        h_j = tl.load(out_indices_ptr + offs_j, mask=mask_j, other=0)
+        pblock_j = h_j // BS
+        within_j = h_j % BS
+
+        nflows = tl.load(sv_flow_out_ptr + offs_j, mask=mask_j, other=0.0)
+        nmars = tl.load(sv_out_values_ptr + offs_j, mask=mask_j, other=0.0)
+
+        W_ptr = (
+            pid_start
+            + (pblock_j * NB_ch + cblock) * CBS * BS
+            + cslot * BS
+            + within_j
+        )
+        W = tl.load(mparams_ptr + W_ptr, mask=mask_j, other=0.0).to(tl.float32)
+
+        chunk = nflows * W * tl.exp(log_val - nmars)
+        acc += tl.where(mask_j, chunk, 0.0)
+
+    tl.store(flow_in_ptr + pid_k, tl.sum(acc))

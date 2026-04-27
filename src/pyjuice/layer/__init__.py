@@ -3,8 +3,10 @@ from .input_layer import InputLayer
 from .dense_input_layer import DenseCategoricalInputLayer
 from .prod_layer import ProdLayer
 from .sparse_prod_layer import SparseProdLayer
+from .co_sparse_prod_layer import CoSparseProdLayer
 from .sparse_node_values import SparseNodeValues
 from .sum_layer import SumLayer
 from .dense_sum_layer import DenseSumLayer
 from .sparse_input_sum_layer import SparseInputSumLayer
+from .sparse_io_sum_layer import SparseIOSumLayer
 from .layer_group import LayerGroup

@@ -13,11 +13,15 @@ networkx = "*"
 numba = "*"
 packaging = "*"
 matplotlib = "*"
+pillow = "*"
 tqdm = "*"
 typing_extensions = "*"
 torch = ">=2.2.0"
 triton = ">=2.2.0"
 pyjuice = { path = ".", editable = true }
+sphinx = ">=9.1.0,<10"
+sphinx-gallery = ">=0.21.0,<0.22"
+sphinx-rtd-theme = ">=3.1.0, <4"
 
 [feature.dev.pypi-dependencies]
 pytest = "*"
