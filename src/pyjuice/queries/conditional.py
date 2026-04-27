@@ -556,7 +556,7 @@ def _sparse_categorical_cond_backward_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["vid_out", "param_base", "batch_size", "num_cats"],
+    do_not_specialize=["vid_out", "param_base", "num_cats"],
     do_not_specialize_on_alignment=["cat_probs_ptr", "sv_indices_ptr",
                                      "sv_values_ptr", "params_ptr",
                                      "csr_indptr_ptr", "csr_cols_ptr",
@@ -565,11 +565,11 @@ def _sparse_categorical_cond_backward_kernel(
 def _sparse_categorical_cond_backward_sparse_kernel(
     cat_probs_ptr, sv_indices_ptr, sv_values_ptr, params_ptr,
     csr_indptr_ptr, csr_cols_ptr, csr_to_csc_ptr,
-    vid_out, param_base,
-    batch_size, num_cats,
-    BLOCK_R: tl.constexpr, BLOCK_B: tl.constexpr,
+    vid_out, param_base, num_cats,
+    BLOCK_R: tl.constexpr,
 ):
-    """Sparse-native version of :func:`_sparse_categorical_cond_backward_kernel`.
+    """Sparse-native, B=1 specialization of
+    :func:`_sparse_categorical_cond_backward_kernel`.
 
     Iterates over the active rows that actually carry non-zero flow (the
     observed CSC column's active rows — the count is set by the launch
@@ -587,49 +587,40 @@ def _sparse_categorical_cond_backward_sparse_kernel(
     state out of Triton's specialization key, so this kernel is JIT-compiled
     exactly once across token sequences.
 
-    Grid: ``(K_active, ceil(max_nnz_per_row / BLOCK_R), ceil(B / BLOCK_B))``.
-    Per program covers one (active row, row-slot tile, batch tile).
+    Grid: ``(K_active, ceil(max_nnz_per_row / BLOCK_R))``. Per program covers
+    one (active row, row-slot tile). The batch axis is collapsed because the
+    sparse path is only entered with ``batch_size == 1``; ``cat_probs`` is
+    indexed as ``[vid_out, col]`` (the trailing B=1 axis is a no-op stride).
     """
     pid_j = tl.program_id(0)
     pid_r = tl.program_id(1)
-    pid_b = tl.program_id(2)
 
-    # Active row + flow for this program.
+    # Active row + flow for this program. ``sv.values`` is [K_active], no
+    # batch axis (B=1 layout).
     row = tl.load(sv_indices_ptr + pid_j)
-    # B=1 layout: ``sv.values`` is [K_active], no batch axis. We scalar-
-    # broadcast across the batch tile (K_active is the same set for every
-    # batch, since we only run the sparse path with B=1).
     flow_scalar = tl.load(sv_values_ptr + pid_j)
 
-    # Walk this row's CSR slot range.
-    row_start = tl.load(csr_indptr_ptr + row)
-    row_end = tl.load(csr_indptr_ptr + row + 1)
+    # Walk this row's CSR slot range. Cast to int32 — register pressure on
+    # the [BLOCK_R] index tiles is the main cost driver here.
+    row_start = tl.load(csr_indptr_ptr + row).to(tl.int32)
+    row_end = tl.load(csr_indptr_ptr + row + 1).to(tl.int32)
     row_nnz = row_end - row_start
 
     offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
     slot_mask = offs_r < row_nnz
     csr_slot = row_start + offs_r
 
-    cols = tl.load(csr_cols_ptr + csr_slot, mask = slot_mask, other = 0)
+    cols = tl.load(csr_cols_ptr + csr_slot, mask = slot_mask, other = 0).to(tl.int32)
     csc_slots = tl.load(csr_to_csc_ptr + csr_slot, mask = slot_mask, other = 0)
     params_v = tl.load(params_ptr + param_base + csc_slots,
                        mask = slot_mask, other = 0.0)
 
-    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
-    mask_b = offs_b < batch_size
+    contrib = flow_scalar * params_v   # [BLOCK_R]
 
-    contrib = (flow_scalar * params_v)[:, None]   # [BLOCK_R, 1]
-    contrib = tl.where(slot_mask[:, None] & mask_b[None, :], contrib, 0.0)
-
-    # cat_probs is laid out as [num_target_vars, num_cats, B] flat. Address:
-    #   (vid_out * num_cats + col) * batch_size + b
-    # Each (col, b) cell may be hit by multiple programs (different active
-    # rows that share a col), so we atomic_add.
-    base = (vid_out * num_cats + cols)[:, None] * batch_size + offs_b[None, :]
-    tl.atomic_add(
-        cat_probs_ptr + base, contrib,
-        mask = slot_mask[:, None] & mask_b[None, :],
-    )
+    # cat_probs is laid out as [num_target_vars, num_cats] (the B=1 axis
+    # collapses). Multiple programs may hit the same col, so atomic_add.
+    addr = vid_out * num_cats + cols
+    tl.atomic_add(cat_probs_ptr + addr, contrib, mask = slot_mask)
 
 
 def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
@@ -670,8 +661,6 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
         dtype = torch.float32, device = node_flows.device,
     )
 
-    BLOCK_B = 64
-
     for ns in layer.nodes:
         var_id = ns.scope.to_list()[0]
         vid_out = int(rev_vars_mapping[var_id].item())
@@ -700,6 +689,10 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
             sv_flow = owner_layer._sparse_flows[owner_ns_idx]
 
         if sv_flow is not None and sv_flow.total_nnz > 0:
+            assert batch_size == 1, (
+                "SparseCategorical sparse-flow conditional backward path "
+                "is only valid for batch_size == 1 (sv.values is [K_active])."
+            )
             assert dist._csr_indptr is not None, (
                 "SparseCategorical: CSR side info not built (set_meta_parameters "
                 "should have populated _csr_indptr). Re-run set_meta_parameters."
@@ -708,7 +701,6 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
             grid = (
                 sv_flow.total_nnz,
                 triton.cdiv(dist._max_nnz_per_row, BLOCK_R),
-                triton.cdiv(batch_size, BLOCK_B),
             )
             _sparse_categorical_cond_backward_sparse_kernel[grid](
                 cat_probs_ptr = cat_probs,
@@ -720,14 +712,13 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
                 csr_to_csc_ptr = dist._csr_to_csc,
                 vid_out = vid_out,
                 param_base = param_base,
-                batch_size = batch_size,
                 num_cats = num_cats,
                 BLOCK_R = BLOCK_R,
-                BLOCK_B = BLOCK_B,
             )
             continue
 
         BLOCK_K = max(triton.next_power_of_2(dist._max_nnz_per_col), 4)
+        BLOCK_B = min(64, max(1, triton.next_power_of_2(batch_size)))
 
         grid = (
             dist.num_cats,
