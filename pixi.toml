@@ -7,6 +7,7 @@ platforms = ["linux-64"]
 [dependencies]
 python = "3.12.*"
 
+# Base pypi deps (no torch/triton — those come from a feature)
 [pypi-dependencies]
 numpy = "*"
 networkx = "*"
@@ -16,13 +17,35 @@ matplotlib = "*"
 pillow = "*"
 tqdm = "*"
 typing_extensions = "*"
-torch = ">=2.2.0"
-triton = ">=2.2.0"
 pyjuice = { path = ".", editable = true }
 sphinx = ">=9.1.0,<10"
 sphinx-gallery = ">=0.21.0,<0.22"
 sphinx-rtd-theme = ">=3.1.0, <4"
 
+# --- torch from PyPI default index (original behaviour) ---
+[feature.pypi-torch.pypi-dependencies]
+torch = ">=2.2.0"
+triton = ">=2.2.0"
+
+# --- torch from PyPI with CUDA 11.8 wheels ---
+[feature.cuda118.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu118"
+extra-index-urls = ["https://pypi.org/simple"]
+
+[feature.cuda118.pypi-dependencies]
+torch = ">=2.2.0, <=2.7.1"
+triton = ">=2.2.0"
+
+# --- torch from PyPI with CUDA 12.4 wheels ---
+[feature.cuda124.pypi-options]
+index-url = "https://download.pytorch.org/whl/cu124"
+extra-index-urls = ["https://pypi.org/simple"]
+
+[feature.cuda124.pypi-dependencies]
+torch = ">=2.2.0, <=2.6.0"
+triton = ">=2.2.0"
+
+# --- dev extras ---
 [feature.dev.pypi-dependencies]
 pytest = "*"
 pytest-xdist = "*"
@@ -32,5 +55,7 @@ datasets = "*"
 flake8 = "*"
 
 [environments]
-default = { solve-group = "default" }
-dev = { features = ["dev"], solve-group = "default" }
+default = { features = ["pypi-torch"], solve-group = "default" }
+dev = { features = ["dev", "pypi-torch"], solve-group = "default" }
+dev-cuda118 = { features = ["dev", "cuda118"], solve-group = "cuda118" }
+dev-cuda124 = { features = ["dev", "cuda124"], solve-group = "cuda124" }
