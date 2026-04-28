@@ -335,12 +335,18 @@ class SparseCategorical(Distribution):
 
     def build_sparse_pattern(self, data: torch.Tensor, var_id: int,
                               num_rows: int,
-                              device: torch.device):
+                              device: torch.device,
+                              values_out: Optional[torch.Tensor] = None):
         """
         Construct a :class:`SparseNodeValues` for the observed token at
         ``var_id`` (B=1 only). ``indices`` is a *view* into ``_csc_indices``
         — no per-call allocation — and ``values`` is an empty buffer sized
         ``total_nnz`` for the consumer (``SparseProdLayer``) to fill.
+
+        If ``values_out`` is supplied, ``values`` becomes a length-``total_nnz``
+        view into that pre-allocated workspace (must be ``>= _max_nnz_per_col``
+        on ``device``). This eliminates the per-call ``cudaMalloc`` that
+        otherwise dominates the per-timestep CPU cost on the sparse HMM path.
 
         ``data`` can live on **CPU or GPU**, but callers in the perf-critical
         sparse HMM path should pass it on CPU: no GPU kernel ever dereferences
@@ -381,16 +387,23 @@ class SparseCategorical(Distribution):
 
         if total_nnz == 0:
             empty_long = self._csc_indices[0:0]
+            if values_out is not None:
+                values = values_out[:0]
+            else:
+                values = torch.empty(0, dtype=torch.float32, device=device)
             return SparseNodeValues(
                 col_start=col_start, total_nnz=0,
                 indices=empty_long,
-                values=torch.empty(0, dtype=torch.float32, device=device),
+                values=values,
                 num_rows=num_rows,
             )
 
         torch.cuda.nvtx.range_push(f"indices_view+values_alloc(nnz={total_nnz})")
         indices = self._csc_indices[col_start:col_end]             # view
-        values = torch.empty(total_nnz, dtype=torch.float32, device=device)
+        if values_out is not None:
+            values = values_out[:total_nnz]
+        else:
+            values = torch.empty(total_nnz, dtype=torch.float32, device=device)
         sv = SparseNodeValues(
             col_start=col_start, total_nnz=total_nnz,
             indices=indices, values=values, num_rows=num_rows,

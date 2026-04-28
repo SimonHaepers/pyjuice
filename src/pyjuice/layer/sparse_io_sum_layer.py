@@ -103,6 +103,16 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # Backward flow container written by downstream CoSparseProdLayer.
         self._sparse_flows: List[Optional[SparseNodeValues]] = [None] * len(self.nodes)
 
+        # Per-block GPU workspaces re-used every call. Sized to the relevant
+        # ``_max_nnz_per_col`` so the per-step ``cudaMalloc`` in
+        # ``build_sparse_pattern`` (forward) and ``torch.empty_like`` for
+        # ``sv_flow_in.values`` (backward) become free slices. Allocated lazily
+        # on first use (device unknown at __init__).
+        self._fwd_values_workspaces: List[Optional[torch.Tensor]] = \
+            [None] * len(self.nodes)
+        self._bwd_flow_workspaces: List[Optional[torch.Tensor]] = \
+            [None] * len(self.nodes)
+
     def __repr__(self) -> str:
         return (
             f"SparseIOSumLayer(nid_range=({self._layer_nid_range[0]}, "
@@ -151,9 +161,17 @@ class SparseIOSumLayer(SparseInputSumLayer):
             out_dist = self._output_sparsity_dists[blk_idx]
             out_var_id = self._output_sparsity_var_ids[blk_idx]
             out_num_rows = self._output_sparsity_num_rows[blk_idx]
+            ws_out = self._fwd_values_workspaces[blk_idx]
+            if ws_out is None or ws_out.device != node_mars.device:
+                ws_out = torch.empty(
+                    out_dist._max_nnz_per_col,
+                    dtype=torch.float32, device=node_mars.device,
+                )
+                self._fwd_values_workspaces[blk_idx] = ws_out
             sv_out = out_dist.build_sparse_pattern(
                 data=data_for_pattern, var_id=out_var_id,
                 num_rows=out_num_rows, device=node_mars.device,
+                values_out=ws_out,
             )
             torch.cuda.nvtx.range_pop()
 
@@ -263,10 +281,17 @@ class SparseIOSumLayer(SparseInputSumLayer):
             K_out = sv_out.total_nnz
 
             # Mirror sv_in pattern for the sparse flow handed to upstream prod.
+            ws_flow = self._bwd_flow_workspaces[blk_idx]
+            if ws_flow is None or ws_flow.device != node_mars.device:
+                in_max_nnz = sparse_prod.nodes[ns_idx].sparse_input_ns.dist._max_nnz_per_col
+                ws_flow = torch.empty(
+                    in_max_nnz, dtype=torch.float32, device=node_mars.device,
+                )
+                self._bwd_flow_workspaces[blk_idx] = ws_flow
             sv_flow_in = SparseNodeValues(
                 col_start=sv_in.col_start, total_nnz=K_in,
                 indices=sv_in.indices,
-                values=torch.empty_like(sv_in.values),
+                values=ws_flow[:K_in],
                 num_rows=sv_in.num_rows,
             )
             sparse_prod._sparse_flows[ns_idx] = sv_flow_in

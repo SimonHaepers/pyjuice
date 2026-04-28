@@ -3,11 +3,34 @@ from __future__ import annotations
 from typing import List, Optional, Sequence, Tuple
 
 import torch
+import triton
+import triton.language as tl
 
 from pyjuice.nodes import ProdNodes, SparseProdNodes
 from .sparse_prod_layer import SparseProdLayer
 from .sparse_node_values import SparseNodeValues
 from .layer_group import LayerGroup
+
+
+@triton.jit
+def _co_sparse_log_add_kernel(
+    out_ptr, params_ptr, dense_values_ptr,
+    param_offset, n,
+    BLOCK: tl.constexpr,
+):
+    """Fused ``out[i] = log(params[param_offset + i]) + dense_values[i]``.
+
+    Replaces the three-kernel ``torch.log(emit_params) + sv_dense.values``
+    + ``sv.values.copy_(...)`` chain that otherwise launches one tiny
+    element-wise kernel each (and allocates two intermediate temps) per
+    timestep on the sparse HMM path.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < n
+    p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
+    d = tl.load(dense_values_ptr + offs, mask=mask, other=0.0)
+    tl.store(out_ptr + offs, tl.log(p) + d, mask=mask)
 
 
 class CoSparseProdLayer(SparseProdLayer):
@@ -91,6 +114,13 @@ class CoSparseProdLayer(SparseProdLayer):
         # eligibility check.
         self._skip_scatter = True
 
+        # Per-ns GPU workspace for the forward sv.values buffer. Sized to
+        # ``dist._max_nnz_per_col`` and re-used every call so the per-step
+        # ``cudaMalloc`` in ``build_sparse_pattern`` becomes a free slice.
+        # Allocated lazily on first forward (device unknown at __init__).
+        self._fwd_values_workspaces: List[Optional[torch.Tensor]] = \
+            [None] * len(self.nodes)
+
     def __repr__(self) -> str:
         return (
             f"CoSparseProdLayer(nid_range=({self._layer_nid_range[0]}, "
@@ -123,10 +153,19 @@ class CoSparseProdLayer(SparseProdLayer):
             sparse_cs = ns.sparse_input_ns
             sparse_input_layer = self._sparse_input_layers[ns_idx]
 
+            ws = self._fwd_values_workspaces[ns_idx]
+            if ws is None or ws.device != node_mars.device:
+                ws = torch.empty(
+                    sparse_cs.dist._max_nnz_per_col,
+                    dtype=torch.float32, device=node_mars.device,
+                )
+                self._fwd_values_workspaces[ns_idx] = ws
+
             torch.cuda.nvtx.range_push("build_sparse_pattern")
             sv = sparse_cs.dist.build_sparse_pattern(
                 data=data_for_pattern, var_id=ns.var_id,
                 num_rows=ns.num_nodes, device=node_mars.device,
+                values_out=ws,
             )
             torch.cuda.nvtx.range_pop()
             self._sparse_outputs[ns_idx] = sv
@@ -154,10 +193,16 @@ class CoSparseProdLayer(SparseProdLayer):
             # indexed by ``_param_range[0] + col_start + j`` for slot j — same
             # addressing as ``_sparse_prod_forward_kernel``.
             param_base = sparse_cs._param_range[0] + sv.col_start
-            emit_params = sparse_input_layer.params[
-                param_base:param_base + sv.total_nnz
-            ]
-            sv.values.copy_(torch.log(emit_params) + sv_dense.values)
+            BLOCK = 256
+            grid = (triton.cdiv(sv.total_nnz, BLOCK),)
+            _co_sparse_log_add_kernel[grid](
+                out_ptr=sv.values,
+                params_ptr=sparse_input_layer.params,
+                dense_values_ptr=sv_dense.values,
+                param_offset=param_base,
+                n=sv.total_nnz,
+                BLOCK=BLOCK,
+            )
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
