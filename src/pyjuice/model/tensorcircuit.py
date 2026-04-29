@@ -248,10 +248,8 @@ class TensorCircuit(nn.Module):
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
-                torch.cuda.nvtx.range_push("fwd/buffer_init")
                 self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
                 self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
-                torch.cuda.nvtx.range_pop()
 
             # Load cached node marginals
             if self._buffer_matches(name = "node_mars", cache = cache):
@@ -261,7 +259,6 @@ class TensorCircuit(nn.Module):
 
             # Input layers
             if not _inner_layers_only:
-                torch.cuda.nvtx.range_push("fwd/input_layers")
                 for idx, layer in enumerate(self.input_layer_group):
                     if input_layer_fn is None:
                         layer(inputs, self.node_mars, **kwargs)
@@ -279,7 +276,6 @@ class TensorCircuit(nn.Module):
 
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")
-                torch.cuda.nvtx.range_pop()  # fwd/input_layers
 
             # SparseProdLayer needs `data` to look up per-batch active CSC
             # columns; stash a reference so the inner loop + the re-forward
@@ -318,16 +314,13 @@ class TensorCircuit(nn.Module):
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
-                        torch.cuda.nvtx.range_push(f"fwd/layer[{layer_id}]/prod")
                         layer_group(self.node_mars, self.element_mars,
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list)
-                        torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
                         # Sum layer
-                        torch.cuda.nvtx.range_push(f"fwd/layer[{layer_id}]/sum")
                         layer_group(self.node_mars, self.element_mars, self.params,
                                     force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32,
@@ -336,7 +329,6 @@ class TensorCircuit(nn.Module):
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
                                     **kwargs)
-                        torch.cuda.nvtx.range_pop()
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -468,10 +460,8 @@ class TensorCircuit(nn.Module):
             ## Initialize buffers for backward pass ##
 
             if not _disable_buffer_init:
-                torch.cuda.nvtx.range_push("bwd/buffer_init")
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
-                torch.cuda.nvtx.range_pop()
 
             # Set root node flows
             def _set_root_node_flows():
@@ -517,19 +507,16 @@ class TensorCircuit(nn.Module):
 
                     if layer_group.is_prod():
                         # Prod layer
-                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/prod")
                         layer_group.backward(self.node_flows, self.element_flows,
                                              logspace_flows = logspace_flows,
                                              data = self._run_data,
                                              data_cpu = self._run_data_cpu,
                                              data_list = self._run_data_list)
-                        torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
                         # Sum layer
 
                         # First recompute the previous product layer
-                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/sum_reforward_prod")
                         self.inner_layer_groups[layer_id-1].forward(
                             self.node_mars, self.element_mars,
                             _for_backward = True,
@@ -537,7 +524,6 @@ class TensorCircuit(nn.Module):
                             data_cpu = self._run_data_cpu,
                             data_list = self._run_data_list,
                         )
-                        torch.cuda.nvtx.range_pop()
 
                         # Execute pre-backward callback
                         layer_group.callback(
@@ -551,13 +537,11 @@ class TensorCircuit(nn.Module):
                         )
 
                         # Backward sum layer
-                        torch.cuda.nvtx.range_push(f"bwd/layer[{layer_id}]/sum")
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows,
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
-                        torch.cuda.nvtx.range_pop()
 
                         # Execute post-backward callback
                         layer_group.callback(

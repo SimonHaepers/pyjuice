@@ -1,8 +1,7 @@
-"""NVTX-instrumented perf harness comparing ``juice.queries.conditional(...)``
-on the **dense** and **sparse** HMM pipelines from
-``tests/layer/sparse_hmm_perf_test.py``, but now running end-to-end conditional
-posteriors (per-token emission distribution) instead of just the inner
-backward.
+"""Perf harness comparing ``juice.queries.conditional(...)`` on the **dense**
+and **sparse** HMM pipelines from ``tests/layer/sparse_hmm_perf_test.py``,
+running end-to-end conditional posteriors (per-token emission distribution)
+instead of just the inner backward.
 
 * Dense path: ``DenseCategorical`` input + ``DenseCategoricalInputLayer`` +
   ``DenseSumLayer``. The conditional backward dispatches to
@@ -17,14 +16,8 @@ Both paths use ``homogeneous=True`` (tied transitions + tied emissions) and
 ``B=1`` — required for the ``SparseInputSumLayer`` / ``SparseProdLayer`` fast
 path.
 
-Emits NVTX ranges around each ``conditional`` call for profiling with ``nsys``
-and prints wall-clock per-iteration timings (CUDA events) so speedups are
-readable off the console without opening a profiler.
-
-Run standalone for profiling::
-
-    pixi run -e dev nsys profile --trace=cuda,nvtx \\
-        -o /tmp/cond_sparse_hmm python tests/queries/sparse_categorical_cond_perf_test.py
+Prints wall-clock per-iteration timings (CUDA events) so speedups are
+readable off the console.
 
 The ``test_cond_perf_smoke`` case is marked ``slow`` and is skipped unless
 ``--run-slow`` is passed.
@@ -139,16 +132,16 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
 
 
 # ---------------------------------------------------------------------------
-# Timing / NVTX helpers
+# Timing helpers
 # ---------------------------------------------------------------------------
 
 
 def _time_conditional(pc: TensorCircuit, data: torch.Tensor,
-                      target_vars, label: str,
+                      target_vars,
                       n_warmup: int, n_iter: int,
                       warmup_data: Optional[torch.Tensor] = None) -> dict:
-    """Warm up JIT, then run ``n_iter`` conditional() calls under NVTX ranges
-    and return per-iter wall-clock stats.
+    """Warm up JIT, then run ``n_iter`` conditional() calls and return
+    per-iter wall-clock stats.
 
     ``warmup_data`` should be a *different* token sequence than ``data`` so
     we exercise input variability — for sparse paths the per-token CSC
@@ -158,25 +151,17 @@ def _time_conditional(pc: TensorCircuit, data: torch.Tensor,
     """
     if warmup_data is None:
         warmup_data = data
-    torch.cuda.nvtx.range_push(f"{label}_warmup(n={n_warmup})")
     for i in range(n_warmup):
-        torch.cuda.nvtx.range_push(f"{label}_warmup_{i}")
         juice.queries.conditional(pc, data=warmup_data, target_vars=target_vars)
-        torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
 
     events = [(torch.cuda.Event(enable_timing=True),
                torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
 
-    torch.cuda.nvtx.range_push(f"{label}_loop")
     for i in range(n_iter):
-        torch.cuda.nvtx.range_push(f"{label}_iter_{i}")
         events[i][0].record()
         juice.queries.conditional(pc, data=data, target_vars=target_vars)
         events[i][1].record()
-        torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
 
     ms = [s.elapsed_time(e) for s, e in events]
@@ -207,7 +192,6 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     assert torch.cuda.is_available(), "this perf test requires CUDA"
     device = torch.device("cuda:0")
 
-    torch.cuda.nvtx.range_push("build_dense")
     root_dense = _build_dense_hmm_dag(T, H, V, bs)
     pc_dense = TensorCircuit(
         root_dense,
@@ -215,12 +199,10 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    torch.cuda.nvtx.range_pop()
 
     csc_indptr, csc_indices, csc_values = _make_csc_emissions(
         H=H, V=V, density=density, seed=seed, device=device,
     )
-    torch.cuda.nvtx.range_push("build_sparse")
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values,
     )
@@ -230,7 +212,6 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    torch.cuda.nvtx.range_pop()
 
     # Sanity-check the expected layer classes are actually in use.
     from pyjuice.layer import (
@@ -262,10 +243,10 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     warmup_data = torch.randint(0, V, (1, T), generator=g, device=device)
     data = torch.randint(0, V, (1, T), generator=g, device=device)
 
-    stats_dense = _time_conditional(pc_dense, data, target_vars, "dense",
+    stats_dense = _time_conditional(pc_dense, data, target_vars,
                                      n_warmup=n_warmup, n_iter=n_iter,
                                      warmup_data=warmup_data)
-    stats_sparse = _time_conditional(pc_sparse, data, target_vars, "sparse",
+    stats_sparse = _time_conditional(pc_sparse, data, target_vars,
                                       n_warmup=n_warmup, n_iter=n_iter,
                                       warmup_data=warmup_data)
 

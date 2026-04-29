@@ -146,9 +146,6 @@ class CoSparseProdLayer(SparseProdLayer):
 
         data_for_pattern = data_cpu if data_cpu is not None else data
 
-        torch.cuda.nvtx.range_push(
-            f"CoSparseProdLayer.fwd(n_ns={len(self.nodes)})"
-        )
         for ns_idx, ns in enumerate(self.nodes):
             sparse_cs = ns.sparse_input_ns
             sparse_input_layer = self._sparse_input_layers[ns_idx]
@@ -199,7 +196,6 @@ class CoSparseProdLayer(SparseProdLayer):
                 n=sv.total_nnz,
                 BLOCK=BLOCK,
             )
-        torch.cuda.nvtx.range_pop()
         return None
 
     # ---------------- Backward ---------------- #
@@ -207,9 +203,6 @@ class CoSparseProdLayer(SparseProdLayer):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  logspace_flows: bool = False,
                  data: Optional[torch.Tensor] = None, **kwargs) -> None:
-        torch.cuda.nvtx.range_push(
-            f"CoSparseProdLayer.bwd(n_ns={len(self.nodes)})"
-        )
         # Log-space product forward: ``out = log_emit + sv_dense``, so
         # ∂out/∂log_emit = ∂out/∂sv_dense = 1. The incoming sv_flow becomes
         # the outgoing flow on both inputs unchanged.
@@ -250,5 +243,4 @@ class CoSparseProdLayer(SparseProdLayer):
             # the sparse path, mirroring how forward leaves ``node_mars``
             # untouched there.
 
-        torch.cuda.nvtx.range_pop()
         return None

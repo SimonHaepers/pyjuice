@@ -134,9 +134,6 @@ class SparseInputSumLayer(DenseSumLayer):
 
         assert params.dim() == 1
 
-        torch.cuda.nvtx.range_push(
-            f"SparseInputSumLayer.fwd(n_blocks={len(self._dense_blocks)})"
-        )
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
         )):
@@ -175,7 +172,6 @@ class SparseInputSumLayer(DenseSumLayer):
                 TILE_M=TILE_M,
                 BLOCK_K=_FWD_BLOCK_K,
             )
-        torch.cuda.nvtx.range_pop()
 
         return None
 
@@ -206,10 +202,6 @@ class SparseInputSumLayer(DenseSumLayer):
                and not allow_neg_flows, (
             "SparseInputSumLayer backward requires propagation_alg='LL' + "
             "logspace_flows=False + negate_pflows=False + allow_neg_flows=False."
-        )
-
-        torch.cuda.nvtx.range_push(
-            f"SparseInputSumLayer.bwd(n_blocks={len(self._dense_blocks)})"
         )
 
         # Fast path: every upstream SparseProdLayer has _skip_scatter=True, so
@@ -301,7 +293,6 @@ class SparseInputSumLayer(DenseSumLayer):
                     allow_modify_flows=1 if allow_modify_flows else 0,
                 )
 
-            torch.cuda.nvtx.range_pop()
             return None
 
         # Dense fallback: write to element_flows with the atomic-add kernel.
@@ -342,7 +333,6 @@ class SparseInputSumLayer(DenseSumLayer):
                 allow_modify_flows=1 if allow_modify_flows else 0,
             )
 
-        torch.cuda.nvtx.range_pop()
         return None
 
 

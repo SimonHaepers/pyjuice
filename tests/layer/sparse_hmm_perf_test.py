@@ -1,7 +1,6 @@
 """
-NVTX-instrumented perf harness comparing the **dense** and **sparse** HMM
-inference pipelines on circuits of identical topology (same ``T``, ``H``,
-``V``, ``block_size``).
+Perf harness comparing the **dense** and **sparse** HMM inference pipelines
+on circuits of identical topology (same ``T``, ``H``, ``V``, ``block_size``).
 
 * Dense path: ``Categorical`` input + ``DenseCategoricalInputLayer`` +
   ``DenseSumLayer``.
@@ -18,15 +17,8 @@ CPU memory (per-timestep clones of H×H and H×V). ``B=1`` is required for
 the ``SparseInputSumLayer`` fast path (it falls back to :class:`DenseSumLayer`
 for B>1).
 
-Emits NVTX ranges around forward and backward per iteration for profiling
-with ``nsys`` / Nsight Systems. Also prints wall-clock per-iteration timings
-measured with ``torch.cuda.Event`` so you can read speedups off the console
-without opening a profiler.
-
-Run it standalone for profiling::
-
-    pixi run -e dev nsys profile --trace=cuda,nvtx \\
-        -o /tmp/sparse_hmm python tests/layer/sparse_hmm_perf_test.py
+Prints wall-clock per-iteration timings measured with ``torch.cuda.Event``
+so you can read speedups off the console.
 
 The ``test_perf_smoke`` case is marked ``slow`` and is skipped unless
 ``--run-slow`` is passed.
@@ -161,24 +153,16 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
 
 
 # ---------------------------------------------------------------------------
-# Timing / NVTX helpers
+# Timing helpers
 # ---------------------------------------------------------------------------
 
 
-def _nvtx_push(name: str) -> None:
-    torch.cuda.nvtx.range_push(name)
-
-
-def _nvtx_pop() -> None:
-    torch.cuda.nvtx.range_pop()
-
-
-def _time_pc(pc: TensorCircuit, data: torch.Tensor, label: str,
+def _time_pc(pc: TensorCircuit, data: torch.Tensor,
              n_warmup: int, n_iter: int,
              warmup_data: Optional[torch.Tensor] = None,
              do_backward: bool = True) -> dict:
-    """Warm up JIT, then run ``n_iter`` fwd(+bwd) under NVTX ranges and
-    return per-phase wall-clock stats measured with CUDA events.
+    """Warm up JIT, then run ``n_iter`` fwd(+bwd) and return per-phase
+    wall-clock stats measured with CUDA events.
 
     ``warmup_data`` should be a *different* token sequence than ``data`` so
     we exercise input variability — for sparse paths the per-token CSC
@@ -196,47 +180,32 @@ def _time_pc(pc: TensorCircuit, data: torch.Tensor, label: str,
     """
     if warmup_data is None:
         warmup_data = data
-    # Warmup — compile Triton kernels, capture any cudagraphs. Wrapped in its
-    # own NVTX range so the (usually long) first-iteration JIT cost is easy
-    # to separate from the timed loop in nsys.
-    _nvtx_push(f"{label}_warmup(n={n_warmup})")
     for i in range(n_warmup):
-        _nvtx_push(f"{label}_warmup_fwd_{i}")
         pc(warmup_data)
-        _nvtx_pop()
         if do_backward:
-            _nvtx_push(f"{label}_warmup_bwd_{i}")
             pc.backward(
                 warmup_data, compute_param_flows=False, allow_modify_flows=False,
                 _inner_layers_only=True,
             )
-            _nvtx_pop()
     torch.cuda.synchronize()
-    _nvtx_pop()
 
     fwd_events = [(torch.cuda.Event(enable_timing=True),
                    torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
     bwd_events = [(torch.cuda.Event(enable_timing=True),
                    torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
 
-    _nvtx_push(f"{label}_loop")
     for i in range(n_iter):
-        _nvtx_push(f"{label}_fwd_{i}")
         fwd_events[i][0].record()
         pc(data)
         fwd_events[i][1].record()
-        _nvtx_pop()
 
         if do_backward:
-            _nvtx_push(f"{label}_bwd_{i}")
             bwd_events[i][0].record()
             pc.backward(
                 data, compute_param_flows=False, allow_modify_flows=False,
                 _inner_layers_only=True,
             )
             bwd_events[i][1].record()
-            _nvtx_pop()
-    _nvtx_pop()
     torch.cuda.synchronize()
 
     fwd_ms = [s.elapsed_time(e) for s, e in fwd_events]
@@ -272,7 +241,6 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     # Pass ``device=`` so ``TensorCircuit`` allocates the flat params tensor
     # (H² floats + H·V emission floats) directly on GPU instead of going
     # through CPU and PCIe-copying on ``.to(device)``.
-    _nvtx_push("build_dense")
     root_dense = _build_dense_hmm_dag(T, H, V, bs)
     pc_dense = TensorCircuit(
         root_dense,
@@ -280,12 +248,10 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    _nvtx_pop()
 
     csc_indptr, csc_indices, csc_values = _make_csc_emissions(
         H=H, V=V, density=density, seed=seed, device=device,
     )
-    _nvtx_push("build_sparse")
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values,
     )
@@ -295,7 +261,6 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    _nvtx_pop()
 
     # Verify expected layer classes are actually in use.
     from pyjuice.layer import (
@@ -337,10 +302,10 @@ def _build_and_run(T: int, H: int, V: int, bs: int, density: float,
     data = torch.randint(0, V, (1, T), generator=g, device=device)
 
     # --- Run ------------------------------------------------------------ #
-    stats_dense = _time_pc(pc_dense, data, "dense",
+    stats_dense = _time_pc(pc_dense, data,
                            n_warmup=n_warmup, n_iter=n_iter,
                            warmup_data=warmup_data)
-    stats_sparse = _time_pc(pc_sparse, data, "sparse",
+    stats_sparse = _time_pc(pc_sparse, data,
                             n_warmup=n_warmup, n_iter=n_iter,
                             warmup_data=warmup_data)
 

@@ -178,10 +178,6 @@ class SparseProdLayer(ProdLayer):
         # TensorCircuit (e.g. unit tests that invoke the layer directly).
         data_for_pattern = data_cpu if data_cpu is not None else data
 
-        torch.cuda.nvtx.range_push(
-            f"SparseProdLayer.fwd(n_ns={len(self.nodes)},"
-            f"skip_scatter={self._skip_scatter})"
-        )
         for ns_idx, ns in enumerate(self.nodes):
             sv = self._compute_sparse_output(
                 ns_idx=ns_idx, ns=ns,
@@ -193,7 +189,6 @@ class SparseProdLayer(ProdLayer):
                 sv.scatter_to_dense(
                     element_mars, ns._output_ind_range[0], fill_value=LOG_EPS,
                 )
-        torch.cuda.nvtx.range_pop()
 
         return None
 
@@ -246,11 +241,6 @@ class SparseProdLayer(ProdLayer):
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  logspace_flows: bool = False,
                  data: Optional[torch.Tensor] = None, **kwargs) -> None:
-        torch.cuda.nvtx.range_push(
-            f"SparseProdLayer.bwd(n_ns={len(self.nodes)},"
-            f"skip_scatter={self._skip_scatter})"
-        )
-
         if self._skip_scatter:
             # Sparse fast path: downstream SparseInputSumLayer wrote sv_flow
             # straight into ``self._sparse_flows``. Route active-row flows to
@@ -281,7 +271,6 @@ class SparseProdLayer(ProdLayer):
                     logspace_flows=logspace_flows,
                 )
 
-            torch.cuda.nvtx.range_pop()
             return None
 
         # Dense fallback: reuse the inherited plain-prod backward. It will
@@ -311,7 +300,6 @@ class SparseProdLayer(ProdLayer):
                 logspace_flows=logspace_flows,
             )
 
-        torch.cuda.nvtx.range_pop()
         return None
 
     def _scatter_flow_to_children(self, ns_idx: int, ns: SparseProdNodes,

@@ -148,9 +148,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
         data_for_pattern = data_cpu if data_cpu is not None else data
 
-        torch.cuda.nvtx.range_push(
-            f"SparseIOSumLayer.fwd(n_blocks={len(self._dense_blocks)})"
-        )
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
         )):
@@ -212,7 +209,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 TILE_M=TILE_M,
                 BLOCK_K=_FWD_BLOCK_K,
             )
-        torch.cuda.nvtx.range_pop()
         return None
 
     # ------------------------------------------------------------------ #
@@ -250,9 +246,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
             "upstream prod layer; accumulate_ch_flows is not supported."
         )
 
-        torch.cuda.nvtx.range_push(
-            f"SparseIOSumLayer.bwd(n_blocks={len(self._dense_blocks)})"
-        )
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
         )):
@@ -306,7 +299,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 CBS=CBS,
                 BLOCK_P=_BWD_BLOCK_P,
             )
-        torch.cuda.nvtx.range_pop()
         return None
 
 

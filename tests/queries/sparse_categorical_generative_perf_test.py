@@ -1,6 +1,6 @@
-"""NVTX-instrumented perf harness for the **generative** conditional query on
-HMMs: given a sequence with a single position ``t*`` unobserved (``missing_mask``
-True there) and the rest observed, compute ``p(x_{t*} | x_{!=t*})``.
+"""Perf harness for the **generative** conditional query on HMMs: given a
+sequence with a single position ``t*`` unobserved (``missing_mask`` True
+there) and the rest observed, compute ``p(x_{t*} | x_{!=t*})``.
 
 This is the imputation/completion sibling of
 ``tests/queries/sparse_categorical_cond_perf_test.py`` (smoothing). Both tests
@@ -28,16 +28,9 @@ Both bypass the known partial-eval/block-id bug in the atomic-add fallback
 (see memory ``project_partial_eval_block_bug``) — dense doesn't call
 ``enable_partial_evaluation``, and sparse iterates ``layer.nodes`` directly.
 
-NVTX ranges around each ``conditional`` call make it profileable with ``nsys``;
-wall-clock per-iter timings (CUDA events) are printed for at-a-glance
+Wall-clock per-iter timings (CUDA events) are printed for at-a-glance
 inspection. The DAG builders mirror those in the smoothing perf test so
 results can be compared apples-to-apples.
-
-Run standalone for profiling::
-
-    pixi run -e dev nsys profile --trace=cuda,nvtx \\
-        -o /tmp/generative_sparse_hmm \\
-        python tests/queries/sparse_categorical_generative_perf_test.py
 
 The ``test_generative_perf_smoke`` case is marked ``slow``.
 """
@@ -153,11 +146,11 @@ def _build_sparse_hmm_dag(T: int, H: int, V: int, bs: int,
 
 
 def _time_generative(pc: TensorCircuit, data: torch.Tensor,
-                     missing_mask: torch.Tensor, target_t: int, label: str,
+                     missing_mask: torch.Tensor, target_t: int,
                      n_warmup: int, n_iter: int,
                      warmup_data: Optional[torch.Tensor] = None) -> dict:
-    """Warm up JIT, then run ``n_iter`` generative ``conditional`` calls under
-    NVTX ranges and return per-iter wall-clock stats.
+    """Warm up JIT, then run ``n_iter`` generative ``conditional`` calls and
+    return per-iter wall-clock stats.
 
     The query runs ``conditional(pc, data, missing_mask=missing_mask,
     target_vars=[target_t])`` — produces a ``[B, 1, V]`` posterior over the
@@ -166,28 +159,20 @@ def _time_generative(pc: TensorCircuit, data: torch.Tensor,
     if warmup_data is None:
         warmup_data = data
     target_vars = [target_t]
-    torch.cuda.nvtx.range_push(f"{label}_warmup(n={n_warmup})")
     for i in range(n_warmup):
-        torch.cuda.nvtx.range_push(f"{label}_warmup_{i}")
         juice.queries.conditional(pc, data=warmup_data,
                                   missing_mask=missing_mask,
                                   target_vars=target_vars)
-        torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
-    torch.cuda.nvtx.range_pop()
 
     events = [(torch.cuda.Event(enable_timing=True),
                torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
 
-    torch.cuda.nvtx.range_push(f"{label}_loop")
     for i in range(n_iter):
-        torch.cuda.nvtx.range_push(f"{label}_iter_{i}")
         events[i][0].record()
         juice.queries.conditional(pc, data=data, missing_mask=missing_mask,
                                   target_vars=target_vars)
         events[i][1].record()
-        torch.cuda.nvtx.range_pop()
-    torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
 
     ms = [s.elapsed_time(e) for s, e in events]
@@ -221,7 +206,6 @@ def _build_and_run_generative(T: int, H: int, V: int, bs: int, density: float,
     if target_t is None:
         target_t = T // 2
 
-    torch.cuda.nvtx.range_push("build_dense")
     root_dense = _build_dense_hmm_dag(T, H, V, bs)
     pc_dense = TensorCircuit(
         root_dense,
@@ -229,12 +213,10 @@ def _build_and_run_generative(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    torch.cuda.nvtx.range_pop()
 
     csc_indptr, csc_indices, csc_values = _make_csc_emissions(
         H=H, V=V, density=density, seed=seed, device=device,
     )
-    torch.cuda.nvtx.range_push("build_sparse")
     root_sparse = _build_sparse_hmm_dag(
         T, H, V, bs, csc_indptr, csc_indices, csc_values,
     )
@@ -244,7 +226,6 @@ def _build_and_run_generative(T: int, H: int, V: int, bs: int, density: float,
         device=device,
         verbose=False,
     )
-    torch.cuda.nvtx.range_pop()
 
     from pyjuice.layer import (
         DenseCategoricalInputLayer, DenseSumLayer, SparseProdLayer,
@@ -280,11 +261,11 @@ def _build_and_run_generative(T: int, H: int, V: int, bs: int, density: float,
     missing_mask[target_t] = True
 
     stats_dense = _time_generative(
-        pc_dense, data, missing_mask, target_t, "dense",
+        pc_dense, data, missing_mask, target_t,
         n_warmup=n_warmup, n_iter=n_iter, warmup_data=warmup_data,
     )
     stats_sparse = _time_generative(
-        pc_sparse, data, missing_mask, target_t, "sparse",
+        pc_sparse, data, missing_mask, target_t,
         n_warmup=n_warmup, n_iter=n_iter, warmup_data=warmup_data,
     )
 
