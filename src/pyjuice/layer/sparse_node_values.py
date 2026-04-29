@@ -52,17 +52,12 @@ class SparseNodeValues:
         """Fill ``out[out_base:out_base+H, 0] = fill_value`` then overwrite
         active rows with ``values``. Single-batch: writes at column 0 only."""
         H = self.num_rows
-        # Dense fill of the H-row slice at batch col 0.
-        torch.cuda.nvtx.range_push(f"svals_fill(H={H})")
         out[out_base:out_base + H, 0] = fill_value
-        torch.cuda.nvtx.range_pop()
 
         if self.total_nnz == 0:
             return
-        torch.cuda.nvtx.range_push(f"svals_scatter_write(nnz={self.total_nnz})")
         # ``indices`` are already absolute row ids within this ns's H-slice.
         out[out_base + self.indices, 0] = self.values
-        torch.cuda.nvtx.range_pop()
 
     def gather_from_dense(self, src: torch.Tensor, src_base: int) -> "SparseNodeValues":
         """Return a new :class:`SparseNodeValues` sharing this object's
@@ -76,9 +71,7 @@ class SparseNodeValues:
                 num_rows=self.num_rows,
             )
 
-        torch.cuda.nvtx.range_push(f"svals_gather(nnz={self.total_nnz})")
         new_values = src[src_base + self.indices, 0].contiguous()
-        torch.cuda.nvtx.range_pop()
         return SparseNodeValues(
             col_start=self.col_start, total_nnz=self.total_nnz,
             indices=self.indices, values=new_values,

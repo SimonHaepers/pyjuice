@@ -305,6 +305,13 @@ class TensorCircuit(nn.Module):
                 self._run_data_cpu = run_data.cpu()
             else:
                 self._run_data_cpu = run_data
+            # Pre-convert to a flat Python list (B=1 sparse path only) so per-
+            # timestep ``data[var_id, 0]`` lookups in build_sparse_pattern
+            # become list indexing instead of PyTorch dispatcher trips.
+            if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
+                self._run_data_list = self._run_data_cpu[:, 0].tolist()
+            else:
+                self._run_data_list = None
 
             # Inner layers
             def _run_inner_layers():
@@ -314,7 +321,8 @@ class TensorCircuit(nn.Module):
                         torch.cuda.nvtx.range_push(f"fwd/layer[{layer_id}]/prod")
                         layer_group(self.node_mars, self.element_mars,
                                     data = self._run_data,
-                                    data_cpu = self._run_data_cpu)
+                                    data_cpu = self._run_data_cpu,
+                                    data_list = self._run_data_list)
                         torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
@@ -326,6 +334,7 @@ class TensorCircuit(nn.Module):
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
+                                    data_list = self._run_data_list,
                                     **kwargs)
                         torch.cuda.nvtx.range_pop()
 
@@ -447,6 +456,10 @@ class TensorCircuit(nn.Module):
             self._run_data_cpu = run_data.cpu()
         else:
             self._run_data_cpu = run_data
+        if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
+            self._run_data_list = self._run_data_cpu[:, 0].tolist()
+        else:
+            self._run_data_list = None
 
         with device_grad_controller(device = self.device, no_grad = True):
 
@@ -508,7 +521,8 @@ class TensorCircuit(nn.Module):
                         layer_group.backward(self.node_flows, self.element_flows,
                                              logspace_flows = logspace_flows,
                                              data = self._run_data,
-                                             data_cpu = self._run_data_cpu)
+                                             data_cpu = self._run_data_cpu,
+                                             data_list = self._run_data_list)
                         torch.cuda.nvtx.range_pop()
 
                     elif layer_group.is_sum():
@@ -521,6 +535,7 @@ class TensorCircuit(nn.Module):
                             _for_backward = True,
                             data = self._run_data,
                             data_cpu = self._run_data_cpu,
+                            data_list = self._run_data_list,
                         )
                         torch.cuda.nvtx.range_pop()
 

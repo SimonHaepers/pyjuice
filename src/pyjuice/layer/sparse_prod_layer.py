@@ -156,6 +156,7 @@ class SparseProdLayer(ProdLayer):
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                 _for_backward: bool = False, data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
+                data_list: Optional[list] = None,
                 **kwargs) -> None:
         assert data is not None, (
             "SparseProdLayer.forward requires `data` "
@@ -182,26 +183,24 @@ class SparseProdLayer(ProdLayer):
             f"skip_scatter={self._skip_scatter})"
         )
         for ns_idx, ns in enumerate(self.nodes):
-            torch.cuda.nvtx.range_push(f"ns[{ns_idx}]")
             sv = self._compute_sparse_output(
                 ns_idx=ns_idx, ns=ns,
                 data=data_for_pattern, node_mars=node_mars,
+                data_list=data_list,
             )
             self._sparse_outputs[ns_idx] = sv
             if not self._skip_scatter:
-                torch.cuda.nvtx.range_push("scatter_to_dense")
                 sv.scatter_to_dense(
                     element_mars, ns._output_ind_range[0], fill_value=LOG_EPS,
                 )
-                torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
 
         return None
 
     def _compute_sparse_output(self, ns_idx: int, ns: SparseProdNodes,
                                 data: torch.Tensor,
-                                node_mars: torch.Tensor) -> SparseNodeValues:
+                                node_mars: torch.Tensor,
+                                data_list: Optional[list] = None) -> SparseNodeValues:
         """
         Build the sparse ``(row, value)`` output for one
         :class:`SparseProdNodes` at B=1. Pattern construction
@@ -215,18 +214,16 @@ class SparseProdLayer(ProdLayer):
         sparse_cs = ns.sparse_input_ns
         sparse_input_layer = self._sparse_input_layers[ns_idx]
 
-        torch.cuda.nvtx.range_push("build_sparse_pattern")
         sv = sparse_cs.dist.build_sparse_pattern(
             data=data, var_id=ns.var_id, num_rows=ns.num_nodes, device=device,
+            data_list=data_list,
         )
-        torch.cuda.nvtx.range_pop()
 
         if sv.total_nnz == 0:
             return sv
 
         dense_ch_lookup = getattr(self, self._dense_ch_lookups[ns_idx])
 
-        torch.cuda.nvtx.range_push(f"_sparse_prod_fwd_kernel(nnz={sv.total_nnz})")
         BLOCK = 256
         grid = (triton.cdiv(sv.total_nnz, BLOCK),)
         _sparse_prod_forward_kernel[grid](
@@ -241,7 +238,6 @@ class SparseProdLayer(ProdLayer):
             NUM_DENSE_CHS=ns.num_dense_chs,
             BLOCK=BLOCK,
         )
-        torch.cuda.nvtx.range_pop()
 
         return sv
 
@@ -275,19 +271,15 @@ class SparseProdLayer(ProdLayer):
                 # the slot anyway. Same contract as ``_sparse_outputs[ns_idx]``
                 # on the forward side, which also persists across passes.
 
-                torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/scatter_children")
                 self._scatter_flow_to_children(ns_idx, ns, sv_flow, node_flows)
-                torch.cuda.nvtx.range_pop()
 
                 sparse_cs = ns.sparse_input_ns
-                torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/custom_backward_sparse")
                 sparse_cs.dist.custom_backward_sparse(
                     input_layer=self._sparse_input_layers[ns_idx],
                     sparse_flow=sv_flow,
                     csc_pflows_base=sparse_cs._param_flow_range[0],
                     logspace_flows=logspace_flows,
                 )
-                torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_pop()
             return None
@@ -296,12 +288,10 @@ class SparseProdLayer(ProdLayer):
         # also scatter into the sparse input's node_flows slice, which is
         # harmless — InputLayer.backward skips that ns (gated via
         # ``_skip_input_backward``), so no accidental second accumulation.
-        torch.cuda.nvtx.range_push("super.backward(dense_children)")
         super().backward(
             node_flows=node_flows, element_flows=element_flows,
             logspace_flows=logspace_flows, **kwargs,
         )
-        torch.cuda.nvtx.range_pop()
 
         # Sparse-input flows: gather element_flows → SparseNodeValues →
         # SparseCategorical.custom_backward_sparse.
@@ -312,18 +302,14 @@ class SparseProdLayer(ProdLayer):
                 "(no cached sparse output)."
             )
             sparse_cs = ns.sparse_input_ns
-            torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/gather_from_dense")
             sv_flow = sv.gather_from_dense(element_flows, ns._output_ind_range[0])
-            torch.cuda.nvtx.range_pop()
 
-            torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/custom_backward_sparse")
             sparse_cs.dist.custom_backward_sparse(
                 input_layer=self._sparse_input_layers[ns_idx],
                 sparse_flow=sv_flow,
                 csc_pflows_base=sparse_cs._param_flow_range[0],
                 logspace_flows=logspace_flows,
             )
-            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_pop()
         return None
@@ -354,13 +340,9 @@ class SparseProdLayer(ProdLayer):
         dense_ch_lookup = getattr(self, self._dense_ch_lookups[ns_idx])
         # dense_ch_lookup: [num_dense_chs, H]. Per ch, fetch the active rows'
         # global nid indices and scatter values. B=1: only col 0 is used.
-        torch.cuda.nvtx.range_push(
-            f"dense_ch_scatter(num_dense_chs={ns.num_dense_chs},nnz={sv_flow.total_nnz})"
-        )
         for ch in range(ns.num_dense_chs):
             target_ids = dense_ch_lookup[ch].index_select(0, sv_flow.indices)
             node_flows[target_ids, 0] = sv_flow.values
-        torch.cuda.nvtx.range_pop()
 
 
 # =====================================================================

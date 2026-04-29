@@ -204,9 +204,14 @@ class SparseCategorical(Distribution):
         if self._csc_indptr is not None:
             # Keep a persistent CPU copy of ``_csc_indptr`` (only V+1 longs —
             # ~256 KB at V=32k) so :meth:`build_sparse_pattern` can look up
-            # column bounds without a host<->device sync per call.
+            # column bounds without a host<->device sync per call. Also
+            # cache a plain Python list view of the same data: list indexing
+            # is ~50 ns vs ~µs for ``int(indptr_cpu[v].item())`` on the per-
+            # timestep hot path.
             if not hasattr(self, "_csc_indptr_cpu") or self._csc_indptr_cpu is None:
                 self._csc_indptr_cpu = self._csc_indptr.cpu().contiguous()
+            if not hasattr(self, "_csc_indptr_list") or self._csc_indptr_list is None:
+                self._csc_indptr_list = self._csc_indptr_cpu.tolist()
             self._csc_indptr = self._csc_indptr.to(device)
             self._csc_indices = self._csc_indices.to(device)
         if self._csr_indptr is not None:
@@ -336,7 +341,8 @@ class SparseCategorical(Distribution):
     def build_sparse_pattern(self, data: torch.Tensor, var_id: int,
                               num_rows: int,
                               device: torch.device,
-                              values_out: Optional[torch.Tensor] = None):
+                              values_out: Optional[torch.Tensor] = None,
+                              data_list: Optional[list] = None):
         """
         Construct a :class:`SparseNodeValues` for the observed token at
         ``var_id`` (B=1 only). ``indices`` is a *view* into ``_csc_indices``
@@ -367,28 +373,32 @@ class SparseCategorical(Distribution):
             "(sparse path is inference-only + B=1)."
         )
 
-        if data.device.type == "cpu":
+        if data_list is not None:
+            # Fastest path: caller has pre-converted data_cpu[:, 0] to a
+            # Python list once per query. List indexing is ~50 ns vs a few
+            # µs for tensor __getitem__ + __int__ via the dispatcher.
+            v = data_list[var_id]
+        elif data.device.type == "cpu":
             # Fast path: plain host read, zero CUDA involvement.
-            torch.cuda.nvtx.range_push("data[var_id,0]_cpu_read")
             v = int(data[var_id, 0])
-            torch.cuda.nvtx.range_pop()
         else:
             # Slow path: full host<->device sync. Pass `data` on CPU to avoid.
-            torch.cuda.nvtx.range_push("data[var_id,0].item()[SYNC]")
             v = int(data[var_id, 0].item())
-            torch.cuda.nvtx.range_pop()
 
-        torch.cuda.nvtx.range_push("csc_indptr_cpu_lookup")
-        indptr_cpu = self._csc_indptr_cpu
-        col_start = int(indptr_cpu[v].item())
-        col_end = int(indptr_cpu[v + 1].item())
+        # ``_csc_indptr_list`` is populated by ``move_to_device``; list lookup
+        # is ~50 ns each vs a few µs for ``int(indptr_cpu[v].item())``.
+        indptr_list = self._csc_indptr_list
+        col_start = indptr_list[v]
+        col_end = indptr_list[v + 1]
         total_nnz = col_end - col_start
-        torch.cuda.nvtx.range_pop()
 
+        # ``narrow`` skips the slice-parsing path of ``__getitem__`` — both
+        # produce the same view, ``narrow`` is a few µs cheaper per call which
+        # adds up across T × #layers calls per query on the sparse HMM path.
         if total_nnz == 0:
-            empty_long = self._csc_indices[0:0]
+            empty_long = self._csc_indices.narrow(0, 0, 0)
             if values_out is not None:
-                values = values_out[:0]
+                values = values_out.narrow(0, 0, 0)
             else:
                 values = torch.empty(0, dtype=torch.float32, device=device)
             return SparseNodeValues(
@@ -398,18 +408,15 @@ class SparseCategorical(Distribution):
                 num_rows=num_rows,
             )
 
-        torch.cuda.nvtx.range_push(f"indices_view+values_alloc(nnz={total_nnz})")
-        indices = self._csc_indices[col_start:col_end]             # view
+        indices = self._csc_indices.narrow(0, col_start, total_nnz)
         if values_out is not None:
-            values = values_out[:total_nnz]
+            values = values_out.narrow(0, 0, total_nnz)
         else:
             values = torch.empty(total_nnz, dtype=torch.float32, device=device)
-        sv = SparseNodeValues(
+        return SparseNodeValues(
             col_start=col_start, total_nnz=total_nnz,
             indices=indices, values=values, num_rows=num_rows,
         )
-        torch.cuda.nvtx.range_pop()
-        return sv
 
     def custom_backward_sparse(self, input_layer, sparse_flow,
                                 csc_pflows_base: int,

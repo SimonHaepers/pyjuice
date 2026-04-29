@@ -145,25 +145,19 @@ class SparseInputSumLayer(DenseSumLayer):
             total_nnz = sv.total_nnz
             if total_nnz == 0:
                 # Empty active column: log(0) = -inf for all parents.
-                torch.cuda.nvtx.range_push(f"block[{blk_idx}]/empty_col_fill")
                 node_mars[nid_start:nid_start + NB * BS, 0].fill_(float("-inf"))
-                torch.cuda.nvtx.range_pop()
                 continue
 
-            torch.cuda.nvtx.range_push(f"block[{blk_idx}]")
             # Per-call max of sparse values (for linear-sum numerical stability).
             # `values` is already length `total_nnz` (no padding); scalar reduction
             # on device keeps the kernel pure.
-            torch.cuda.nvtx.range_push("values.max()")
             max_val = sv.values.max()
-            torch.cuda.nvtx.range_pop()
 
             # Tile parents: TILE_M divides BS and is a power of 2.
             TILE_M = min(BS, 32)
             while BS % TILE_M != 0 and TILE_M > 1:
                 TILE_M //= 2
 
-            torch.cuda.nvtx.range_push(f"_sparse_input_sum_fwd_kernel(nnz={total_nnz})")
             grid = (NB * (BS // TILE_M),)
             _sparse_input_sum_forward_kernel[grid](
                 node_mars_ptr=node_mars,
@@ -181,8 +175,6 @@ class SparseInputSumLayer(DenseSumLayer):
                 TILE_M=TILE_M,
                 BLOCK_K=_FWD_BLOCK_K,
             )
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
 
         return None
@@ -290,9 +282,6 @@ class SparseInputSumLayer(DenseSumLayer):
                 if total_nnz == 0:
                     continue
 
-                torch.cuda.nvtx.range_push(
-                    f"block[{blk_idx}]/_sparse_input_sum_bwd_sv_kernel(nnz={total_nnz})"
-                )
                 grid = (total_nnz,)
                 _sparse_input_sum_backward_sv_kernel[grid](
                     node_flows_ptr=node_flows,
@@ -311,7 +300,6 @@ class SparseInputSumLayer(DenseSumLayer):
                     BLOCK_P=_BWD_SV_BLOCK_P,
                     allow_modify_flows=1 if allow_modify_flows else 0,
                 )
-                torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_pop()
             return None
@@ -321,13 +309,11 @@ class SparseInputSumLayer(DenseSumLayer):
         # DenseSumLayer's accumulate_ch_flows contract (the kernel uses
         # atomic_add, so we must clear beforehand when NOT accumulating).
         if not accumulate_ch_flows:
-            torch.cuda.nvtx.range_push("zero_child_ranges(pytorch .zero_())")
             for block, (sparse_prod, ns_idx) in zip(
                 self._dense_blocks, self._sparse_input_refs,
             ):
                 _nid_start, cid_start, _pid_start, _pfid_start, _NB, NB_ch, _BS, CBS = block
                 element_flows[cid_start:cid_start + NB_ch * CBS, 0].zero_()
-            torch.cuda.nvtx.range_pop()
 
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
@@ -338,9 +324,6 @@ class SparseInputSumLayer(DenseSumLayer):
             if total_nnz == 0:
                 continue
 
-            torch.cuda.nvtx.range_push(
-                f"block[{blk_idx}]/_sparse_input_sum_bwd_kernel(nnz={total_nnz})"
-            )
             grid = (total_nnz, NB)
             _sparse_input_sum_backward_kernel[grid](
                 node_flows_ptr=node_flows,
@@ -358,7 +341,6 @@ class SparseInputSumLayer(DenseSumLayer):
                 CBS=CBS,
                 allow_modify_flows=1 if allow_modify_flows else 0,
             )
-            torch.cuda.nvtx.range_pop()
 
         torch.cuda.nvtx.range_pop()
         return None

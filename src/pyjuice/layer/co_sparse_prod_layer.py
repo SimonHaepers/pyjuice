@@ -133,6 +133,7 @@ class CoSparseProdLayer(SparseProdLayer):
     def forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                 _for_backward: bool = False, data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
+                data_list: Optional[list] = None,
                 **kwargs) -> None:
         assert data is not None, (
             "CoSparseProdLayer.forward requires `data` (per-var observed tokens)."
@@ -149,7 +150,6 @@ class CoSparseProdLayer(SparseProdLayer):
             f"CoSparseProdLayer.fwd(n_ns={len(self.nodes)})"
         )
         for ns_idx, ns in enumerate(self.nodes):
-            torch.cuda.nvtx.range_push(f"ns[{ns_idx}]")
             sparse_cs = ns.sparse_input_ns
             sparse_input_layer = self._sparse_input_layers[ns_idx]
 
@@ -161,17 +161,14 @@ class CoSparseProdLayer(SparseProdLayer):
                 )
                 self._fwd_values_workspaces[ns_idx] = ws
 
-            torch.cuda.nvtx.range_push("build_sparse_pattern")
             sv = sparse_cs.dist.build_sparse_pattern(
                 data=data_for_pattern, var_id=ns.var_id,
                 num_rows=ns.num_nodes, device=node_mars.device,
-                values_out=ws,
+                values_out=ws, data_list=data_list,
             )
-            torch.cuda.nvtx.range_pop()
             self._sparse_outputs[ns_idx] = sv
 
             if sv.total_nnz == 0:
-                torch.cuda.nvtx.range_pop()
                 continue
 
             sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
@@ -188,7 +185,6 @@ class CoSparseProdLayer(SparseProdLayer):
                 "of dist._csc_indices (same var_id)."
             )
 
-            torch.cuda.nvtx.range_push(f"values_add(nnz={sv.total_nnz})")
             # Emission params live flat-packed in sparse_input_layer.params,
             # indexed by ``_param_range[0] + col_start + j`` for slot j — same
             # addressing as ``_sparse_prod_forward_kernel``.
@@ -203,8 +199,6 @@ class CoSparseProdLayer(SparseProdLayer):
                 n=sv.total_nnz,
                 BLOCK=BLOCK,
             )
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
         return None
 
@@ -238,14 +232,12 @@ class CoSparseProdLayer(SparseProdLayer):
             sum_layer._sparse_flows[sum_ns_idx] = sv_flow
 
             # Emission param flow accumulation (unchanged from SparseProdLayer).
-            torch.cuda.nvtx.range_push(f"ns[{ns_idx}]/custom_backward_sparse")
             sparse_cs.dist.custom_backward_sparse(
                 input_layer=self._sparse_input_layers[ns_idx],
                 sparse_flow=sv_flow,
                 csc_pflows_base=sparse_cs._param_flow_range[0],
                 logspace_flows=logspace_flows,
             )
-            torch.cuda.nvtx.range_pop()
 
             # Note: we deliberately do NOT scatter into ``node_flows`` here.
             # The dense child is a :class:`SparseIOSumLayer` whose backward

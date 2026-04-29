@@ -130,6 +130,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 force_use_fp32: bool = False, propagation_alg: str = "LL",
                 data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
+                data_list: Optional[list] = None,
                 **kwargs) -> None:
         batch_size = node_mars.size(1)
         assert batch_size == 1, (
@@ -157,7 +158,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
             sv_in = sparse_prod._sparse_outputs[ns_idx]
             K_in = sv_in.total_nnz
 
-            torch.cuda.nvtx.range_push(f"block[{blk_idx}]/build_out_pattern")
             out_dist = self._output_sparsity_dists[blk_idx]
             out_var_id = self._output_sparsity_var_ids[blk_idx]
             out_num_rows = self._output_sparsity_num_rows[blk_idx]
@@ -171,9 +171,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
             sv_out = out_dist.build_sparse_pattern(
                 data=data_for_pattern, var_id=out_var_id,
                 num_rows=out_num_rows, device=node_mars.device,
-                values_out=ws_out,
+                values_out=ws_out, data_list=data_list,
             )
-            torch.cuda.nvtx.range_pop()
 
             self._sparse_outputs[blk_idx] = sv_out
             K_out = sv_out.total_nnz
@@ -188,10 +187,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_out.values.fill_(float("-inf"))
                 continue
 
-            torch.cuda.nvtx.range_push(f"block[{blk_idx}]")
-            torch.cuda.nvtx.range_push("in_values.max()")
             max_val = sv_in.values.max()
-            torch.cuda.nvtx.range_pop()
 
             TILE_M = 32
             while TILE_M > 1 and TILE_M > K_out:
@@ -199,9 +195,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
             if TILE_M < 1:
                 TILE_M = 1
 
-            torch.cuda.nvtx.range_push(
-                f"_sparse_io_sum_fwd_kernel(K_in={K_in}, K_out={K_out})"
-            )
             grid = (triton.cdiv(K_out, TILE_M),)
             _sparse_io_sum_forward_kernel[grid](
                 values_out_ptr=sv_out.values,
@@ -219,8 +212,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 TILE_M=TILE_M,
                 BLOCK_K=_FWD_BLOCK_K,
             )
-            torch.cuda.nvtx.range_pop()
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
         return None
 
@@ -291,7 +282,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             sv_flow_in = SparseNodeValues(
                 col_start=sv_in.col_start, total_nnz=K_in,
                 indices=sv_in.indices,
-                values=ws_flow[:K_in],
+                values=ws_flow.narrow(0, 0, K_in),
                 num_rows=sv_in.num_rows,
             )
             sparse_prod._sparse_flows[ns_idx] = sv_flow_in
@@ -299,9 +290,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
             if K_in == 0 or K_out == 0:
                 continue
 
-            torch.cuda.nvtx.range_push(
-                f"block[{blk_idx}]/_sparse_io_sum_bwd_kernel(K_in={K_in},K_out={K_out})"
-            )
             grid = (K_in,)
             _sparse_io_sum_backward_kernel[grid](
                 flow_in_ptr=sv_flow_in.values,
@@ -318,7 +306,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 CBS=CBS,
                 BLOCK_P=_BWD_BLOCK_P,
             )
-            torch.cuda.nvtx.range_pop()
         torch.cuda.nvtx.range_pop()
         return None
 
