@@ -24,6 +24,7 @@ API
 - :doc:`pyjuice.nodes <python-api/nodes>`
 - :doc:`pyjuice.TensorCircuit <python-api/tensorcircuit>`
 - :doc:`pyjuice.structures <python-api/structures>`
+- :doc:`Backend: dense and sparse fast paths <python-api/backend>`
 
 .. toctree::
    :maxdepth: 1
@@ -34,3 +35,4 @@ API
    python-api/nodes
    python-api/tensorcircuit
    python-api/structures
+   python-api/backend

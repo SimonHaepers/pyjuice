@@ -13,6 +13,8 @@ PC Creation
     inputs
     multiply
     summate
+    sparse_multiply
+    sparse_summate
     set_block_size
 
 PC Structure Transformation
