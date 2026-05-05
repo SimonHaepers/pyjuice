@@ -14,23 +14,33 @@ from .layer_group import LayerGroup
 
 @triton.jit
 def _co_sparse_log_add_kernel(
-    out_ptr, params_ptr, dense_values_ptr,
+    out_ptr, params_ptr, dense_values_ptr, max_out_ptr,
     param_offset, n,
     BLOCK: tl.constexpr,
 ):
-    """Fused ``out[i] = log(params[param_offset + i]) + dense_values[i]``.
+    """Fused ``out[i] = log(params[param_offset + i]) + dense_values[i]`` and
+    ``max_out[0] = max(out[:])`` via per-tile atomic-max.
 
     Replaces the three-kernel ``torch.log(emit_params) + sv_dense.values``
     + ``sv.values.copy_(...)`` chain that otherwise launches one tiny
     element-wise kernel each (and allocates two intermediate temps) per
-    timestep on the sparse HMM path.
+    timestep on the sparse HMM path. The atomic-max additionally elides the
+    per-block ``sv.values.max()`` dispatch in
+    :meth:`SparseInputSumLayer.forward` — the values are already in registers
+    here, and ``max_out`` is pre-initialized to ``-inf`` by the launcher so
+    masked-out lanes contribute nothing.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
     p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
     d = tl.load(dense_values_ptr + offs, mask=mask, other=0.0)
-    tl.store(out_ptr + offs, tl.log(p) + d, mask=mask)
+    out = tl.log(p) + d
+    tl.store(out_ptr + offs, out, mask=mask)
+
+    tile_val = tl.where(mask, out, -float("inf"))
+    local_max = tl.max(tile_val, axis=0)
+    tl.atomic_max(max_out_ptr, local_max)
 
 
 class CoSparseProdLayer(SparseProdLayer):
@@ -121,6 +131,12 @@ class CoSparseProdLayer(SparseProdLayer):
         self._fwd_values_workspaces: List[Optional[torch.Tensor]] = \
             [None] * len(self.nodes)
 
+        # Single per-layer scalar workspace holding one f32 slot per ns —
+        # populated inline by the fused log+add+max kernel and read by the
+        # downstream SparseInputSumLayer in place of ``sv.values.max()``.
+        # Allocated lazily on first forward; reset to ``-inf`` once per call.
+        self._fwd_max_workspace: Optional[torch.Tensor] = None
+
     def __repr__(self) -> str:
         return (
             f"CoSparseProdLayer(nid_range=({self._layer_nid_range[0]}, "
@@ -146,6 +162,16 @@ class CoSparseProdLayer(SparseProdLayer):
 
         data_for_pattern = data_cpu if data_cpu is not None else data
 
+        if (self._fwd_max_workspace is None
+                or self._fwd_max_workspace.device != node_mars.device):
+            self._fwd_max_workspace = torch.empty(
+                len(self.nodes), dtype=torch.float32, device=node_mars.device,
+            )
+        # One memset per forward replaces N per-block ``sv.values.max()``
+        # dispatches; empty-column ns'es leave their slot at -inf, which the
+        # sum layer never reads (it short-circuits on total_nnz == 0).
+        self._fwd_max_workspace.fill_(float("-inf"))
+
         for ns_idx, ns in enumerate(self.nodes):
             sparse_cs = ns.sparse_input_ns
             sparse_input_layer = self._sparse_input_layers[ns_idx]
@@ -163,6 +189,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 num_rows=ns.num_nodes, device=node_mars.device,
                 values_out=ws, data_list=data_list,
             )
+            sv.max_val = self._fwd_max_workspace[ns_idx:ns_idx + 1]
             self._sparse_outputs[ns_idx] = sv
 
             if sv.total_nnz == 0:
@@ -192,6 +219,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 out_ptr=sv.values,
                 params_ptr=sparse_input_layer.params,
                 dense_values_ptr=sv_dense.values,
+                max_out_ptr=sv.max_val,
                 param_offset=param_base,
                 n=sv.total_nnz,
                 BLOCK=BLOCK,

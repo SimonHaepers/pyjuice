@@ -296,7 +296,7 @@ if __name__ == "__main__":
     # generative numbers are directly comparable.
     _build_and_run_generative(
         T=32,
-        H=8192*2,
+        H=8192*4,
         V=32768,
         bs=1024,
         density=0.01,

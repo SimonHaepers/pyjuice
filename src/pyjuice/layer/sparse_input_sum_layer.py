@@ -146,9 +146,15 @@ class SparseInputSumLayer(DenseSumLayer):
                 continue
 
             # Per-call max of sparse values (for linear-sum numerical stability).
-            # `values` is already length `total_nnz` (no padding); scalar reduction
-            # on device keeps the kernel pure.
-            max_val = sv.values.max()
+            # Prefer the upstream-fused max produced inline by
+            # CoSparseProdLayer's log+add+max kernel — that path leaves a
+            # ready-to-use scalar on ``sv.max_val`` so we can skip the per-block
+            # ``sv.values.max()`` torch dispatch entirely. Fall back to the
+            # eager reduction for non-co-sparse producers.
+            if sv.max_val is not None:
+                max_val = sv.max_val
+            else:
+                max_val = sv.values.max()
 
             # Tile parents: TILE_M divides BS and is a power of 2.
             TILE_M = min(BS, 32)

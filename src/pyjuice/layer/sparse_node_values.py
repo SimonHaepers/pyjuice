@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 
@@ -35,6 +36,12 @@ class SparseNodeValues:
                                    (row id within the owning ns's output block, 0..H).
       values     [total_nnz]    — log_emit + Σ log_trans (forward) or gathered flow (backward).
       num_rows   int            — H.
+      max_val    [1] | None     — optional pre-computed max of ``values`` (f32),
+                                   produced inline by :class:`CoSparseProdLayer`'s
+                                   fused log+add+max kernel so downstream sum
+                                   layers can skip a per-block ``values.max()``
+                                   torch dispatch. ``None`` for backward containers
+                                   and for any forward path that didn't fuse.
     """
 
     col_start: int
@@ -42,6 +49,7 @@ class SparseNodeValues:
     indices: torch.Tensor
     values: torch.Tensor
     num_rows: int
+    max_val: Optional[torch.Tensor] = None
 
     @property
     def device(self) -> torch.device:
