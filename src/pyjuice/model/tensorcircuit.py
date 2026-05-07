@@ -309,6 +309,18 @@ class TensorCircuit(nn.Module):
             else:
                 self._run_data_list = None
 
+            # ``missing_mask`` reaches the input layers via ``**kwargs`` on the
+            # initial ``layer(inputs, ...)`` calls above; for inner layers it
+            # only matters to :class:`SparseProdLayer` / :class:`CoSparseProdLayer`
+            # (which use it to skip the per-token CSC lookup at marginalised
+            # positions) and :class:`SparseIOSumLayer` (which switches its
+            # output sparsity to all-rows when the consumer's var is masked).
+            # The standard ``_fw_missing_mask_kernel`` runs on ``node_mars`` at
+            # the input layer, but sparse-input ns's bypass ``node_mars``
+            # entirely and write straight to ``element_mars``, so the mask has
+            # to be re-applied here. Plain :class:`ProdLayer` ignores it.
+            missing_mask_for_prod = kwargs.get("missing_mask", None)
+
             # Inner layers
             def _run_inner_layers():
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
@@ -317,7 +329,8 @@ class TensorCircuit(nn.Module):
                         layer_group(self.node_mars, self.element_mars,
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
-                                    data_list = self._run_data_list)
+                                    data_list = self._run_data_list,
+                                    missing_mask = missing_mask_for_prod)
 
                     elif layer_group.is_sum():
                         # Sum layer
@@ -498,6 +511,13 @@ class TensorCircuit(nn.Module):
 
             ## Run backward pass ##
 
+            # Same plumbing as in ``forward``: missing_mask is needed by
+            # SparseProdLayer / CoSparseProdLayer / SparseIOSumLayer at
+            # marginalised positions. Both the prod-layer re-forward (the
+            # ``_for_backward=True`` call below) and the sum-layer backward
+            # need to see it so they take the all-rows-at-missing branch.
+            missing_mask_for_prod = kwargs.get("missing_mask", None)
+
             # Inner layers
             def _run_inner_layers():
 
@@ -523,6 +543,7 @@ class TensorCircuit(nn.Module):
                             data = self._run_data,
                             data_cpu = self._run_data_cpu,
                             data_list = self._run_data_list,
+                            missing_mask = missing_mask_for_prod,
                         )
 
                         # Execute pre-backward callback

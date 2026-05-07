@@ -113,6 +113,11 @@ class SparseIOSumLayer(SparseInputSumLayer):
         self._bwd_flow_workspaces: List[Optional[torch.Tensor]] = \
             [None] * len(self.nodes)
 
+        # Lazily-allocated arange tensors used as ``indices`` for the
+        # all-rows ``sv_out`` produced when ``output_sparsity_var_id`` is
+        # marginalised (see ``forward``). Keyed by ``out_num_rows``.
+        self._missing_indices_cache: dict = {}
+
     def __repr__(self) -> str:
         return (
             f"SparseIOSumLayer(nid_range=({self._layer_nid_range[0]}, "
@@ -131,6 +136,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
                 data_list: Optional[list] = None,
+                missing_mask: Optional[torch.Tensor] = None,
                 **kwargs) -> None:
         batch_size = node_mars.size(1)
         assert batch_size == 1, (
@@ -148,6 +154,27 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
         data_for_pattern = data_cpu if data_cpu is not None else data
 
+        # ``output_sparsity_var_id`` is the var of the *consumer*
+        # CoSparseProdNodes. When that var is marginalised, the consumer's
+        # input emission contribution becomes ``log(1) = 0`` for every row,
+        # which means the consumer needs all-rows sv_dense from us — not
+        # the column-keyed pattern derived from ``data[out_var_id]`` (which
+        # would be junk at a missing position anyway).
+        missing_mask_cpu = None
+        if missing_mask is not None:
+            mm = missing_mask
+            if mm.dim() == 2:
+                if mm.size(0) == 1:
+                    mm = mm[0]
+                elif mm.size(1) == 1:
+                    mm = mm[:, 0]
+                else:
+                    raise AssertionError(
+                        "SparseIOSumLayer.forward got a 2D missing_mask with "
+                        "neither dim == 1; sparse path is B=1 only."
+                    )
+            missing_mask_cpu = mm.cpu() if mm.device.type != "cpu" else mm
+
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
         )):
@@ -158,18 +185,39 @@ class SparseIOSumLayer(SparseInputSumLayer):
             out_dist = self._output_sparsity_dists[blk_idx]
             out_var_id = self._output_sparsity_var_ids[blk_idx]
             out_num_rows = self._output_sparsity_num_rows[blk_idx]
-            ws_out = self._fwd_values_workspaces[blk_idx]
-            if ws_out is None or ws_out.device != node_mars.device:
-                ws_out = torch.empty(
-                    out_dist._max_nnz_per_col,
-                    dtype=torch.float32, device=node_mars.device,
+            out_is_missing = bool(missing_mask_cpu[out_var_id].item()) if missing_mask_cpu is not None else False
+
+            if out_is_missing:
+                # Build an all-rows sv_out: indices = arange(out_num_rows),
+                # values workspace must be at least ``out_num_rows`` long.
+                indices = self._missing_indices_cache.get(out_num_rows)
+                if indices is None or indices.device != node_mars.device:
+                    indices = torch.arange(out_num_rows, dtype=torch.long, device=node_mars.device).contiguous()
+                    self._missing_indices_cache[out_num_rows] = indices
+                ws_out = self._fwd_values_workspaces[blk_idx]
+                if (ws_out is None or ws_out.device != node_mars.device
+                        or ws_out.numel() < out_num_rows):
+                    ws_out = torch.empty(out_num_rows, dtype=torch.float32, device=node_mars.device)
+                    self._fwd_values_workspaces[blk_idx] = ws_out
+                values = ws_out.narrow(0, 0, out_num_rows)
+                sv_out = SparseNodeValues(
+                    col_start=0, total_nnz=out_num_rows,
+                    indices=indices, values=values, num_rows=out_num_rows,
                 )
-                self._fwd_values_workspaces[blk_idx] = ws_out
-            sv_out = out_dist.build_sparse_pattern(
-                data=data_for_pattern, var_id=out_var_id,
-                num_rows=out_num_rows, device=node_mars.device,
-                values_out=ws_out, data_list=data_list,
-            )
+            else:
+                ws_out = self._fwd_values_workspaces[blk_idx]
+                if (ws_out is None or ws_out.device != node_mars.device
+                        or ws_out.numel() < max(out_dist._max_nnz_per_col, out_num_rows)):
+                    ws_out = torch.empty(
+                        max(out_dist._max_nnz_per_col, out_num_rows),
+                        dtype=torch.float32, device=node_mars.device,
+                    )
+                    self._fwd_values_workspaces[blk_idx] = ws_out
+                sv_out = out_dist.build_sparse_pattern(
+                    data=data_for_pattern, var_id=out_var_id,
+                    num_rows=out_num_rows, device=node_mars.device,
+                    values_out=ws_out, data_list=data_list,
+                )
 
             self._sparse_outputs[blk_idx] = sv_out
             K_out = sv_out.total_nnz
@@ -265,11 +313,16 @@ class SparseIOSumLayer(SparseInputSumLayer):
             K_out = sv_out.total_nnz
 
             # Mirror sv_in pattern for the sparse flow handed to upstream prod.
+            # ``K_in`` can exceed ``_max_nnz_per_col`` when the upstream
+            # CoSparseProdLayer's ns is at a marginalised position (its sv
+            # then carries all H rows, not just the active CSC column).
             ws_flow = self._bwd_flow_workspaces[blk_idx]
-            if ws_flow is None or ws_flow.device != node_mars.device:
-                in_max_nnz = sparse_prod.nodes[ns_idx].sparse_input_ns.dist._max_nnz_per_col
+            in_dist = sparse_prod.nodes[ns_idx].sparse_input_ns.dist
+            in_max_nnz = max(in_dist._max_nnz_per_col, in_dist._num_nodes)
+            if (ws_flow is None or ws_flow.device != node_mars.device
+                    or ws_flow.numel() < max(K_in, in_max_nnz)):
                 ws_flow = torch.empty(
-                    in_max_nnz, dtype=torch.float32, device=node_mars.device,
+                    max(K_in, in_max_nnz), dtype=torch.float32, device=node_mars.device,
                 )
                 self._bwd_flow_workspaces[blk_idx] = ws_flow
             sv_flow_in = SparseNodeValues(

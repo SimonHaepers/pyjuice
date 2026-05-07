@@ -17,6 +17,7 @@ def _co_sparse_log_add_kernel(
     out_ptr, params_ptr, dense_values_ptr, max_out_ptr,
     param_offset, n,
     BLOCK: tl.constexpr,
+    IS_MISSING: tl.constexpr,
 ):
     """Fused ``out[i] = log(params[param_offset + i]) + dense_values[i]`` and
     ``max_out[0] = max(out[:])`` via per-tile atomic-max.
@@ -29,13 +30,21 @@ def _co_sparse_log_add_kernel(
     :meth:`SparseInputSumLayer.forward` — the values are already in registers
     here, and ``max_out`` is pre-initialized to ``-inf`` by the launcher so
     masked-out lanes contribute nothing.
+
+    When ``IS_MISSING`` is set, this position is being marginalised: the
+    emission contribution is ``log(Σ_v P(v|h)) = log(1) = 0`` for every
+    latent, so the kernel skips the ``params`` load and copies
+    ``dense_values`` straight through.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
     mask = offs < n
-    p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
     d = tl.load(dense_values_ptr + offs, mask=mask, other=0.0)
-    out = tl.log(p) + d
+    if IS_MISSING:
+        out = d
+    else:
+        p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
+        out = tl.log(p) + d
     tl.store(out_ptr + offs, out, mask=mask)
 
     tile_val = tl.where(mask, out, -float("inf"))
@@ -150,6 +159,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 _for_backward: bool = False, data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
                 data_list: Optional[list] = None,
+                missing_mask: Optional[torch.Tensor] = None,
                 **kwargs) -> None:
         assert data is not None, (
             "CoSparseProdLayer.forward requires `data` (per-var observed tokens)."
@@ -161,6 +171,26 @@ class CoSparseProdLayer(SparseProdLayer):
         assert batch_size == 1, "CoSparseProdLayer is B=1 only."
 
         data_for_pattern = data_cpu if data_cpu is not None else data
+
+        # See ``SparseProdLayer.forward`` for the full explanation. At
+        # missing positions the upstream :class:`SparseIOSumLayer` produced
+        # an all-rows ``sv_dense`` (its ``output_sparsity_var_id`` matches
+        # this prod's ``var_id``), and we replace this prod's input emission
+        # contribution with ``log(1) = 0`` for every latent.
+        missing_mask_cpu = None
+        if missing_mask is not None:
+            mm = missing_mask
+            if mm.dim() == 2:
+                if mm.size(0) == 1:
+                    mm = mm[0]
+                elif mm.size(1) == 1:
+                    mm = mm[:, 0]
+                else:
+                    raise AssertionError(
+                        "CoSparseProdLayer.forward got a 2D missing_mask with "
+                        "neither dim == 1; sparse path is B=1 only."
+                    )
+            missing_mask_cpu = mm.cpu() if mm.device.type != "cpu" else mm
 
         if (self._fwd_max_workspace is None
                 or self._fwd_max_workspace.device != node_mars.device):
@@ -176,10 +206,58 @@ class CoSparseProdLayer(SparseProdLayer):
             sparse_cs = ns.sparse_input_ns
             sparse_input_layer = self._sparse_input_layers[ns_idx]
 
+            is_missing = bool(missing_mask_cpu[ns.var_id].item()) if missing_mask_cpu is not None else False
+            self._was_missing[ns_idx] = is_missing
+            H = ns.num_nodes
+
+            if is_missing:
+                indices = self._missing_indices_cache.get(H)
+                if indices is None or indices.device != node_mars.device:
+                    indices = torch.arange(H, dtype=torch.long, device=node_mars.device).contiguous()
+                    self._missing_indices_cache[H] = indices
+                # Workspace must hold up to H entries at missing positions
+                # (vs. ``_max_nnz_per_col`` entries at observed ones).
+                ws = self._fwd_values_workspaces[ns_idx]
+                if (ws is None or ws.device != node_mars.device
+                        or ws.numel() < H):
+                    ws = torch.empty(H, dtype=torch.float32, device=node_mars.device)
+                    self._fwd_values_workspaces[ns_idx] = ws
+                values = ws.narrow(0, 0, H)
+                sv = SparseNodeValues(
+                    col_start=0, total_nnz=H,
+                    indices=indices, values=values, num_rows=H,
+                )
+                sv.max_val = self._fwd_max_workspace[ns_idx:ns_idx + 1]
+                self._sparse_outputs[ns_idx] = sv
+
+                sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
+                sv_dense = sum_layer._sparse_outputs[sum_ns_idx]
+                assert sv_dense.total_nnz == H, (
+                    "CoSparseProdLayer at a missing position expected the "
+                    "upstream SparseIOSumLayer to have emitted an all-rows "
+                    "sv_dense; got total_nnz=%d, num_rows=%d." % (
+                        sv_dense.total_nnz, H,
+                    )
+                )
+
+                BLOCK = 256
+                grid = (triton.cdiv(H, BLOCK),)
+                _co_sparse_log_add_kernel[grid](
+                    out_ptr=sv.values,
+                    params_ptr=sparse_input_layer.params,
+                    dense_values_ptr=sv_dense.values,
+                    max_out_ptr=sv.max_val,
+                    param_offset=0,
+                    n=H,
+                    BLOCK=BLOCK,
+                    IS_MISSING=True,
+                )
+                continue
+
             ws = self._fwd_values_workspaces[ns_idx]
             if ws is None or ws.device != node_mars.device:
                 ws = torch.empty(
-                    sparse_cs.dist._max_nnz_per_col,
+                    max(sparse_cs.dist._max_nnz_per_col, H),
                     dtype=torch.float32, device=node_mars.device,
                 )
                 self._fwd_values_workspaces[ns_idx] = ws
@@ -223,6 +301,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 param_offset=param_base,
                 n=sv.total_nnz,
                 BLOCK=BLOCK,
+                IS_MISSING=False,
             )
         return None
 
@@ -251,6 +330,13 @@ class CoSparseProdLayer(SparseProdLayer):
             # its backward reads sv_flow.values at K_out positions.
             sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
             sum_layer._sparse_flows[sum_ns_idx] = sv_flow
+
+            if self._was_missing[ns_idx]:
+                # Marginalised position: emission contribution was forced to
+                # ``log(1) = 0`` in the forward, so it has zero gradient.
+                # Skip the param-flow accumulation that would otherwise
+                # spuriously credit this ns's emission column.
+                continue
 
             # Emission param flow accumulation (unchanged from SparseProdLayer).
             sparse_cs.dist.custom_backward_sparse(
