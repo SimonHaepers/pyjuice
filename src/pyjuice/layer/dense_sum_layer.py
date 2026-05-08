@@ -516,7 +516,12 @@ class DenseSumLayer(SumLayer):
         # global child id ``cid_start + k`` and edge-block base pid
         # ``pid_start + (nblock_id*NB_ch*CBS + k) * BS``.
         # offs_edge = arange(0,TILE_K) is already contig(TILE_K)/mult(TILE_K).
-        par_block_base = pid_start + nblock_id * NB_ch * CBS * BS
+        # Cast ``nblock_id`` to int64 so the address arithmetic doesn't
+        # tickle Triton's int32 bounds check: the constexpr ``NB_ch*CBS*BS``
+        # can be ~2^24, and Triton's worst-case range analysis on the
+        # int32 ``nblock_id`` then folds to ~2^31 even when the runtime
+        # range is bounded by NB.
+        par_block_base = pid_start + nblock_id.to(tl.int64) * NB_ch * CBS * BS
         offs_edge = tl.arange(0, TILE_K)
 
         # epars tile: [TILE_M, TILE_K]
@@ -808,8 +813,11 @@ class DenseSumLayer(SumLayer):
             off_mid = nid_start + pblock_id * BS + off_pwithin
 
             # Edge block base for (pblock_id, cblock_id). Scalar multiple of BS.
+            # int64 cast: same int32-range fix as the forward kernel — the
+            # constexpr ``CBS*BS`` can be ~2^24 and Triton's worst-case
+            # range analysis on int32 ``pblock_id``/``cblock_id`` overflows.
             edge_block_base = pid_start + \
-                (pblock_id * NB_ch + cblock_id) * CBS * BS
+                (pblock_id.to(tl.int64) * NB_ch + cblock_id) * CBS * BS
             # epars [TILE_N, TILE_K] — note: the inner/outer layout is the
             # TRANSPOSE of the forward kernel's epars load.
             #   inner dim (TILE_K, cols): stride 1  — contiguous / coalesced

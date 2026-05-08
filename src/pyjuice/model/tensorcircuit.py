@@ -16,7 +16,7 @@ from pyjuice.nodes.distributions import SparseCategorical
 from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
     CoSparseProdLayer, SumLayer, DenseSumLayer, SparseInputSumLayer,
-    SparseIOSumLayer, LayerGroup,
+    SparseIOSumLayer, TopKLayer, TopKSumLayer, LayerGroup,
 )
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -144,6 +144,11 @@ class TensorCircuit(nn.Module):
         self.node_flows = None
         self.element_flows = None
         self.param_flows = None
+        # Side buffers for the TopK fast path. Allocated lazily on the
+        # first forward call when any sum node opts in via ``summate(topk=K)``;
+        # remain ``None`` for circuits without any TopK summate.
+        self.topk_indices = None
+        self.topk_values = None
 
         self.use_dense_sum_layer = use_dense_sum_layer
         self.param_dtype = param_dtype
@@ -250,6 +255,8 @@ class TensorCircuit(nn.Module):
             if not _no_buffer_reset:
                 self._init_buffer(name = "node_mars", shape = (self.num_nodes, B), set_value = 0.0)
                 self._init_buffer(name = "element_mars", shape = (self.num_elements, B), set_value = -torch.inf)
+                if self._has_topk:
+                    self._init_topk_buffers(B)
 
             # Load cached node marginals
             if self._buffer_matches(name = "node_mars", cache = cache):
@@ -325,8 +332,12 @@ class TensorCircuit(nn.Module):
             def _run_inner_layers():
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
-                        # Prod layer
+                        # Prod layer (or TopKLayer, which subclasses
+                        # ProdLayer and ignores extra kwargs in the plain
+                        # case but reads ``topk_indices``/``topk_values``).
                         layer_group(self.node_mars, self.element_mars,
+                                    topk_indices = self.topk_indices,
+                                    topk_values = self.topk_values,
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
@@ -335,6 +346,8 @@ class TensorCircuit(nn.Module):
                     elif layer_group.is_sum():
                         # Sum layer
                         layer_group(self.node_mars, self.element_mars, self.params,
+                                    topk_indices = self.topk_indices,
+                                    topk_values = self.topk_values,
                                     force_use_bf16 = force_use_bf16,
                                     force_use_fp32 = force_use_fp32,
                                     propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
@@ -513,8 +526,8 @@ class TensorCircuit(nn.Module):
 
             # Same plumbing as in ``forward``: missing_mask is needed by
             # SparseProdLayer / CoSparseProdLayer / SparseIOSumLayer at
-            # marginalised positions. Both the prod-layer re-forward (the
-            # ``_for_backward=True`` call below) and the sum-layer backward
+            # marginalised positions. Both the prod-layer re-forward (at
+            # line "_for_backward=True" below) and the sum-layer backward
             # need to see it so they take the all-rows-at-missing branch.
             missing_mask_for_prod = kwargs.get("missing_mask", None)
 
@@ -526,8 +539,12 @@ class TensorCircuit(nn.Module):
                     layer_group = self.inner_layer_groups[layer_id]
 
                     if layer_group.is_prod():
-                        # Prod layer
+                        # Prod layer (TopKLayer.backward is a no-op — the
+                        # downstream TopKSumLayer's atomic-add into
+                        # element_flows already handled the flow flow).
                         layer_group.backward(self.node_flows, self.element_flows,
+                                             topk_indices = self.topk_indices,
+                                             topk_values = self.topk_values,
                                              logspace_flows = logspace_flows,
                                              data = self._run_data,
                                              data_cpu = self._run_data_cpu,
@@ -536,10 +553,15 @@ class TensorCircuit(nn.Module):
                     elif layer_group.is_sum():
                         # Sum layer
 
-                        # First recompute the previous product layer
+                        # First recompute the previous product layer (or
+                        # TopKLayer, which re-runs the deterministic top-K
+                        # selection so ``topk_indices`` / ``topk_values``
+                        # match what the forward computed).
                         self.inner_layer_groups[layer_id-1].forward(
                             self.node_mars, self.element_mars,
                             _for_backward = True,
+                            topk_indices = self.topk_indices,
+                            topk_values = self.topk_values,
                             data = self._run_data,
                             data_cpu = self._run_data_cpu,
                             data_list = self._run_data_list,
@@ -560,6 +582,8 @@ class TensorCircuit(nn.Module):
                         # Backward sum layer
                         layer_group.backward(self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
                                              param_flows = self.param_flows if compute_param_flows else None,
+                                             topk_indices = self.topk_indices,
+                                             topk_values = self.topk_values,
                                              allow_modify_flows = allow_modify_flows,
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
                                              logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
@@ -832,6 +856,9 @@ class TensorCircuit(nn.Module):
             layer_id = None
             for idx, layer_group in enumerate(self.inner_layer_groups):
                 for layer in layer_group:
+                    # Match against plain ProdLayer instances by membership;
+                    # TopKLayer (also is_prod()) holds SumNodes, so the
+                    # ``ns in layer.nodes`` check naturally rejects it.
                     if layer.is_prod() and ns in layer.nodes:
                         layer_id = idx
                         break
@@ -839,13 +866,29 @@ class TensorCircuit(nn.Module):
                 if layer_id is not None:
                     break
 
-            # Rerun the corresponding product layer to get the node values
-            self.inner_layer_groups[layer_id].forward(self.node_mars, self.element_mars, _for_backward = True)
-            self.inner_layer_groups[layer_id+1].backward(
-                self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params, 
-                param_flows = None, allow_modify_flows = self._run_params["allow_modify_flows"], 
-                propagation_alg = self._run_params["propagation_alg"], 
-                logspace_flows = self._run_params["logspace_flows"], 
+            # Walk forward past any TopK group that may sit between the
+            # ProdLayer and the consumer SumLayer.
+            sum_idx = layer_id + 1
+            while sum_idx < len(self.inner_layer_groups) and \
+                    not self.inner_layer_groups[sum_idx].is_sum():
+                sum_idx += 1
+
+            # Rerun the prod (and any intervening TopK) so element_mars
+            # and the topk side buffers reflect the requested ns.
+            for i in range(layer_id, sum_idx):
+                self.inner_layer_groups[i].forward(
+                    self.node_mars, self.element_mars, _for_backward = True,
+                    topk_indices = self.topk_indices,
+                    topk_values = self.topk_values,
+                )
+            self.inner_layer_groups[sum_idx].backward(
+                self.node_flows, self.element_flows, self.node_mars, self.element_mars, self.params,
+                param_flows = None,
+                topk_indices = self.topk_indices,
+                topk_values = self.topk_values,
+                allow_modify_flows = self._run_params["allow_modify_flows"],
+                propagation_alg = self._run_params["propagation_alg"],
+                logspace_flows = self._run_params["logspace_flows"],
                 negate_pflows = self._run_params["negate_pflows"],
                 force_use_fp32 = self._run_params["force_use_fp32"], **kwargs
             )
@@ -959,6 +1002,34 @@ class TensorCircuit(nn.Module):
         if backward:
             self._bk_partial_eval_enabled = False
 
+    def _init_topk_buffers(self, B: int) -> None:
+        """Allocate (or grow) the int32 ``topk_indices`` and fp32
+        ``topk_values`` side buffers used by :class:`TopKLayer` /
+        :class:`TopKSumLayer`. The contents are overwritten on every
+        forward (per-batch K selection); we don't reset between calls.
+        """
+        shape = (self.num_topk_slots, B)
+        idx = self.topk_indices
+        if (
+            idx is None
+            or idx.size() != torch.Size(shape)
+            or idx.device != self.device
+            or idx.dtype != torch.int32
+        ):
+            self.topk_indices = torch.zeros(
+                shape, device = self.device, dtype = torch.int32,
+            )
+        val = self.topk_values
+        if (
+            val is None
+            or val.size() != torch.Size(shape)
+            or val.device != self.device
+            or val.dtype != torch.float32
+        ):
+            self.topk_values = torch.full(
+                shape, -float("inf"), device = self.device, dtype = torch.float32,
+            )
+
     def _init_buffer(self, name: str, shape: Tuple, set_value: Optional[float] = None, check_device: bool = True):
         flag = False
         if not name in self.__dict__:
@@ -1070,6 +1141,11 @@ class TensorCircuit(nn.Module):
 
         # Number of parameter flows
         num_param_flows = 0
+
+        # Total rows in the circuit-level topk side buffers (one row per
+        # (summate, k) selection slot; columns indexed by batch). Stays at
+        # zero unless any sum node opted in via ``summate(topk=K)``.
+        num_topk_slots = 0
 
         # Stores distributed parameter flows
         node2tiednodes = dict()
@@ -1239,9 +1315,29 @@ class TensorCircuit(nn.Module):
                                         return True
                         return False
 
+                    # TopK eligibility: opt-in via ``summate(topk=K)``. Runs
+                    # *first* in the dispatch chain so a user-requested
+                    # topk on a sum whose child also matches the sparse-prod
+                    # pattern doesn't get silently shadowed. Falls back to
+                    # plain ``SumLayer`` when ``K >= H_total`` so the user
+                    # can leave the annotation in place during sweeps.
+                    def _topk_eligible(ns):
+                        K = getattr(ns, "_topk_k", None)
+                        if K is None:
+                            return False
+                        if not (ns.is_block_dense and len(ns.chs) == 1):
+                            return False
+                        cs = ns.chs[0]
+                        H_total = cs.num_node_blocks * cs.block_size
+                        if K >= H_total:
+                            return False
+                        return True
+
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        if id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
+                        if _topk_eligible(ns):
+                            mode = "topk"
+                        elif id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
                             mode = "sparse_io"
                         elif _sparse_sum_eligible(ns):
                             mode = "sparse_dense"
@@ -1251,6 +1347,30 @@ class TensorCircuit(nn.Module):
                             mode = "plain"
                         key = (ns.block_size, mode)
                         gsize2sum_nodes.setdefault(key, []).append(ns)
+
+                    # If any sum node at this depth opts into TopK, build a
+                    # ``TopKLayer`` group sandwiched between the prod and sum
+                    # layer groups. The TopKLayer reads the dense product
+                    # activations from ``element_mars`` and writes the K
+                    # selected (index, log-value) pairs into circuit-level
+                    # ``topk_indices`` / ``topk_values`` side buffers shared
+                    # with the matching :class:`TopKSumLayer`. Subclassing
+                    # ``ProdLayer`` lets the existing layer-group dispatch
+                    # carry it through without a fourth ``is_topk()`` branch.
+                    topk_layers = []
+                    for (gsize, mode), nodes in gsize2sum_nodes.items():
+                        if mode != "topk":
+                            continue
+                        topk_layer = TopKLayer(
+                            nodes = nodes,
+                            slot_start = num_topk_slots,
+                        )
+                        num_topk_slots += topk_layer.num_topk_slots
+                        topk_layers.append(topk_layer)
+                    if topk_layers:
+                        topk_layer_group = LayerGroup(topk_layers)
+                        self.inner_layer_groups.append(topk_layer_group)
+                        self.add_module(f"topk_layer_{layer_id}", topk_layer_group)
 
                     sum_layers = []
                     for (gsize, mode), nodes in gsize2sum_nodes.items():
@@ -1281,6 +1401,9 @@ class TensorCircuit(nn.Module):
                             extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
                         elif mode == "dense":
                             layer_cls = DenseSumLayer
+                            extra_kwargs = {}
+                        elif mode == "topk":
+                            layer_cls = TopKSumLayer
                             extra_kwargs = {}
                         else:
                             layer_cls = SumLayer
@@ -1317,6 +1440,8 @@ class TensorCircuit(nn.Module):
         self.num_elements = num_elements
         self.num_sum_params = num_parameters
         self.num_param_flows = num_param_flows
+        self.num_topk_slots = num_topk_slots
+        self._has_topk = num_topk_slots > 0
 
         # Post-pass: mark any SparseProdLayer whose every consumer is a
         # SparseInputSumLayer so its forward can skip scatter-to-dense.
@@ -1655,10 +1780,18 @@ class TensorCircuit(nn.Module):
         for idx, layer in enumerate(self.input_layer_group):
             layer._prepare_scope2nids()
 
-        # Inner layers
+        # Inner layers. ``TopKLayer`` is a "prod" layer for dispatch
+        # purposes (so the existing forward/backward hooks see it through
+        # ``is_prod()``), but it produces no scope-addressable outputs, so
+        # we must not let its empty ``_prepare_scope2nids`` overwrite the
+        # ``prod_scope_eleids`` seeded by the preceding plain ProdLayer
+        # group at the same depth.
         prod_scope_eleids = None
         for layer_group in self.inner_layer_groups:
             if layer_group.is_prod():
+                if isinstance(layer_group.layers[0], TopKLayer):
+                    layer_group._prepare_scope2nids()
+                    continue
                 prod_scope_eleids = layer_group._prepare_scope2nids()
             else:
                 assert layer_group.is_sum()

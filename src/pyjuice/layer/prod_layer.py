@@ -601,7 +601,13 @@ class ProdLayer(Layer, nn.Module):
         if not triton.__version__ == "2.0.0":
 
             BLOCK_B = min(2048 // num_edges, triton.next_power_of_2(batch_size))
-            BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size)
+            # Cap BLOCK_M: at small ``num_edges`` (e.g. dense HMM with
+            # ``num_edges=2``) the 2048-element budget heuristic balloons
+            # BLOCK_M up to ``block_size`` (4096), serialising thousands of
+            # rows per program and starving the GPU. Capping at 8 keeps
+            # some inner-loop unroll while letting the grid scale to
+            # thousands of programs.
+            BLOCK_M = min(max(2048 // (BLOCK_B * num_edges), 1), self.block_size, 8)
 
             grid = (triton.cdiv(n_nblocks * self.block_size, BLOCK_M), triton.cdiv(batch_size, BLOCK_B))
 
