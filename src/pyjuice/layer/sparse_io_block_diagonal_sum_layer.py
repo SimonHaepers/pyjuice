@@ -355,11 +355,13 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             # --- Per-block offsets via precomputed table ----------------- #
             in_offs = self._lookup_block_offsets(
                 blk_idx, side="in", var_id=in_var_id,
-                is_missing=in_is_missing, data=data, device=node_mars.device,
+                is_missing=in_is_missing, data=data,
+                data_list=data_list, device=node_mars.device,
             )
             out_offs = self._lookup_block_offsets(
                 blk_idx, side="out", var_id=out_var_id,
-                is_missing=out_is_missing, data=data, device=node_mars.device,
+                is_missing=out_is_missing, data=data,
+                data_list=data_list, device=node_mars.device,
             )
             # Cache for backward — re-deriving these from missing flags
             # would require threading ``missing_mask`` into ``backward``,
@@ -402,29 +404,25 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                  logspace_flows: bool = False, negate_pflows: bool = False,
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  force_use_fp32: bool = False, **kwargs) -> None:
-        # Same inference-only contract as :class:`SparseIOSumLayer`.
-        if param_flows is not None:
-            raise NotImplementedError(
-                "SparseIOBlockDiagonalSumLayer is inference-only; "
-                "parameter-flow accumulation is not supported."
-            )
         batch_size = node_mars.size(1)
         assert batch_size == 1, "SparseIOBlockDiagonalSumLayer is B=1 only."
         assert propagation_alg == "LL" and not logspace_flows \
-               and not negate_pflows and not allow_neg_flows, (
+               and not allow_neg_flows, (
             "SparseIOBlockDiagonalSumLayer.backward requires "
             "propagation_alg='LL', logspace_flows=False, "
-            "negate_pflows=False, allow_neg_flows=False."
+            "allow_neg_flows=False."
         )
         assert not accumulate_ch_flows, (
             "SparseIOBlockDiagonalSumLayer writes sv_flow_in straight into "
             "the upstream prod layer; accumulate_ch_flows is not supported."
         )
 
+        compute_pflows = param_flows is not None
+
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._bd_blocks, self._sparse_input_refs,
         )):
-            _nid_start, _cid_start, pid_start, _pfid_start, NB, BS, CBS = block
+            _nid_start, _cid_start, pid_start, pfid_start, NB, BS, CBS = block
 
             sv_flow_out = self._sparse_flows[blk_idx]
             assert sv_flow_out is not None, (
@@ -479,16 +477,20 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 sv_flow_out_ptr=sv_flow_out.values,
                 sv_out_values_ptr=sv_out.values,
                 mparams_ptr=params,
+                pflows_ptr=(param_flows if compute_pflows else sv_flow_in.values),
                 in_indices_ptr=sv_in.indices,
                 in_values_ptr=sv_in.values,
                 in_block_offsets_ptr=in_offs,
                 out_indices_ptr=sv_out.indices,
                 out_block_offsets_ptr=out_offs,
                 pid_start=pid_start,
+                pfid_start=pfid_start,
                 BS=BS,
                 CBS=CBS,
                 MAX_K_IN=self._MAX_K_IN,
                 MAX_K_OUT=self._MAX_K_OUT,
+                COMPUTE_PFLOWS=1 if compute_pflows else 0,
+                NEGATE_PFLOWS=1 if negate_pflows else 0,
             )
             # Consume-and-clear the cache to surface any stale-pointer bug.
             self._cached_in_offsets[blk_idx] = None
@@ -502,6 +504,7 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 
     def _lookup_block_offsets(self, blk_idx: int, side: str, var_id: int,
                                 is_missing: bool, data: torch.Tensor,
+                                data_list: Optional[list],
                                 device: torch.device) -> torch.Tensor:
         """Look up per-block start offsets via the compile-time table.
 
@@ -510,9 +513,11 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
           ``build_sparse_pattern`` emits an all-rows sv whose indices are
           ``arange(num_rows)``. Block ``b`` starts at ``b * BS`` (resp.
           ``b * CBS``). Returns the precomputed missing-case tensor.
-        * Active position: gather ``table[v]`` where ``v`` is the observed
-          token. Stays on device — a 0-d tensor index into a 2-D table
-          produces a 1-D view without a host sync.
+        * Active position: index ``table[v]`` where ``v`` is the observed
+          token. If ``data_list`` (Python-list cache of ``data_cpu[:, 0]``)
+          is available, ``v`` is a Python int and the gather is a plain
+          view — zero CUDA dispatch. Otherwise we ``index_select`` with a
+          1-D GPU slice to avoid the 0-d-CUDA-index sync.
 
         ``side`` selects between input (``"in"``, uses CBS-aligned table)
         and output (``"out"``, uses BS-aligned table).
@@ -543,10 +548,17 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 
         if is_missing:
             return missing_offs
-        # Device-side gather: ``data[var_id, 0]`` is a 0-d int tensor;
-        # ``table[v]`` is a 1-D view of row ``v``. No ``.item()`` / sync.
-        v = data[var_id, 0]
-        return table[v]
+        # Sync-free index. ``table[scalar]`` with a 0-d CUDA index forces
+        # a host-device sync (pytorch needs the scalar value to determine
+        # the output shape). Two faster paths:
+        #   * ``data_list`` available ⇒ ``v`` is a Python int and
+        #     ``table[v]`` is a plain row view (no kernel, no dispatch).
+        #   * Else fall back to ``index_select`` with a 1-D GPU slice —
+        #     also sync-free but does a launch.
+        if data_list is not None:
+            return table[data_list[var_id]]
+        v_1d = data[var_id:var_id + 1, 0]
+        return table.index_select(0, v_1d).squeeze(0)
 
 
 # ======================================================================= #
@@ -651,26 +663,29 @@ def _fw_bd_sparse_io_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["pid_start"],
+    do_not_specialize=["pid_start", "pfid_start"],
     do_not_specialize_on_alignment=[
         "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
         "in_indices_ptr", "in_values_ptr", "in_block_offsets_ptr",
         "out_indices_ptr", "out_block_offsets_ptr",
+        "pflows_ptr",
     ],
 )
 def _bk_bd_sparse_io_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,
     mparams_ptr,
+    pflows_ptr,
     in_indices_ptr, in_values_ptr, in_block_offsets_ptr,
     out_indices_ptr, out_block_offsets_ptr,
-    pid_start,
+    pid_start, pfid_start,
     BS: tl.constexpr, CBS: tl.constexpr,
     MAX_K_IN: tl.constexpr, MAX_K_OUT: tl.constexpr,
+    COMPUTE_PFLOWS: tl.constexpr, NEGATE_PFLOWS: tl.constexpr,
 ):
-    """Element-flow backward for one parent block. Grid = ``(NB,)``.
+    """Element-flow + (optional) param-flow backward for one parent block.
 
-    Per-program math (one parent block ``pid_nb``):
+    Grid = ``(NB,)``. Per-program math (one parent block ``pid_nb``):
 
       cslot[k] := in_indices[in_s + k] - pid_nb * CBS
       pslot[m] := out_indices[out_s + m] - pid_nb * BS
@@ -678,11 +693,22 @@ def _bk_bd_sparse_io_kernel(
       contrib[m, k] := W[m, k] · sv_flow_out[m]
                        · exp(in_values[k] - sv_out_values[m])
       flow_in[in_s + k] := Σ_m contrib[m, k]
+      # When COMPUTE_PFLOWS == 1:
+      param_flows[pfid_start + pid_nb*BS*CBS + cslot[k]*BS + pslot[m]] += contrib[m, k]
 
-    Block-diagonal structure guarantees that each ``flow_in`` slot is
-    written by exactly one program (its own block), so no atomic-add is
-    needed — a plain store does it. Mirrors the forward kernel's tile
-    shape so the two stay in sync.
+    Element-flow scatter: block-diagonal structure guarantees each
+    ``flow_in`` slot is written by exactly one program — plain store.
+
+    Param-flow scatter: programs in this launch write to disjoint blocks
+    (``pblock``-th block ⇒ slice ``pfid_start + pblock*BS*CBS …``), so
+    no intra-launch collisions. But tied SumNodes across blocks (e.g. an
+    HMM chain whose every time step ties to the same source's pfid_start)
+    accumulate across kernel calls — those calls are sequential on the
+    stream so they don't race either, but the semantics of
+    ``param_flows`` is accumulation (``flows_memory * existing + new``)
+    so we use ``atomic_add`` to read-modify-write atomically. Each address
+    is touched by only one (pid_nb, m, k) triple per launch, so atomic
+    contention is zero.
     """
     pid_nb = tl.program_id(0)
 
@@ -740,3 +766,21 @@ def _bk_bd_sparse_io_kernel(
     # K_out_j == 0 ⇒ flow_k stays at 0, which is the desired output for
     # an "empty output" block (no parents to take flow from).
     tl.store(flow_in_ptr + in_s + offs_k, flow_k, mask=mask_k)
+
+    if COMPUTE_PFLOWS == 1:
+        # Scatter contrib[m, k] into param_flows. Same address arithmetic
+        # as the weight gather but rebased on pfid_start; the BD layout
+        # guarantees param_flows and params share the per-block stride
+        # ``BS * CBS`` with the same intra-block ``(cslot, pslot)`` order.
+        pf_base = pfid_start + pid_nb.to(tl.int64) * BS * CBS
+        pf_addr = (
+            pf_base
+            + cslot[None, :] * BS
+            + pslot[:, None]
+        )                                                                        # [MAX_K_OUT, MAX_K_IN]
+        pf_val = -contrib if NEGATE_PFLOWS == 1 else contrib
+        tl.atomic_add(
+            pflows_ptr + pf_addr,
+            pf_val,
+            mask=mask_m[:, None] & mask_k[None, :],
+        )

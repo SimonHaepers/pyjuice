@@ -167,6 +167,13 @@ class BlockDiagonalSumLayer(SumLayer):
             edge_lin_ids = torch.arange(NB, dtype = torch.long)
             ns._param_ids = block_pid_start + edge_lin_ids * bs * cbs
             ns._inverse_param_ids = torch.argsort(edge_lin_ids)
+            # ``_param_flow_ids`` mirrors ``_param_ids`` in the BD layout —
+            # the param-flow buffer reuses the params' ``[NB, bs, cbs]`` flat
+            # stride exactly (one ``bs*cbs`` block per edge, in arange order).
+            # Needed by :meth:`SumNodes.update_param_flows` and
+            # :meth:`TensorCircuit.get_node_param_flows` to pull this ns's
+            # accumulated pflows back into canonical ``[NB, bs, cbs]`` shape.
+            ns._param_flow_ids = block_pfid_start + edge_lin_ids * bs * cbs
 
             blocks.append((
                 curr_nid,                      # nid_start in node_mars
