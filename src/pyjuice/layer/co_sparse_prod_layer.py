@@ -99,7 +99,14 @@ class CoSparseProdLayer(SparseProdLayer):
         self._dense_sum_refs: List[Tuple] = []
         # Imported lazily to avoid the circular dep
         # CoSparseProdLayer → SparseIOSumLayer → SparseInputSumLayer.
+        # Also accept :class:`SparseIOBlockDiagonalSumLayer` (BD-pattern
+        # variant of the sparse-IO sum) — both layer types expose the
+        # same ``_sparse_outputs`` / ``_sparse_flows`` plumbing.
         from .sparse_io_sum_layer import SparseIOSumLayer
+        from .sparse_io_block_diagonal_sum_layer import (
+            SparseIOBlockDiagonalSumLayer,
+        )
+        _sparse_io_layer_cls = (SparseIOSumLayer, SparseIOBlockDiagonalSumLayer)
 
         for ns in self.nodes:
             dense_ch_ns = ns.chs[ns.dense_ch_idxs[0]]
@@ -108,7 +115,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 if lg.is_prod():
                     continue
                 for layer in lg:
-                    if not isinstance(layer, SparseIOSumLayer):
+                    if not isinstance(layer, _sparse_io_layer_cls):
                         continue
                     for idx, sum_ns in enumerate(layer.nodes):
                         if sum_ns is dense_ch_ns:
@@ -120,10 +127,11 @@ class CoSparseProdLayer(SparseProdLayer):
                     break
             assert found is not None, (
                 "CoSparseProdLayer: dense child sum ns is not owned by any "
-                "SparseIOSumLayer in inner_layer_groups. The DAG pre-pass "
-                "classified the sum as sparse_io but the layer dispatch did "
-                "not compile it as SparseIOSumLayer — check TensorCircuit "
-                "compilation order."
+                "sparse-IO sum layer (SparseIOSumLayer or "
+                "SparseIOBlockDiagonalSumLayer) in inner_layer_groups. The "
+                "DAG pre-pass classified the sum as sparse_io but the "
+                "layer dispatch did not compile it as a sparse-IO layer — "
+                "check TensorCircuit compilation order."
             )
             self._dense_sum_refs.append(found)
 

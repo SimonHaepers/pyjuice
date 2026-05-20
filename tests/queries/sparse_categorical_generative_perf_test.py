@@ -298,7 +298,7 @@ if __name__ == "__main__":
         T=32,
         H=8192*4,
         V=32768,
-        bs=1024,
+        bs=8192*4,
         density=0.01,
         target_t=16,
         n_warmup=1,

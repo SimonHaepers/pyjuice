@@ -15,8 +15,9 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, SparseP
 from pyjuice.nodes.distributions import SparseCategorical
 from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
-    CoSparseProdLayer, SumLayer, DenseSumLayer, SparseInputSumLayer,
-    SparseIOSumLayer, TopKLayer, TopKSumLayer, LayerGroup,
+    CoSparseProdLayer, SumLayer, DenseSumLayer, BlockDiagonalSumLayer,
+    SparseInputSumLayer, SparseIOSumLayer, SparseIOBlockDiagonalSumLayer,
+    TopKLayer, TopKSumLayer, LayerGroup,
 )
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
@@ -93,6 +94,38 @@ def device_grad_controller(device, no_grad = True):
                     yield
             else:
                 yield
+
+
+def _is_block_diagonal_pattern(ns) -> bool:
+    """Structural detector for the block-diagonal ``edge_ids`` pattern
+    produced by ``summate(np, edge_ids=arange(NB)[None,:].repeat(2,1),
+    ...)`` (the building block of Monarch factorisations).
+
+    Shared by :meth:`TensorCircuit._classify_sparse_chains` (so sparse-IO
+    chains can pick up BD sums alongside block-dense ones) and
+    :meth:`TensorCircuit._init_layers` (where it gates dispatch to
+    :class:`BlockDiagonalSumLayer` / :class:`SparseIOBlockDiagonalSumLayer`).
+
+    Excludes the trivial ``NB == 1`` case — block-diagonal collapses to
+    block-dense there, so leave it on the regular fast paths so parity
+    tests against ``DenseSumLayer`` / plain ``SumLayer`` stay numerically
+    consistent.
+    """
+    if len(ns.chs) != 1:
+        return False
+    if ns.num_node_blocks != ns.num_ch_node_blocks:
+        return False
+    if ns.block_size != ns.ch_block_size:
+        return False
+    NB = ns.num_node_blocks
+    if NB < 2:
+        return False
+    edge_ids = ns.edge_ids
+    if edge_ids.size(1) != NB:
+        return False
+    expected = torch.arange(NB, dtype=edge_ids.dtype, device=edge_ids.device)
+    return (torch.equal(edge_ids[0], expected)
+            and torch.equal(edge_ids[1], expected))
 
 
 class TensorCircuit(nn.Module):
@@ -1315,6 +1348,38 @@ class TensorCircuit(nn.Module):
                                         return True
                         return False
 
+                    # Block-diagonal eligibility uses the module-level
+                    # :func:`_is_block_diagonal_pattern` helper (also used
+                    # by :meth:`_classify_sparse_chains`). The inner closure
+                    # adds the ``_force_plain_layer`` veto since the
+                    # classifier doesn't gate on that — it serves both
+                    # block-dense and BD topologies.
+                    def _block_diagonal_eligible(ns):
+                        if getattr(ns, "_force_plain_layer", False):
+                            return False
+                        return _is_block_diagonal_pattern(ns)
+
+                    # Sparse-IO BD eligibility: a BD-pattern sum whose
+                    # child is a :class:`SparseProdLayer`. Routes to
+                    # :class:`SparseIOBlockDiagonalSumLayer`, which uses
+                    # the same upstream / downstream
+                    # :class:`SparseNodeValues` plumbing as
+                    # :class:`SparseIOSumLayer` but exploits the
+                    # block-diagonal structure for ``K_in_j × K_out_j``
+                    # per-block work instead of ``K_in × K_out``.
+                    def _sparse_io_bd_eligible(ns):
+                        if not _block_diagonal_eligible(ns):
+                            return False
+                        cs = ns.chs[0]
+                        for lg in self.inner_layer_groups:
+                            if not lg.is_prod():
+                                continue
+                            for layer in lg:
+                                if isinstance(layer, SparseProdLayer):
+                                    if cs in layer.nodes:
+                                        return True
+                        return False
+
                     # TopK eligibility: opt-in via ``summate(topk=K)``. Runs
                     # *first* in the dispatch chain so a user-requested
                     # topk on a sum whose child also matches the sparse-prod
@@ -1339,10 +1404,14 @@ class TensorCircuit(nn.Module):
                             mode = "topk"
                         elif id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
                             mode = "sparse_io"
+                        elif id(ns) in sparse_io_sums and _sparse_io_bd_eligible(ns):
+                            mode = "sparse_io_block_diagonal"
                         elif _sparse_sum_eligible(ns):
                             mode = "sparse_dense"
                         elif _dense_eligible(ns):
                             mode = "dense"
+                        elif _block_diagonal_eligible(ns):
+                            mode = "block_diagonal"
                         else:
                             mode = "plain"
                         key = (ns.block_size, mode)
@@ -1374,7 +1443,7 @@ class TensorCircuit(nn.Module):
 
                     sum_layers = []
                     for (gsize, mode), nodes in gsize2sum_nodes.items():
-                        if mode == "sparse_io":
+                        if mode == "sparse_io" or mode == "sparse_io_block_diagonal":
                             # Resolve per-ns consumer metadata from the DAG
                             # pre-pass: output_sparsity_var_ids (which CSC
                             # column defines this sum's output rows) plus the
@@ -1389,7 +1458,11 @@ class TensorCircuit(nn.Module):
                                 out_var_ids.append(consumer.var_id)
                                 out_dists.append(consumer.sparse_input_ns.dist)
                                 out_num_rows.append(consumer.num_nodes)
-                            layer_cls = SparseIOSumLayer
+                            layer_cls = (
+                                SparseIOBlockDiagonalSumLayer
+                                if mode == "sparse_io_block_diagonal"
+                                else SparseIOSumLayer
+                            )
                             extra_kwargs = {
                                 "inner_layer_groups": list(self.inner_layer_groups),
                                 "output_sparsity_var_ids": out_var_ids,
@@ -1401,6 +1474,9 @@ class TensorCircuit(nn.Module):
                             extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
                         elif mode == "dense":
                             layer_cls = DenseSumLayer
+                            extra_kwargs = {}
+                        elif mode == "block_diagonal":
+                            layer_cls = BlockDiagonalSumLayer
                             extra_kwargs = {}
                         elif mode == "topk":
                             layer_cls = TopKSumLayer
@@ -1610,7 +1686,16 @@ class TensorCircuit(nn.Module):
             for ns in depth2nodes[d].get("sum", []):
                 if getattr(ns, "_force_plain_layer", False):
                     continue
-                if not (ns.is_block_dense and len(ns.chs) == 1):
+                # Accept either block-dense single-child sums (the
+                # classical sparse-IO path) or the block-diagonal pattern
+                # (Monarch transition halves). The BD variant compiles to
+                # :class:`SparseIOBlockDiagonalSumLayer`, which exploits
+                # the per-block restriction to do ``K_in_j × K_out_j``
+                # work instead of the dense ``K_in × K_out``.
+                if len(ns.chs) != 1:
+                    continue
+                topology_ok = ns.is_block_dense or _is_block_diagonal_pattern(ns)
+                if not topology_ok:
                     continue
                 child = ns.chs[0]
                 if not isinstance(child, SparseProdNodes):
