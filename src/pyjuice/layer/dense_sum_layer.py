@@ -143,6 +143,11 @@ class DenseSumLayer(SumLayer):
             # block-sparse path does during compilation.
             ns._param_ids = block_pid_start + edge_lin_ids * bs * cbs
             ns._inverse_param_ids = torch.argsort(edge_lin_ids)
+            # ``_param_flow_ids`` mirrors ``_param_ids`` — the param-flow
+            # buffer shares the same per-block ``bs * cbs`` stride and intra-
+            # block ``(c, s)`` order as the params buffer. Needed by
+            # :meth:`SumNodes.update_param_flows` for canonical extraction.
+            ns._param_flow_ids = block_pfid_start + edge_lin_ids * bs * cbs
 
             blocks.append((
                 curr_nid,                      # nid_start in node_mars

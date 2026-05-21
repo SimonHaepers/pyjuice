@@ -35,9 +35,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
     ``node_mars`` is never written — the consumer reads the packed
     :class:`SparseNodeValues` directly via ``self._sparse_outputs``.
 
-    Inference-only, B=1, propagation_alg=='LL', no param_flows. Every
-    assertion inherited from :class:`SparseInputSumLayer` still holds; the
-    sparse output is purely additive.
+    B=1, propagation_alg=='LL'. Backward writes the upstream prod's
+    ``sv_flow_in`` from the sparse fast path and (optionally) scatters
+    per-edge contributions into ``param_flows`` for EM training — same
+    accumulation pattern as the BD sibling
+    (:class:`SparseIOBlockDiagonalSumLayer`), atomic_add into the canonical
+    ``[NB, NB_ch, cbs, bs]`` flat pflow buffer.
     """
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
@@ -270,18 +273,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
                  logspace_flows: bool = False, negate_pflows: bool = False,
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  force_use_fp32: bool = False, **kwargs) -> None:
-        if param_flows is not None:
-            raise NotImplementedError(
-                "SparseIOSumLayer is inference-only; parameter-flow "
-                "accumulation is not supported."
-            )
-
         batch_size = node_mars.size(1)
         assert batch_size == 1, "SparseIOSumLayer is B=1 only."
         assert propagation_alg == "LL" and not logspace_flows \
-               and not negate_pflows and not allow_neg_flows, (
+               and not allow_neg_flows, (
             "SparseIOSumLayer.backward requires propagation_alg='LL' + "
-            "logspace_flows=False + negate_pflows=False + allow_neg_flows=False."
+            "logspace_flows=False + allow_neg_flows=False."
         )
         # ``allow_modify_flows`` only governs whether the upstream SparseInputSumLayer /
         # SparseIOSumLayer pre-transforms ``node_flows`` dense cells before its
@@ -294,10 +291,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
             "upstream prod layer; accumulate_ch_flows is not supported."
         )
 
+        compute_pflows = param_flows is not None
+
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._dense_blocks, self._sparse_input_refs,
         )):
-            _nid_start, _cid_start, pid_start, _pfid_start, _NB, NB_ch, BS, CBS = block
+            _nid_start, _cid_start, pid_start, pfid_start, _NB, NB_ch, BS, CBS = block
 
             sv_flow_out = self._sparse_flows[blk_idx]
             assert sv_flow_out is not None, (
@@ -342,15 +341,19 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_flow_out_ptr=sv_flow_out.values,
                 sv_out_values_ptr=sv_out.values,
                 mparams_ptr=params,
+                pflows_ptr=(param_flows if compute_pflows else sv_flow_in.values),
                 in_indices_ptr=sv_in.indices,
                 in_values_ptr=sv_in.values,
                 out_indices_ptr=sv_out.indices,
                 pid_start=pid_start,
+                pfid_start=pfid_start,
                 K_out=K_out,
                 NB_ch=NB_ch,
                 BS=BS,
                 CBS=CBS,
                 BLOCK_P=_BWD_BLOCK_P,
+                COMPUTE_PFLOWS=1 if compute_pflows else 0,
+                NEGATE_PFLOWS=1 if negate_pflows else 0,
             )
         return None
 
@@ -440,23 +443,27 @@ def _sparse_io_sum_forward_kernel(
 
 
 @triton.jit(
-    do_not_specialize=["pid_start", "K_out"],
+    do_not_specialize=["pid_start", "pfid_start", "K_out"],
     do_not_specialize_on_alignment=[
         "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
         "in_indices_ptr", "in_values_ptr", "out_indices_ptr",
+        "pflows_ptr",
     ],
 )
 def _sparse_io_sum_backward_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,
     mparams_ptr,
+    pflows_ptr,
     in_indices_ptr, in_values_ptr, out_indices_ptr,
-    pid_start,
+    pid_start, pfid_start,
     K_out,
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     BLOCK_P: tl.constexpr,
+    COMPUTE_PFLOWS: tl.constexpr, NEGATE_PFLOWS: tl.constexpr,
 ):
-    """Backward for one SparseIOSumLayer block. Grid = ``(K_in,)``.
+    """Element-flow + (optional) param-flow backward for one SparseIOSumLayer
+    block. Grid = ``(K_in,)``.
 
     Per-program (one active K_in slot) math:
 
@@ -472,6 +479,17 @@ def _sparse_io_sum_backward_kernel(
         chunk       = nflow_j * W_j * exp(log_val_k - nmars_j)
         acc        += chunk
       flow_in[k] = Σ acc
+      # When COMPUTE_PFLOWS == 1:
+      param_flows[pfid_start + (pblock_j*NB_ch + cblock)*CBS*BS
+                              + cslot*BS + within_j] += chunk
+
+    Param-flow scatter uses ``atomic_add`` for accumulation across multiple
+    backward calls (tied SumNodes across HMM time steps share the source's
+    ``pfid_start``, so each launch atomically adds its contribution). Within
+    a single launch no two programs collide on the same address: CSC indices
+    are unique per column so different ``k`` programs map to different
+    ``(cblock, cslot)`` pairs, and inside a program different ``j`` indices
+    write to different ``(pblock_j, within_j)`` pairs.
     """
     pid_k = tl.program_id(0)
 
@@ -501,7 +519,21 @@ def _sparse_io_sum_backward_kernel(
         )
         W = tl.load(mparams_ptr + W_ptr, mask=mask_j, other=0.0).to(tl.float32)
 
-        chunk = nflows * W * tl.exp(log_val - nmars)
-        acc += tl.where(mask_j, chunk, 0.0)
+        chunk_full = nflows * W * tl.exp(log_val - nmars)
+        chunk = tl.where(mask_j, chunk_full, 0.0)
+        acc += chunk
+
+        if COMPUTE_PFLOWS == 1:
+            # Address layout mirrors mparams exactly (same per-block stride,
+            # same intra-block ``(cslot, within_j)`` order); the BD layer uses
+            # an identical pattern, see ``_bk_bd_sparse_io_kernel``.
+            pf_ptr = (
+                pfid_start
+                + (pblock_j * NB_ch + cblock) * CBS * BS
+                + cslot * BS
+                + within_j
+            )
+            pf_val = -chunk if NEGATE_PFLOWS == 1 else chunk
+            tl.atomic_add(pflows_ptr + pf_ptr, pf_val, mask=mask_j)
 
     tl.store(flow_in_ptr + pid_k, tl.sum(acc))
