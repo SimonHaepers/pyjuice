@@ -411,7 +411,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_mars.size(1)
 
         if mode is not None:
-            assert mode in STR2MODE
+            assert mode in self.STR2MODE
             mode = self.STR2MODE[mode]
 
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
@@ -1298,7 +1298,7 @@ class SumLayer(Layer, nn.Module):
         batch_size = node_flows.size(1)
 
         if mode is not None:
-            assert mode in STR2MODE
+            assert mode in self.STR2MODE
             mode = self.STR2MODE[mode]
 
         elif params.dim() == 1 and self.block_size >= 16 and num_edges >= 16 and batch_size >= 16:
@@ -2794,17 +2794,21 @@ class SumLayer(Layer, nn.Module):
     @triton_jit
     def _bk_triton_sparse_par_kernel(node_flows, node_mars, element_mars, mparams, param_flows, nids, cids, pids, pfids,
                                      pid_m_offset, num_edges: tl.constexpr, batch_size: tl.constexpr, allow_modify_flows: tl.constexpr, 
-                                     logspace_flows: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr, 
-                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, propagation_alg_id: tl.constexpr, 
+                                     logspace_flows: tl.constexpr, BLOCK_SIZE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK_B: tl.constexpr,
+                                     TILE_SIZE_B: tl.constexpr, B_NUM_BLOCKS: tl.constexpr, propagation_alg_id: tl.constexpr,
                                      negate_pflows: tl.constexpr, alpha = 0.0):
 
         pid_b = tl.program_id(0) # ID of size-`BLOCK_B` samples
         pid_e = tl.program_id(1) # ID of size-`BLOCK_K` edges
-        pid_m = tl.program_id(2) + pid_m_offset # ID of size-`BLOCK_M` nodes
+        pid_m = tl.program_id(2) + pid_m_offset # one node per program (grid spans `layer_n_nodes`)
 
-        # Get inferred node block id from `pid_m`
-        nblock_id = pid_m // BLOCK_M
-        tile_id = pid_m % BLOCK_M
+        # Decompose the flat node id `pid_m` into its node block and the tile
+        # (within-block offset). The grid dimension is `num_nblocks * block_size`,
+        # so the divisor MUST be the block size — not a tiling heuristic — or
+        # `nblock_id` overruns `nids` / `cids` (out-of-bounds load) whenever the
+        # heuristic block size is smaller than `block_size`.
+        nblock_id = pid_m // BLOCK_SIZE_M
+        tile_id = pid_m % BLOCK_SIZE_M
 
         # Batch offsets and mask
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * TILE_SIZE_B
@@ -2936,11 +2940,9 @@ class SumLayer(Layer, nn.Module):
         if num_edges <= 1024:
             BLOCK_B = max(min(2048 // num_edges, BATCH_SIZE_NP2), 1)
             BLOCK_K = num_edges
-            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
         else:
             BLOCK_B = min(512, BATCH_SIZE_NP2)
             BLOCK_K = min(2048 // BLOCK_B, num_edges)
-            BLOCK_M = max(min(2048 // num_edges, self.block_size), 1)
         B_NUM_BLOCKS = triton.cdiv(batch_size, BLOCK_B)
         K_NUM_BLOCKS = triton.cdiv(num_edges, BLOCK_K)
 
@@ -2978,7 +2980,7 @@ class SumLayer(Layer, nn.Module):
                 batch_size = batch_size,
                 allow_modify_flows = allow_modify_flows,
                 logspace_flows = logspace_flows,
-                BLOCK_M = BLOCK_M,
+                BLOCK_SIZE_M = self.block_size,
                 BLOCK_K = BLOCK_K,
                 BLOCK_B = BLOCK_B,
                 TILE_SIZE_B = TILE_SIZE_B,
@@ -3010,7 +3012,7 @@ class SumLayer(Layer, nn.Module):
                     batch_size = batch_size,
                     allow_modify_flows = allow_modify_flows,
                     logspace_flows = logspace_flows,
-                    BLOCK_M = BLOCK_M,
+                    BLOCK_SIZE_M = self.block_size,
                     BLOCK_K = BLOCK_K,
                     BLOCK_B = BLOCK_B,
                     TILE_SIZE_B = TILE_SIZE_B,

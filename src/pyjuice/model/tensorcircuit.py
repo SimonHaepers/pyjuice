@@ -667,7 +667,8 @@ class TensorCircuit(nn.Module):
             if not _inner_layers_only:
                 for idx, layer in enumerate(self.input_layer_group):
                     if input_layer_fn is None:
-                        layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                        layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows,
+                                       compute_param_flows = compute_param_flows, **kwargs)
 
                     elif isinstance(input_layer_fn, str):
                         assert hasattr(layer, input_layer_fn), f"Custom input function `{input_layer_fn}` not found for layer type {type(layer)}."
@@ -678,7 +679,8 @@ class TensorCircuit(nn.Module):
 
                         # If the layer is not handled by `input_layer_fn`, we assume it will return `False`
                         if not ret and ret is not None:
-                            layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows, **kwargs)
+                            layer.backward(inputs, self.node_flows, self.node_mars, logspace_flows = logspace_flows,
+                                           compute_param_flows = compute_param_flows, **kwargs)
 
                     else:
                         raise ValueError(f"Custom input function should be either a `str` or a `Callable`. Found {type(input_layer_fn)} instead.")

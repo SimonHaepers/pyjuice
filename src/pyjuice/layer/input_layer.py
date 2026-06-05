@@ -426,14 +426,23 @@ class InputLayer(Layer, nn.Module):
         else:
             raise NotImplementedError("CPU forward fn for input nodes is not implemented.")
 
-    def backward(self, data: torch.Tensor, node_flows: torch.Tensor, 
+    def backward(self, data: torch.Tensor, node_flows: torch.Tensor,
                  node_mars: torch.Tensor, params: Optional[Dict] = None,
-                 logspace_flows: bool = False, missing_mask: Optional[torch.Tensor] = None, 
-                 _batch_first: bool = True, **kwargs):
+                 logspace_flows: bool = False, missing_mask: Optional[torch.Tensor] = None,
+                 _batch_first: bool = True, compute_param_flows: bool = True, **kwargs):
         """
         data: [num_vars, B]
         node_flows: [num_nodes, B]
         node_mars: [num_nodes, B]
+
+        ``compute_param_flows``: when ``False`` the parameter-flow kernels are
+        skipped. The standard input-layer flow kernels (``bk_flow_fn`` /
+        ``bk_flow_mask_fn`` and ``post_bp_fns``) accumulate *only* into
+        ``param_flows``; with ``compute_param_flows=False`` ``self.param_flows``
+        is ``None`` (never allocated by :meth:`TensorCircuit.init_param_flows`),
+        so launching them would dereference a null pointer. Custom backward
+        distributions (e.g. ``SparseCategorical``) still run — they handle
+        ``param_flows is None`` internally and produce their element flows.
         """
 
         if params is None:
@@ -490,7 +499,7 @@ class InputLayer(Layer, nn.Module):
 
             grid = (triton.cdiv(layer_num_nodes * batch_size, BLOCK_SIZE),)
 
-            if not self._has_custom_backward and self._flows_kernel is not None:
+            if not self._has_custom_backward and self._flows_kernel is not None and compute_param_flows:
                 self._flows_kernel[grid](
                     params_ptr = self.params,
                     param_flows_ptr = self.param_flows,
@@ -519,8 +528,10 @@ class InputLayer(Layer, nn.Module):
                     num_warps = 8
                 )
 
-            # Apply post-processing kernels
+            # Apply post-processing kernels (parameter-flow accumulation only)
             for (kernel, cond_fn, prep_kwargs_fn) in self.post_bp_fns:
+                if not compute_param_flows:
+                    continue
                 if not cond_fn(self, kwargs):
                     continue
 
@@ -555,8 +566,8 @@ class InputLayer(Layer, nn.Module):
                     **target_kwargs
                 )
 
-            # Handle the masked input nodes
-            if missing_mask is not None and self.bk_flow_mask_fn is not None:
+            # Handle the masked input nodes (parameter-flow accumulation only)
+            if missing_mask is not None and self.bk_flow_mask_fn is not None and compute_param_flows:
                 if not self.provided("_flows_mask_kernel"):
                     self._flows_mask_kernel = self._compile_triton_kernel(self._flows_kernel_template, flow_fn = self.bk_flow_mask_fn)
 
