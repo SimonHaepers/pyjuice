@@ -37,10 +37,21 @@ from pyjuice.nodes import (
 from pyjuice.layer import SparseIOBlockDiagonalSumLayer
 
 
-# Reuse the same CSC pattern + builders the correctness test uses so the
-# perf result reflects code paths exercised by the parity gate.
+# Allow running this file directly (``python tests/layer/sparse_io_bd_training_perf_test.py``):
+# put the repo root on ``sys.path`` so the absolute ``tests.*`` imports resolve
+# (under pytest the rootdir is already on the path).
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
+# Reuse the same builders the correctness test uses so the perf result
+# reflects code paths exercised by the parity gate; the CSC generator comes
+# from the shared perf helper (identical to the correctness test's copy).
 from tests.queries.sparse_io_block_diagonal_param_flow_test import (
-    _random_csc_pattern, _build_plain_bd, _build_sparse_io_bd_chain,
+    _build_plain_bd, _build_sparse_io_bd_chain,
+)
+from tests.layer._sparse_io_perf_helpers import (
+    random_csc_pattern as _random_csc_pattern,
 )
 
 
