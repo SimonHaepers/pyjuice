@@ -20,8 +20,7 @@ balloon CPU memory.
 
 Backward is run with ``compute_param_flows=False, _inner_layers_only=True``
 so the timed region is the prod / sum kernels (and the BD layer's own
-backward), not the input-layer param-flow accumulation. Mirrors the
-:mod:`topk_hmm_perf_test` policy for direct comparability.
+backward), not the input-layer param-flow accumulation.
 
 NVTX ranges (visible in ``nsys-ui``):
   * ``build/dense``, ``build/monarch`` — DAG construction + compile

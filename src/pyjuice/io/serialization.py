@@ -40,13 +40,6 @@ def serialize_nodes(root_ns: CircuitNodes):
             ns_info["scope"] = ns.scope.to_list()
             ns_info["dist"] = pickle.dumps(ns.dist)
 
-        # Persist the TopK opt-in (set by ``summate(topk=K)``). Skipped if
-        # the user didn't annotate; loaded back through the matching
-        # ``summate`` kwarg so the dispatch routes the deserialised circuit
-        # through the TopK fast path the same way.
-        if ns.is_sum() and getattr(ns, "_topk_k", None) is not None:
-            ns_info["topk_k"] = int(ns._topk_k)
-
         ns2id[ns] = len(nodes_list)
         nodes_list.append(ns_info)
 
@@ -109,8 +102,7 @@ def deserialize_nodes(nodes_list: Sequence):
             else:
                 params = None
 
-            ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size,
-                         topk = ns_info.get("topk_k", None))
+            ns = summate(*chs, edge_ids = edge_ids, params = params, block_size = block_size)
 
             if "zero_param_mask" in ns_info:
                 zero_param_mask = torch.from_numpy(ns_info["zero_param_mask"])

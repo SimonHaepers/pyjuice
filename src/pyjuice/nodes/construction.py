@@ -129,7 +129,6 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
 def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int = 0,
             edge_ids: Optional[Tensor] = None, block_size: int = 0,
             sum_edge_ids_constructor: Optional[Callable] = None,
-            topk: Optional[int] = None,
             _force_plain: bool = False, **kwargs) -> SumNodes:
     """
     Construct a vector of sum nodes given a list of children PCs defined on the same sets of variables.
@@ -207,16 +206,6 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
         # param-flow accumulation through the sums (the sparse sum layer is
         # inference-only).
         ns._force_plain_layer = True
-    if topk is not None:
-        # Opt-in TopK approximation: at compile time the dispatch in
-        # ``TensorCircuit._init_layers`` reads ``_topk_k`` to route this sum
-        # node through the ``TopKLayer`` + ``TopKSumLayer`` fast path. ``K``
-        # must be a positive integer; the dispatch transparently falls back to
-        # the plain ``SumLayer`` when ``K >= total_ch_blocks * ch_block_size``.
-        assert isinstance(topk, int) and topk >= 1, (
-            "`topk` must be a positive int."
-        )
-        ns._topk_k = int(topk)
     return ns
 
 

@@ -155,15 +155,6 @@ class SumNodes(CircuitNodes):
         # out of the sparse fast path, so should the duplicate.
         if getattr(self, "_force_plain_layer", False):
             ns._force_plain_layer = True
-        # Propagate the ``_topk_k`` annotation. Critical for tied HMM chains:
-        # every timestep's duplicate must inherit ``topk=K`` so the dispatch
-        # in ``TensorCircuit._init_layers`` keys all timesteps to the same
-        # mode — otherwise mode-key fragmentation in ``gsize2sum_nodes``
-        # would split the chain across ``TopKSumLayer`` and plain ``SumLayer``
-        # groups and break ``LayerGroup`` type homogeneity.
-        topk_k = getattr(self, "_topk_k", None)
-        if topk_k is not None:
-            ns._topk_k = topk_k
         return ns
 
     def get_params(self, as_matrix: bool = False):

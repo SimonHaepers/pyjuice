@@ -60,7 +60,7 @@ class BlockDiagonalSumLayer(SumLayer):
 
         # Bypass ``SumLayer.__init__`` — we replace its block-sparse
         # bookkeeping with the direct-layout metadata below (same pattern
-        # as ``DenseSumLayer`` / ``TopKSumLayer``).
+        # as ``DenseSumLayer``).
         Layer.__init__(self, nodes)
         nn.Module.__init__(self)
 
@@ -198,7 +198,7 @@ class BlockDiagonalSumLayer(SumLayer):
 
         # Stub out the block-sparse bookkeeping that some parent
         # introspection paths read — mirrors the same stubs in
-        # ``TopKSumLayer`` / ``DenseSumLayer``.
+        # ``DenseSumLayer``.
         self.num_fw_partitions = 0
         self.num_bk_partitions = 0
         self.partitioned_nids = FastParamList([])

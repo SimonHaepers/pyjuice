@@ -11,6 +11,4 @@ from .block_diagonal_sum_layer import BlockDiagonalSumLayer
 from .sparse_input_sum_layer import SparseInputSumLayer
 from .sparse_io_sum_layer import SparseIOSumLayer
 from .sparse_io_block_diagonal_sum_layer import SparseIOBlockDiagonalSumLayer
-from .topk_layer import TopKLayer
-from .topk_sum_layer import TopKSumLayer
 from .layer_group import LayerGroup
