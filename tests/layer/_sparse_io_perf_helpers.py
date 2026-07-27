@@ -45,7 +45,7 @@ def random_csc_pattern(H: int, V: int, density: float, seed: int):
     return csc_indptr, csc_indices, csc_values
 
 
-def time_phase(pc, data, phase, n_warmup, n_iter):
+def time_phase(pc, data, phase, n_warmup, n_iter, per_sample_loop=False):
     """Mean wall-clock (ms) of one backward/forward phase over ``n_iter`` runs.
 
     ``phase`` is one of:
@@ -56,33 +56,49 @@ def time_phase(pc, data, phase, n_warmup, n_iter):
 
     A forward pass precedes every backward (flows need fresh ``node_mars``).
     Timing uses CUDA events and synchronises around each measured region.
+
+    ``per_sample_loop=True`` times the python-loop baseline instead: the
+    phase runs sample by sample over ``data[b:b+1]``. For the backward
+    phases each sample's backward is preceded by its own forward *inside*
+    the timed region — a real B=1 training loop cannot amortise that
+    re-forward, so it is part of what the loop workflow pays.
     """
-    def _run():
+    def _op(d):
         if phase == "fwd":
-            pc(data)
+            pc(d)
         elif phase == "bwd_ele":
-            pc.backward(data, compute_param_flows=False, flows_memory=0.0,
+            pc.backward(d, compute_param_flows=False, flows_memory=0.0,
                         allow_modify_flows=False)
         elif phase == "bwd_pflow":
-            pc.backward(data, compute_param_flows=True, flows_memory=0.0,
+            pc.backward(d, compute_param_flows=True, flows_memory=0.0,
                         allow_modify_flows=False)
         else:
             raise ValueError(f"unknown phase {phase!r}")
 
-    if phase != "fwd":
-        pc(data)
+    def _run():
+        if per_sample_loop:
+            for b in range(data.size(0)):
+                d = data[b:b + 1]
+                if phase != "fwd":
+                    pc(d)
+                _op(d)
+        else:
+            _op(data)
 
-    for _ in range(n_warmup):
-        if phase != "fwd":
+    def _prep():
+        if not per_sample_loop and phase != "fwd":
             pc(data)
+
+    _prep()
+    for _ in range(n_warmup):
+        _prep()
         _run()
     torch.cuda.synchronize()
 
     evs = [(torch.cuda.Event(enable_timing=True),
             torch.cuda.Event(enable_timing=True)) for _ in range(n_iter)]
     for i in range(n_iter):
-        if phase != "fwd":
-            pc(data)
+        _prep()
         torch.cuda.synchronize()
         evs[i][0].record()
         _run()

@@ -12,44 +12,89 @@ from .sparse_node_values import SparseNodeValues
 from .layer_group import LayerGroup
 
 
-@triton.jit
+_CO_BATCHED_BLOCK_K = 64
+_CO_BATCHED_BLOCK_B = 8
+"""[BLOCK_B, BLOCK_K] tile shape for the batched (B>1) variant of
+:func:`_co_sparse_log_add_kernel`. Pure element-wise gathers — the shape
+only trades program count against register pressure."""
+
+
+@triton.jit(
+    do_not_specialize=["param_offset", "n", "batch_size", "in_stride",
+                       "out_stride"],
+)
 def _co_sparse_log_add_kernel(
     out_ptr, params_ptr, dense_values_ptr, max_out_ptr,
+    col_starts_ptr, nnz_ptr,
     param_offset, n,
+    batch_size, in_stride, out_stride,
     BLOCK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
     IS_MISSING: tl.constexpr,
+    IS_BATCHED: tl.constexpr,
 ):
-    """Fused ``out[i] = log(params[param_offset + i]) + dense_values[i]`` and
-    ``max_out[0] = max(out[:])`` via per-tile atomic-max.
+    """Fused ``out[b, j] = log(params[param_offset + col_starts[b] + j]) +
+    dense_values[b, j]`` and per-sample ``max_out[b] = max_j out[b, j]`` via
+    per-tile atomic-max. Grid ``(cdiv(K, BLOCK), cdiv(B, BLOCK_B))``;
+    degenerates to the 1-D ``(cdiv(n, BLOCK), 1)`` form at B=1
+    (``IS_BATCHED == 0``, where ``param_offset`` already folds in the
+    column's ``col_start`` and both value tensors are flat ``[n]``).
 
     Replaces the three-kernel ``torch.log(emit_params) + sv_dense.values``
     + ``sv.values.copy_(...)`` chain that otherwise launches one tiny
     element-wise kernel each (and allocates two intermediate temps) per
     timestep on the sparse HMM path. The atomic-max additionally elides the
-    per-block ``sv.values.max()`` dispatch in
-    :meth:`SparseInputSumLayer.forward` — the values are already in registers
-    here, and ``max_out`` is pre-initialized to ``-inf`` by the launcher so
-    masked-out lanes contribute nothing.
+    per-block ``sv.values.max()`` dispatch in the downstream sum layers —
+    the values are already in registers here, and ``max_out`` is
+    pre-initialized to ``-inf`` by the launcher so masked-out lanes
+    contribute nothing.
 
-    When ``IS_MISSING`` is set, this position is being marginalised: the
-    emission contribution is ``log(Σ_v P(v|h)) = log(1) = 0`` for every
-    latent, so the kernel skips the ``params`` load and copies
+    When ``IS_MISSING`` is set (B=1 only), this position is being
+    marginalised: the emission contribution is ``log(Σ_v P(v|h)) = log(1) =
+    0`` for every latent, so the kernel skips the ``params`` load and copies
     ``dense_values`` straight through.
     """
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    d = tl.load(dense_values_ptr + offs, mask=mask, other=0.0)
-    if IS_MISSING:
-        out = d
-    else:
-        p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
-        out = tl.log(p) + d
-    tl.store(out_ptr + offs, out, mask=mask)
 
-    tile_val = tl.where(mask, out, -float("inf"))
-    local_max = tl.max(tile_val, axis=0)
-    tl.atomic_max(max_out_ptr, local_max)
+    if IS_BATCHED:
+        pid_b = tl.program_id(1)
+        offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_b = offs_b < batch_size
+        cs_b = tl.load(col_starts_ptr + offs_b, mask=mask_b, other=0)
+        k_b = tl.load(nnz_ptr + offs_b, mask=mask_b, other=0)
+        mask = mask_b[:, None] & (offs[None, :] < k_b[:, None])
+
+        d = tl.load(
+            dense_values_ptr + offs_b[:, None] * in_stride + offs[None, :],
+            mask=mask, other=0.0,
+        )
+        p = tl.load(
+            params_ptr + param_offset + cs_b[:, None] + offs[None, :],
+            mask=mask, other=1.0,
+        )
+        out = tl.log(p) + d
+        tl.store(
+            out_ptr + offs_b[:, None] * out_stride + offs[None, :],
+            out, mask=mask,
+        )
+
+        tile_val = tl.where(mask, out, -float("inf"))
+        local_max = tl.max(tile_val, axis=1)
+        tl.atomic_max(max_out_ptr + offs_b, local_max, mask=mask_b)
+    else:
+        mask = offs < n
+        d = tl.load(dense_values_ptr + offs, mask=mask, other=0.0)
+        if IS_MISSING:
+            out = d
+        else:
+            p = tl.load(params_ptr + param_offset + offs, mask=mask, other=1.0)
+            out = tl.log(p) + d
+        tl.store(out_ptr + offs, out, mask=mask)
+
+        tile_val = tl.where(mask, out, -float("inf"))
+        local_max = tl.max(tile_val, axis=0)
+        tl.atomic_max(max_out_ptr, local_max)
 
 
 class CoSparseProdLayer(SparseProdLayer):
@@ -141,18 +186,10 @@ class CoSparseProdLayer(SparseProdLayer):
         # eligibility check.
         self._skip_scatter = True
 
-        # Per-ns GPU workspace for the forward sv.values buffer. Sized to
-        # ``dist._max_nnz_per_col`` and re-used every call so the per-step
-        # ``cudaMalloc`` in ``build_sparse_pattern`` becomes a free slice.
-        # Allocated lazily on first forward (device unknown at __init__).
-        self._fwd_values_workspaces: List[Optional[torch.Tensor]] = \
-            [None] * len(self.nodes)
-
-        # Single per-layer scalar workspace holding one f32 slot per ns —
-        # populated inline by the fused log+add+max kernel and read by the
-        # downstream SparseInputSumLayer in place of ``sv.values.max()``.
-        # Allocated lazily on first forward; reset to ``-inf`` once per call.
-        self._fwd_max_workspace: Optional[torch.Tensor] = None
+        # ``_fwd_values_workspaces`` / ``_fwd_max_workspace`` are created by
+        # ``SparseProdLayer.__init__`` (shared per-ns values workspaces + the
+        # ``[len(nodes), B]`` per-sample max buffer filled by the fused
+        # log+add+max kernel).
 
     def __repr__(self) -> str:
         return (
@@ -167,6 +204,7 @@ class CoSparseProdLayer(SparseProdLayer):
                 _for_backward: bool = False, data: Optional[torch.Tensor] = None,
                 data_cpu: Optional[torch.Tensor] = None,
                 data_list: Optional[list] = None,
+                pattern_cache: Optional[dict] = None,
                 missing_mask: Optional[torch.Tensor] = None,
                 **kwargs) -> None:
         assert data is not None, (
@@ -176,7 +214,10 @@ class CoSparseProdLayer(SparseProdLayer):
             "CoSparseProdLayer does not support partial evaluation."
 
         batch_size = element_mars.size(1)
-        assert batch_size == 1, "CoSparseProdLayer is B=1 only."
+        assert missing_mask is None or batch_size == 1, (
+            "missing_mask on the sparse fast path is only supported at "
+            "batch_size == 1 (conditional queries stay B=1 for now)."
+        )
 
         data_for_pattern = data_cpu if data_cpu is not None else data
 
@@ -196,18 +237,21 @@ class CoSparseProdLayer(SparseProdLayer):
                 else:
                     raise AssertionError(
                         "CoSparseProdLayer.forward got a 2D missing_mask with "
-                        "neither dim == 1; sparse path is B=1 only."
+                        "neither dim == 1; missing_mask on the sparse path "
+                        "is B=1 only."
                     )
             missing_mask_cpu = mm.cpu() if mm.device.type != "cpu" else mm
 
         if (self._fwd_max_workspace is None
-                or self._fwd_max_workspace.device != node_mars.device):
+                or self._fwd_max_workspace.device != node_mars.device
+                or self._fwd_max_workspace.shape != (len(self.nodes), batch_size)):
             self._fwd_max_workspace = torch.empty(
-                len(self.nodes), dtype=torch.float32, device=node_mars.device,
+                len(self.nodes), batch_size,
+                dtype=torch.float32, device=node_mars.device,
             )
         # One memset per forward replaces N per-block ``sv.values.max()``
-        # dispatches; empty-column ns'es leave their slot at -inf, which the
-        # sum layer never reads (it short-circuits on total_nnz == 0).
+        # dispatches; empty-column (ns, sample) slots stay at -inf, which the
+        # sum layer never reads (it short-circuits / masks on nnz == 0).
         self._fwd_max_workspace.fill_(float("-inf"))
 
         for ns_idx, ns in enumerate(self.nodes):
@@ -235,7 +279,7 @@ class CoSparseProdLayer(SparseProdLayer):
                     col_start=0, total_nnz=H,
                     indices=indices, values=values, num_rows=H,
                 )
-                sv.max_val = self._fwd_max_workspace[ns_idx:ns_idx + 1]
+                sv.max_val = self._fwd_max_workspace[ns_idx]
                 self._sparse_outputs[ns_idx] = sv
 
                 sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
@@ -249,24 +293,30 @@ class CoSparseProdLayer(SparseProdLayer):
                 )
 
                 BLOCK = 256
-                grid = (triton.cdiv(H, BLOCK),)
+                grid = (triton.cdiv(H, BLOCK), 1)
                 _co_sparse_log_add_kernel[grid](
                     out_ptr=sv.values,
                     params_ptr=sparse_input_layer.params,
                     dense_values_ptr=sv_dense.values,
                     max_out_ptr=sv.max_val,
+                    col_starts_ptr=sv.values, nnz_ptr=sv.values,  # unused at B=1
                     param_offset=0,
                     n=H,
+                    batch_size=1, in_stride=0, out_stride=0,
                     BLOCK=BLOCK,
+                    BLOCK_B=1,
                     IS_MISSING=True,
+                    IS_BATCHED=False,
                 )
                 continue
 
             ws = self._fwd_values_workspaces[ns_idx]
-            if ws is None or ws.device != node_mars.device:
+            needed = (batch_size * sparse_cs.dist._max_nnz_per_col
+                      if batch_size > 1
+                      else max(sparse_cs.dist._max_nnz_per_col, H))
+            if ws is None or ws.device != node_mars.device or ws.numel() < needed:
                 ws = torch.empty(
-                    max(sparse_cs.dist._max_nnz_per_col, H),
-                    dtype=torch.float32, device=node_mars.device,
+                    needed, dtype=torch.float32, device=node_mars.device,
                 )
                 self._fwd_values_workspaces[ns_idx] = ws
 
@@ -274,8 +324,9 @@ class CoSparseProdLayer(SparseProdLayer):
                 data=data_for_pattern, var_id=ns.var_id,
                 num_rows=ns.num_nodes, device=node_mars.device,
                 values_out=ws, data_list=data_list,
+                pattern_cache=pattern_cache,
             )
-            sv.max_val = self._fwd_max_workspace[ns_idx:ns_idx + 1]
+            sv.max_val = self._fwd_max_workspace[ns_idx]
             self._sparse_outputs[ns_idx] = sv
 
             if sv.total_nnz == 0:
@@ -285,32 +336,73 @@ class CoSparseProdLayer(SparseProdLayer):
             sv_dense = sum_layer._sparse_outputs[sum_ns_idx]
 
             # Invariant: indices coincide (both built from
-            # ``build_sparse_pattern(var_id=ns.var_id)`` — views of the same
-            # slice of ``dist._csc_indices``). total_nnz + col_start equality
-            # certifies the views alias the same memory.
-            assert sv_dense.col_start == sv.col_start \
-                   and sv_dense.total_nnz == sv.total_nnz, (
-                "CoSparseProdLayer: dense sum output sparsity does not match "
-                "this prod's sparse input sparsity. Expected identical views "
-                "of dist._csc_indices (same var_id)."
-            )
+            # ``build_sparse_pattern(var_id=ns.var_id)``, i.e. the same
+            # (dist, var) pattern). At B=1, total_nnz + col_start equality
+            # certifies the views alias the same memory; at B>1 the shared
+            # per-query pattern_cache yields identical col_starts tensors
+            # (fall back to the host nnz_list comparison for direct-layer
+            # callers that built the two patterns without a shared cache).
+            if sv.is_batched:
+                assert sv_dense.is_batched and (
+                    sv_dense.col_starts is sv.col_starts
+                    or sv_dense.nnz_list == sv.nnz_list
+                ), (
+                    "CoSparseProdLayer: batched dense sum output sparsity "
+                    "does not match this prod's sparse input sparsity "
+                    "(expected the same (dist, var) pattern, ideally via a "
+                    "shared pattern_cache)."
+                )
+            else:
+                assert sv_dense.col_start == sv.col_start \
+                       and sv_dense.total_nnz == sv.total_nnz, (
+                    "CoSparseProdLayer: dense sum output sparsity does not "
+                    "match this prod's sparse input sparsity. Expected "
+                    "identical views of dist._csc_indices (same var_id)."
+                )
 
             # Emission params live flat-packed in sparse_input_layer.params,
             # indexed by ``_param_range[0] + col_start + j`` for slot j — same
-            # addressing as ``_sparse_prod_forward_kernel``.
-            param_base = sparse_cs._param_range[0] + sv.col_start
-            BLOCK = 256
-            grid = (triton.cdiv(sv.total_nnz, BLOCK),)
-            _co_sparse_log_add_kernel[grid](
-                out_ptr=sv.values,
-                params_ptr=sparse_input_layer.params,
-                dense_values_ptr=sv_dense.values,
-                max_out_ptr=sv.max_val,
-                param_offset=param_base,
-                n=sv.total_nnz,
-                BLOCK=BLOCK,
-                IS_MISSING=False,
-            )
+            # addressing as ``_sparse_prod_forward_kernel``. At B>1 the
+            # per-sample col_start moves into the kernel.
+            if sv.is_batched:
+                BLOCK = _CO_BATCHED_BLOCK_K
+                BLOCK_B = _CO_BATCHED_BLOCK_B
+                grid = (triton.cdiv(sv.total_nnz, BLOCK),
+                        triton.cdiv(batch_size, BLOCK_B))
+                _co_sparse_log_add_kernel[grid](
+                    out_ptr=sv.values,
+                    params_ptr=sparse_input_layer.params,
+                    dense_values_ptr=sv_dense.values,
+                    max_out_ptr=sv.max_val,
+                    col_starts_ptr=sv.col_starts, nnz_ptr=sv.nnz,
+                    param_offset=sparse_cs._param_range[0],
+                    n=sv.total_nnz,
+                    batch_size=batch_size,
+                    in_stride=sv_dense.values.stride(0),
+                    out_stride=sv.values.stride(0),
+                    BLOCK=BLOCK,
+                    BLOCK_B=BLOCK_B,
+                    IS_MISSING=False,
+                    IS_BATCHED=True,
+                )
+            else:
+                param_base = sparse_cs._param_range[0] + sv.col_start
+                BLOCK = 256
+                grid = (triton.cdiv(sv.total_nnz, BLOCK), 1)
+                _co_sparse_log_add_kernel[grid](
+                    out_ptr=sv.values,
+                    params_ptr=sparse_input_layer.params,
+                    dense_values_ptr=sv_dense.values,
+                    max_out_ptr=sv.max_val,
+                    col_starts_ptr=sv.values, nnz_ptr=sv.values,  # unused at B=1
+                    param_offset=param_base,
+                    n=sv.total_nnz,
+                    batch_size=1, in_stride=0, out_stride=0,
+                    BLOCK=BLOCK,
+                    BLOCK_B=1,
+                    IS_MISSING=False,
+                    IS_BATCHED=False,
+                )
         return None
 
     # ---------------- Backward ---------------- #

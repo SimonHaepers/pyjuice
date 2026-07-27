@@ -114,8 +114,11 @@ def _build_sparse_chain(T: int, H: int, V: int, bs: int,
         return sparse_summate(curr_zs, num_node_blocks=1, block_size=1)
 
 
-@pytest.mark.parametrize("T,H,V,bs", [(3, 8, 4, 4), (5, 16, 8, 8), (6, 16, 12, 4)])
-def test_sparse_io_chain_matches_plain(T, H, V, bs):
+@pytest.mark.parametrize("T,H,V,bs,B", [
+    (3, 8, 4, 4, 1), (5, 16, 8, 8, 1), (6, 16, 12, 4, 1),
+    (3, 8, 4, 4, 4), (5, 16, 8, 8, 7), (6, 16, 12, 4, 16),
+])
+def test_sparse_io_chain_matches_plain(T, H, V, bs, B):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device("cuda:0")
@@ -168,19 +171,50 @@ def test_sparse_io_chain_matches_plain(T, H, V, bs):
         "root sum layer should stay as dense-output SparseInputSumLayer"
     )
 
-    # B=1 forward comparison — exercise the chain on a handful of token seqs.
+    # Forward comparison — exercise the chain on a handful of token batches
+    # (B=1 keeps the classic single-column path; B>1 runs the batched chain).
     for seed in (0, 1, 2, 3):
         torch.manual_seed(seed)
-        data = torch.randint(0, V, (1, T), device=device)
+        data = torch.randint(0, V, (B, T), device=device)
         lls_plain = pc_plain(data)
         lls_sparse = pc_sparse(data)
         torch.testing.assert_close(lls_sparse, lls_plain, rtol=1e-4, atol=1e-5)
 
 
-@pytest.mark.parametrize("T,H,V,bs", [(4, 8, 4, 4), (6, 16, 8, 8)])
-def test_sparse_io_chain_backward_matches_plain(T, H, V, bs):
+@pytest.mark.parametrize("T,H,V,bs,B", [(5, 16, 8, 8, 6), (6, 16, 12, 4, 3)])
+def test_sparse_io_chain_batched_matches_loop(T, H, V, bs, B):
+    """Batched sparse forward == concatenation of per-sample B=1 calls
+    (tight tolerance — catches cross-sample leakage without needing the
+    plain reference build)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda:0")
+
+    csc_indptr, csc_indices, csc_values = _random_csc_pattern(
+        H=H, V=V, density=0.6, seed=23,
+    )
+    torch.manual_seed(7)
+    root_sparse = _build_sparse_chain(
+        T, H, V, bs, csc_indptr, csc_indices, csc_values,
+    )
+    pc_sparse = juice.TensorCircuit(root_sparse, verbose=False).to(device)
+
+    torch.manual_seed(11)
+    data = torch.randint(0, V, (B, T), device=device)
+    lls = pc_sparse(data)
+    lls_loop = torch.cat([pc_sparse(data[b:b + 1]) for b in range(B)], dim=0)
+    torch.testing.assert_close(lls, lls_loop, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("allow_modify_flows", [False, True])
+@pytest.mark.parametrize("T,H,V,bs,B", [
+    (4, 8, 4, 4, 1), (6, 16, 8, 8, 1),
+    (4, 8, 4, 4, 5), (6, 16, 8, 8, 8),
+])
+def test_sparse_io_chain_backward_matches_plain(T, H, V, bs, B, allow_modify_flows):
     """``pc.backward()`` should drive the same root LL gradient through both
-    paths, so ``pc.node_flows`` at the root range matches bit-for-bit."""
+    paths, so the sparse flow containers match the plain ``pc.node_flows``
+    at the active rows, per sample."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device("cuda:0")
@@ -201,21 +235,23 @@ def test_sparse_io_chain_backward_matches_plain(T, H, V, bs):
     pc_sparse.params.data.copy_(pc_plain.params.data)
 
     torch.manual_seed(0)
-    data = torch.randint(0, V, (1, T), device=device)
+    data = torch.randint(0, V, (B, T), device=device)
 
     lls_plain = pc_plain(data)
     lls_sparse = pc_sparse(data)
     torch.testing.assert_close(lls_sparse, lls_plain, rtol=1e-4, atol=1e-5)
 
-    pc_plain.backward(data, compute_param_flows=False, flows_memory=0.0)
-    pc_sparse.backward(data, compute_param_flows=False, flows_memory=0.0)
+    pc_plain.backward(data, compute_param_flows=False, flows_memory=0.0,
+                      allow_modify_flows=allow_modify_flows)
+    pc_sparse.backward(data, compute_param_flows=False, flows_memory=0.0,
+                       allow_modify_flows=allow_modify_flows)
 
     # Sparse chain leaves ``pc.node_flows`` untouched at SparseCategorical
     # input rows — flow lives in the layer's ``_sparse_flows[ns_idx]`` slot,
     # reachable from the input ns via ``_sparse_flow_owner``. Compare those
     # values to the plain path's dense ``node_flows`` at exactly the active
-    # CSC rows (inactive rows on the plain path are LOG_EPS-tiny and absent
-    # from the sparse container by construction).
+    # CSC rows, per sample (inactive rows on the plain path are LOG_EPS-tiny
+    # and absent from the sparse container by construction).
     for in_ns_plain, in_ns_sparse in zip(
         pc_plain.input_layer_group[0].nodes, pc_sparse.input_layer_group[0].nodes,
     ):
@@ -230,12 +266,26 @@ def test_sparse_io_chain_backward_matches_plain(T, H, V, bs):
         assert sv_flow is not None, (
             "expected backward to leave sv_flow populated post-call"
         )
-        active = sv_flow.indices.cpu()
-        torch.testing.assert_close(
-            sv_flow.values.cpu(),
-            pc_plain.node_flows[lo_p + active, 0].cpu(),
-            rtol=1e-3, atol=1e-5,
-        )
+        if sv_flow.is_batched:
+            col_starts_cpu = sv_flow.col_starts.cpu().tolist()
+            for b in range(B):
+                k_b = sv_flow.nnz_list[b]
+                if k_b == 0:
+                    continue
+                active_b = sv_flow.indices[
+                    col_starts_cpu[b]:col_starts_cpu[b] + k_b].cpu()
+                torch.testing.assert_close(
+                    sv_flow.values[b, :k_b].cpu(),
+                    pc_plain.node_flows[lo_p + active_b, b].cpu(),
+                    rtol=1e-3, atol=1e-5,
+                )
+        else:
+            active = sv_flow.indices.cpu()
+            torch.testing.assert_close(
+                sv_flow.values.cpu(),
+                pc_plain.node_flows[lo_p + active, 0].cpu(),
+                rtol=1e-3, atol=1e-5,
+            )
 
 
 @pytest.mark.parametrize("T,H,V,bs", [(4, 8, 4, 4), (5, 16, 8, 8)])
@@ -273,13 +323,40 @@ def test_sparse_io_chain_conditional_matches_plain(T, H, V, bs):
     torch.testing.assert_close(out_sparse, out_plain, rtol=1e-3, atol=1e-4)
 
 
+def test_sparse_io_chain_conditional_b_gt_1_rejected():
+    """Conditional queries on the sparse chain stay B=1-only: the sparse-flow
+    conditional backward asserts batch_size == 1, and the batched training
+    path must not silently change that."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    import pyjuice.queries as queries
+    device = torch.device("cuda:0")
+
+    T, H, V, bs = 4, 8, 4, 4
+    csc_indptr, csc_indices, csc_values = _random_csc_pattern(
+        H=H, V=V, density=0.5, seed=29,
+    )
+    torch.manual_seed(11)
+    root_sparse = _build_sparse_chain(
+        T, H, V, bs, csc_indptr, csc_indices, csc_values,
+    )
+    pc_sparse = juice.TensorCircuit(root_sparse, verbose=False).to(device)
+
+    torch.manual_seed(0)
+    data = torch.randint(0, V, (3, T), device=device)
+    with pytest.raises(AssertionError, match="batch_size == 1"):
+        queries.conditional(pc_sparse, data=data, target_vars=list(range(T)))
+
+
 if __name__ == "__main__":
-    for params in [(3, 8, 4, 4), (5, 16, 8, 8), (6, 16, 12, 4)]:
+    for params in [(3, 8, 4, 4, 1), (5, 16, 8, 8, 7)]:
         test_sparse_io_chain_matches_plain(*params)
         print(f"ok forward: {params}")
-    for params in [(4, 8, 4, 4), (6, 16, 8, 8)]:
-        test_sparse_io_chain_backward_matches_plain(*params)
+    for params in [(4, 8, 4, 4, 1), (6, 16, 8, 8, 8)]:
+        test_sparse_io_chain_backward_matches_plain(*params, allow_modify_flows=True)
         print(f"ok backward: {params}")
     for params in [(4, 8, 4, 4), (5, 16, 8, 8)]:
         test_sparse_io_chain_conditional_matches_plain(*params)
         print(f"ok conditional: {params}")
+    test_sparse_io_chain_conditional_b_gt_1_rejected()
+    print("ok conditional B>1 rejected")

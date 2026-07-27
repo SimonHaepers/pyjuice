@@ -146,12 +146,21 @@ def _has_sparse_io_sum(pc: juice.TensorCircuit) -> bool:
 # ---------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("T,H,V,bs,density", [
-    (4, 8, 4, 4, 0.6),
-    (5, 16, 8, 8, 0.5),
-    (6, 32, 12, 8, 0.4),
+# NOTE on the B>1 rows: the PLAIN reference's general-SumLayer backward
+# writes param flows at wrong offsets for non-power-of-2 batches at bs>=8
+# shapes (pre-existing bug, present on main — canonical extraction reads
+# zeros while the raw buffer holds the mass). So plain-referenced rows use
+# B the reference handles (B=8 at bs=8; non-pow2 B=6 works at bs=4 via the
+# SPARSE-mode kernel). Non-pow2-B pflow coverage for the sparse chain lives
+# in test_param_flow_batched_matches_loop below, which needs no plain build.
+@pytest.mark.parametrize("T,H,V,bs,density,B", [
+    (4, 8, 4, 4, 0.6, 1),
+    (5, 16, 8, 8, 0.5, 1),
+    (6, 32, 12, 8, 0.4, 1),
+    (4, 8, 4, 4, 0.6, 6),
+    (5, 16, 8, 8, 0.5, 8),
 ])
-def test_param_flow_matches_plain(T, H, V, bs, density):
+def test_param_flow_matches_plain(T, H, V, bs, density, B):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     device = torch.device("cuda:0")
@@ -178,7 +187,7 @@ def test_param_flow_matches_plain(T, H, V, bs, density):
     )
 
     torch.manual_seed(0)
-    data = torch.randint(0, V, (1, T), device=device)
+    data = torch.randint(0, V, (B, T), device=device)
 
     ll_plain = pc_plain(data)
     ll_chain = pc_chain(data)
@@ -189,7 +198,8 @@ def test_param_flow_matches_plain(T, H, V, bs, density):
 
     # Canonical per-edge layout via update_param_flows; the dense baseline
     # uses plain SumLayer compile path, the chain uses DenseSumLayer path —
-    # both produce the same edge ordering for block-dense ``summate``.
+    # both produce the same edge ordering for block-dense ``summate``. At
+    # B>1 both sides accumulate the batch sum into the same flat buffer.
     ns_sum_plain.update_param_flows(pc_plain.param_flows, origin_ns_only=True)
     ns_sum_chain.update_param_flows(pc_chain.param_flows, origin_ns_only=True)
 
@@ -209,8 +219,10 @@ def test_param_flow_matches_plain(T, H, V, bs, density):
 # ---------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("T,H,V,bs", [(5, 16, 8, 8), (6, 32, 10, 8)])
-def test_param_flow_dense_csc_matches_plain(T, H, V, bs):
+@pytest.mark.parametrize("T,H,V,bs,B", [
+    (5, 16, 8, 8, 1), (6, 32, 10, 8, 1), (5, 16, 8, 8, 8),
+])
+def test_param_flow_dense_csc_matches_plain(T, H, V, bs, B):
     """Same shape as ``sparse_categorical_cond_test`` (dense CSC pattern) so
     every ``(latent, category)`` slot is active. Verifies the param-flow
     backward holds when the sparse-IO path degenerates to full coverage."""
@@ -236,7 +248,7 @@ def test_param_flow_dense_csc_matches_plain(T, H, V, bs):
     assert _has_sparse_io_sum(pc_chain)
 
     torch.manual_seed(0)
-    data = torch.randint(0, V, (1, T), device=device)
+    data = torch.randint(0, V, (B, T), device=device)
 
     ll_plain = pc_plain(data)
     ll_chain = pc_chain(data)
@@ -260,15 +272,66 @@ def test_param_flow_dense_csc_matches_plain(T, H, V, bs):
 
 
 # ---------------------------------------------------------------------- #
+# Batched-vs-loop pflow self-consistency (no plain reference needed)
+# ---------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("T,H,V,bs,density,B", [
+    (5, 16, 8, 8, 0.5, 7),
+    (6, 32, 12, 8, 0.4, 9),
+])
+def test_param_flow_batched_matches_loop(T, H, V, bs, density, B):
+    """One batched backward must accumulate the same param flows as B
+    single-sample backward calls summed on host. Covers non-power-of-2 B,
+    where the plain reference's own B>1 pflow path is broken (see note on
+    test_param_flow_matches_plain)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    device = torch.device("cuda:0")
+
+    csc_indptr, csc_indices, csc_values = _random_csc_pattern(
+        H=H, V=V, density=density, seed=59,
+    )
+
+    torch.manual_seed(202)
+    root_chain, ns_sum = _build_sparse_chain(
+        T, H, V, bs, csc_indptr, csc_indices, csc_values,
+    )
+    pc = juice.TensorCircuit(root_chain, verbose=False).to(device)
+    assert _has_sparse_io_sum(pc)
+
+    torch.manual_seed(3)
+    data = torch.randint(0, V, (B, T), device=device)
+
+    # Loop of B single-sample passes, canonical pflows summed on host.
+    pf_loop = None
+    for b in range(B):
+        pc(data[b:b + 1])
+        pc.backward(data[b:b + 1], compute_param_flows=True, flows_memory=0.0)
+        ns_sum.update_param_flows(pc.param_flows, origin_ns_only=True)
+        pf_b = ns_sum._param_flows.detach().clone()
+        pf_loop = pf_b if pf_loop is None else pf_loop + pf_b
+
+    # One batched pass.
+    pc(data)
+    pc.backward(data, compute_param_flows=True, flows_memory=0.0)
+    ns_sum.update_param_flows(pc.param_flows, origin_ns_only=True)
+    pf_batched = ns_sum._param_flows.detach()
+
+    torch.testing.assert_close(pf_batched, pf_loop, rtol=1e-4, atol=1e-5)
+
+
+# ---------------------------------------------------------------------- #
 # One EM step end-to-end
 # ---------------------------------------------------------------------- #
 
 
-@pytest.mark.parametrize("T,H,V,bs,density", [
-    (6, 16, 8, 8, 0.5),
-    (8, 32, 10, 8, 0.4),
+@pytest.mark.parametrize("T,H,V,bs,density,B", [
+    (6, 16, 8, 8, 0.5, 1),
+    (8, 32, 10, 8, 0.4, 1),
+    (6, 16, 8, 8, 0.5, 8),
 ])
-def test_em_step_matches_plain(T, H, V, bs, density):
+def test_em_step_matches_plain(T, H, V, bs, density, B):
     """Drive one full EM update and confirm both paths land on virtually
     identical params (and equivalent post-EM LLs on a held-out sequence)."""
     if not torch.cuda.is_available():
@@ -297,7 +360,7 @@ def test_em_step_matches_plain(T, H, V, bs, density):
     # would divide-by-zero in the normalizer otherwise. See the analogous
     # note in sparse_io_block_diagonal_param_flow_test.
     torch.manual_seed(5)
-    train = torch.randint(0, V, (1, T), device=device)
+    train = torch.randint(0, V, (B, T), device=device)
 
     opt_plain = juice.optim.CircuitOptimizer(
         pc_plain, base_optimizer=None, lr=1.0, pseudocount=0.01,
@@ -324,7 +387,7 @@ def test_em_step_matches_plain(T, H, V, bs, density):
     # LL parity on a held-out sequence — loose tolerance because HMM LL
     # amplifies tiny per-param fp32 noise through T transitions.
     torch.manual_seed(6)
-    test_seq = torch.randint(0, V, (1, T), device=device)
+    test_seq = torch.randint(0, V, (B, T), device=device)
     ll_p = pc_plain(test_seq).detach()
     ll_c = pc_chain(test_seq).detach()
     ll_diff = (ll_c - ll_p).abs().max().item()

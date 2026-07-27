@@ -13,9 +13,11 @@ of magnitude slower and is *not* a dense GEMV.) The sparse build uses
 so the DAG pre-pass upgrades the interior to :class:`SparseIOSumLayer` +
 :class:`CoSparseProdLayer`.
 
-Batch size is fixed at 1: the sparse fast path (``SparseProdLayer`` /
-``SparseIOSumLayer``) is an inference-only, ``B=1``-only path, so the
-head-to-head can only be run at ``B=1``.
+The dense-GEMV head-to-head runs at ``B=1`` (``DenseSumLayer`` is the fair
+baseline there). The sparse chain itself also supports ``B>1`` (batched
+per-sample columns); ``_run_batched_scaling`` compares the batched pass
+against a python loop of ``B`` single-sample calls on the same circuit,
+reporting per-sample-equivalent times per phase.
 
 ``bwd_pflow`` on the dense path is reported as ``n/a``: :class:`DenseSumLayer`
 is inference-only and raises on parameter-flow accumulation (learning needs
@@ -161,6 +163,121 @@ def _build_and_run(T, H, V, bs, density, n_warmup, n_iter, seed=0):
     return results
 
 
+def _run_batched_scaling(T, H, V, bs, density, Bs, n_warmup, n_iter, seed=0):
+    """Batched sparse chain vs a python loop of B single-sample calls, on
+    the SAME circuit. Reports per-sample-equivalent ms per phase.
+
+    Loop-baseline caveat: for the backward phases the loop re-runs each
+    sample's forward inside the timed region (a real B=1 training loop
+    cannot amortise it); the batched numbers exclude the forward, matching
+    ``time_phase``'s batched contract.
+    """
+    assert torch.cuda.is_available()
+    device = torch.device("cuda:0")
+
+    csc_indptr, csc_indices, csc_values = random_csc_pattern(
+        H=H, V=V, density=density, seed=seed,
+    )
+    torch.manual_seed(seed)
+    root_sparse = _build_sparse_chain(
+        T, H, V, bs, csc_indptr, csc_indices, csc_values,
+    )
+    pc = juice.TensorCircuit(root_sparse, verbose=False).to(device)
+    assert any(isinstance(l, SparseIOSumLayer)
+               for lg in pc.inner_layer_groups for l in lg)
+
+    print(f"\n=== batched vs loop: T={T} H={H} V={V} bs={bs} density={density} ===")
+    print(f"  (per-sample ms; loop bwd_* include the per-sample re-forward)")
+    print(f"  {'B':>4s} {'mode':8s} {'fwd':>10s} {'bwd_ele':>10s} {'bwd_pflow':>10s}")
+
+    results = {}
+    g = torch.Generator(device=device).manual_seed(seed)
+    for B in Bs:
+        data = torch.randint(0, V, (B, T), generator=g, device=device)
+        row = {}
+        for mode, loop in (("batched", False), ("loop", True)):
+            if B == 1 and mode == "loop":
+                continue
+            times = {ph: time_phase(pc, data, ph, n_warmup, n_iter,
+                                    per_sample_loop=loop) / B
+                     for ph in ("fwd", "bwd_ele", "bwd_pflow")}
+            row[mode] = times
+            print(f"  {B:>4d} {mode:8s} "
+                  f"{times['fwd']:8.3f}ms {times['bwd_ele']:8.3f}ms "
+                  f"{times['bwd_pflow']:8.3f}ms")
+        if "loop" in row:
+            spd = {ph: row["loop"][ph] / row["batched"][ph]
+                   for ph in ("fwd", "bwd_ele", "bwd_pflow")}
+            print(f"  {'':4s} {'speedup':8s} "
+                  f"{spd['fwd']:9.2f}x {spd['bwd_ele']:9.2f}x "
+                  f"{spd['bwd_pflow']:9.2f}x")
+        results[B] = row
+    return results
+
+
+def _run_dense_vs_sparse_batched(T, H, V, bs, density, Bs, n_warmup, n_iter,
+                                 seed=0):
+    """Batched dense baseline vs batched sparse chain at matched (T, H, V,
+    bs) across batch sizes. Dense = ``DenseCategorical`` emissions + plain
+    ``ProdLayer`` + ``DenseSumLayer`` GEMM (dense input AND output
+    activations of the transition); sparse = CSC emissions + the batched
+    sparse-IO chain. Both circuits are built once and reused across Bs.
+
+    ``bwd_pflow`` stays n/a on the dense side at every B — DenseSumLayer is
+    inference-only, and the trainable general-``SumLayer`` alternative is
+    not a GEMM (unfair baseline; see module docstring).
+    """
+    assert torch.cuda.is_available()
+    device = torch.device("cuda:0")
+
+    csc_indptr, csc_indices, csc_values = random_csc_pattern(
+        H=H, V=V, density=density, seed=seed,
+    )
+
+    torch.manual_seed(seed)
+    root_dense = _build_dense(T, H, V, bs)
+    pc_dense = juice.TensorCircuit(
+        root_dense, verbose=False, use_dense_sum_layer=True,
+    ).to(device)
+    assert any(isinstance(l, DenseSumLayer)
+               for lg in pc_dense.inner_layer_groups for l in lg)
+
+    torch.manual_seed(seed)
+    root_sparse = _build_sparse_chain(
+        T, H, V, bs, csc_indptr, csc_indices, csc_values,
+    )
+    pc_sparse = juice.TensorCircuit(root_sparse, verbose=False).to(device)
+    assert any(isinstance(l, SparseIOSumLayer)
+               for lg in pc_sparse.inner_layer_groups for l in lg)
+
+    print(f"\n=== batched dense vs sparse: T={T} H={H} V={V} bs={bs} "
+          f"density={density} ===")
+    print(f"  (per-sample ms; dense bwd_pflow n/a — DenseSumLayer is "
+          f"inference-only)")
+    print(f"  {'B':>4s} {'path':8s} {'fwd':>10s} {'bwd_ele':>10s} "
+          f"{'bwd_pflow':>10s}")
+
+    results = {}
+    g = torch.Generator(device=device).manual_seed(seed)
+    for B in Bs:
+        data = torch.randint(0, V, (B, T), generator=g, device=device)
+        dense_row = {ph: time_phase(pc_dense, data, ph, n_warmup, n_iter) / B
+                     for ph in ("fwd", "bwd_ele")}
+        sparse_row = {ph: time_phase(pc_sparse, data, ph, n_warmup, n_iter) / B
+                      for ph in ("fwd", "bwd_ele", "bwd_pflow")}
+        print(f"  {B:>4d} {'dense':8s} "
+              f"{dense_row['fwd']:8.3f}ms {dense_row['bwd_ele']:8.3f}ms "
+              f"{'n/a':>10s}")
+        print(f"  {B:>4d} {'sparse':8s} "
+              f"{sparse_row['fwd']:8.3f}ms {sparse_row['bwd_ele']:8.3f}ms "
+              f"{sparse_row['bwd_pflow']:8.3f}ms")
+        spd = {ph: dense_row[ph] / sparse_row[ph] for ph in ("fwd", "bwd_ele")}
+        print(f"  {'':4s} {'speedup':8s} "
+              f"{spd['fwd']:9.2f}x {spd['bwd_ele']:9.2f}x {'n/a':>10s}")
+        results[B] = {"dense": dense_row, "sparse": sparse_row}
+    return results
+
+
 @pytest.mark.slow
 def test_sparse_io_sum_perf_smoke():
     """Smoke test — both circuits build, the dense interior compiles to
@@ -177,6 +294,32 @@ def test_sparse_io_sum_perf_smoke():
     assert "bwd_pflow" not in res["dense_gemv"]  # inference-only GEMV
 
 
+@pytest.mark.slow
+def test_sparse_io_batched_vs_loop_perf_smoke():
+    """Smoke test — the batched path and the python-loop baseline both
+    complete all three phases at B > 1 on the same circuit."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    res = _run_batched_scaling(T=8, H=32, V=128, bs=8, density=0.1,
+                               Bs=(1, 8), n_warmup=1, n_iter=3, seed=42)
+    assert set(res.keys()) == {1, 8}
+    for ph in ("fwd", "bwd_ele", "bwd_pflow"):
+        assert res[8]["batched"][ph] > 0 and res[8]["loop"][ph] > 0
+
+
+@pytest.mark.slow
+def test_sparse_io_dense_vs_sparse_batched_perf_smoke():
+    """Smoke test — batched dense GEMM baseline vs batched sparse chain
+    complete fwd + bwd_ele at B > 1 (dense bwd_pflow stays n/a)."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    res = _run_dense_vs_sparse_batched(T=8, H=32, V=128, bs=8, density=0.1,
+                                       Bs=(1, 8), n_warmup=1, n_iter=3, seed=42)
+    for ph in ("fwd", "bwd_ele"):
+        assert res[8]["dense"][ph] > 0 and res[8]["sparse"][ph] > 0
+    assert "bwd_pflow" not in res[8]["dense"]
+
+
 if __name__ == "__main__":
     # The dense H*H GEMV transition is ~256 MiB per buffer at H=8192; the
     # sparse path is unaffected by H*H. Both run fwd + bwd_ele; only the
@@ -184,4 +327,14 @@ if __name__ == "__main__":
     _build_and_run(
         T=32, H=8192, V=32768, bs=8192, density=0.01,
         n_warmup=1, n_iter=2, seed=42,
+    )
+    # Batch scaling: batched sparse pass vs python loop of B=1 calls.
+    _run_batched_scaling(
+        T=32, H=8192, V=32768, bs=8192, density=0.01,
+        Bs=(1, 8, 32, 64), n_warmup=1, n_iter=2, seed=42,
+    )
+    # Batched dense GEMM baseline vs batched sparse at matched sizes.
+    _run_dense_vs_sparse_batched(
+        T=32, H=8192, V=32768, bs=8192, density=0.01,
+        Bs=(1, 8, 32, 64), n_warmup=1, n_iter=2, seed=42,
     )

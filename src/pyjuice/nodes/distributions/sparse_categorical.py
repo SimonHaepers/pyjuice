@@ -342,12 +342,18 @@ class SparseCategorical(Distribution):
                               num_rows: int,
                               device: torch.device,
                               values_out: Optional[torch.Tensor] = None,
-                              data_list: Optional[list] = None):
+                              data_list: Optional[list] = None,
+                              pattern_cache: Optional[dict] = None):
         """
-        Construct a :class:`SparseNodeValues` for the observed token at
-        ``var_id`` (B=1 only). ``indices`` is a *view* into ``_csc_indices``
+        Construct a :class:`SparseNodeValues` for the observed token(s) at
+        ``var_id``. At B=1, ``indices`` is a *view* into ``_csc_indices``
         — no per-call allocation — and ``values`` is an empty buffer sized
-        ``total_nnz`` for the consumer (``SparseProdLayer``) to fill.
+        ``total_nnz`` for the consumer (``SparseProdLayer``) to fill. At
+        B>1 the batched layout is built instead (one column per sample —
+        see :meth:`_build_batched_pattern`); ``pattern_cache`` (a per-query
+        dict threaded by ``TensorCircuit``) dedups the host lookups + H2D
+        copy when several layers request the same ``(dist, var)`` pattern
+        in one pass.
 
         If ``values_out`` is supplied, ``values`` becomes a length-``total_nnz``
         view into that pre-allocated workspace (must be ``>= _max_nnz_per_col``
@@ -368,10 +374,10 @@ class SparseCategorical(Distribution):
         # layer/sparse_node_values.
         from pyjuice.layer.sparse_node_values import SparseNodeValues
 
-        assert data.size(1) == 1, (
-            "SparseCategorical.build_sparse_pattern requires batch_size == 1 "
-            "(sparse path is inference-only + B=1)."
-        )
+        if data.size(1) != 1:
+            return self._build_batched_pattern(
+                data, var_id, num_rows, device, values_out, pattern_cache,
+            )
 
         if data_list is not None:
             # Fastest path: caller has pre-converted data_cpu[:, 0] to a
@@ -418,17 +424,80 @@ class SparseCategorical(Distribution):
             indices=indices, values=values, num_rows=num_rows,
         )
 
+    def _build_batched_pattern(self, data: torch.Tensor, var_id: int,
+                                num_rows: int, device: torch.device,
+                                values_out: Optional[torch.Tensor],
+                                pattern_cache: Optional[dict]):
+        """B>1 companion of :meth:`build_sparse_pattern`: one CSC column per
+        sample (see :class:`SparseNodeValues` for the batched layout).
+
+        Per-sample column bounds come from host indptr lookups on the CPU
+        ``data`` mirror, shipped as ONE ``[2, B]`` int32 H2D copy — so
+        ``data`` must be the CPU mirror (``TensorCircuit`` always passes
+        ``data_cpu``), and ``values_out`` (a workspace of numel
+        ``>= B * _max_nnz_per_col``) is mandatory: the batched path never
+        allocates per call.
+        """
+        from pyjuice.layer.sparse_node_values import SparseNodeValues
+
+        B = data.size(1)
+        assert data.device.type == "cpu", (
+            "batched build_sparse_pattern needs the CPU data mirror "
+            "(TensorCircuit passes `data_cpu`); a GPU tensor would cost one "
+            "device sync per variable per pass."
+        )
+        assert values_out is not None, (
+            "batched build_sparse_pattern requires a caller workspace "
+            "(`values_out`) with numel >= B * _max_nnz_per_col."
+        )
+        assert self._nnz < 2 ** 31, (
+            "CSC nnz exceeds the int32 range of batched col_starts."
+        )
+
+        key = (id(self), var_id)
+        cached = pattern_cache.get(key) if pattern_cache is not None else None
+        if cached is None:
+            row = data[var_id]                       # [B] long, host
+            indptr = self._csc_indptr_cpu
+            col_starts_cpu = indptr[row]
+            nnz_cpu = indptr[row + 1] - col_starts_cpu
+            nnz_list = nnz_cpu.tolist()
+            max_nnz = max(nnz_list)
+            packed = torch.stack([col_starts_cpu, nnz_cpu]).to(torch.int32).to(device)
+            cached = (packed[0], packed[1], nnz_list, max_nnz)
+            if pattern_cache is not None:
+                pattern_cache[key] = cached
+        col_starts_dev, nnz_dev, nnz_list, max_nnz = cached
+
+        K_stride = self._max_nnz_per_col
+        assert values_out.numel() >= B * K_stride, (
+            f"values_out workspace too small: need {B * K_stride}, "
+            f"got {values_out.numel()}."
+        )
+        values = values_out.narrow(0, 0, B * K_stride).view(B, K_stride)
+
+        return SparseNodeValues(
+            col_start=0, total_nnz=max_nnz,
+            indices=self._csc_indices,
+            values=values, num_rows=num_rows,
+            batch_size=B,
+            col_starts=col_starts_dev, nnz=nnz_dev, nnz_list=nnz_list,
+        )
+
     def custom_backward_sparse(self, input_layer, sparse_flow,
                                 csc_pflows_base: int,
                                 logspace_flows: bool = False):
         """
         Accumulate parameter flows from a :class:`SparseNodeValues` produced
-        by :class:`SparseProdLayer` (one entry per active CSC slot in the
-        observed column; B=1 only).
+        by :class:`SparseProdLayer` (one entry per active CSC slot of each
+        sample's observed column).
 
-        Atomically adds ``sparse_flow.values[j]`` to
-        ``input_layer.param_flows[csc_pflows_base + sparse_flow.col_start + j]``.
-        If ``logspace_flows`` is set the values are ``tl.exp``'d before adding.
+        Atomically adds ``sparse_flow.values[b, j]`` to
+        ``input_layer.param_flows[csc_pflows_base + col_starts[b] + j]``
+        (B=1: ``col_start`` is folded into the base on host, as before).
+        Samples observing the same token collide on the same slots — the
+        atomic is the cross-sample reduction EM needs. If ``logspace_flows``
+        is set the values are ``tl.exp``'d before adding.
         """
         total_nnz = sparse_flow.total_nnz
         if total_nnz == 0 or self._nnz == 0:
@@ -440,16 +509,42 @@ class SparseCategorical(Distribution):
             # input-layer backward path for this mode.
             return
 
-        BLOCK = 256
-        grid = (triton.cdiv(total_nnz, BLOCK),)
-        _sparse_cat_backward_sparse_kernel[grid](
-            values_ptr = sparse_flow.values,
-            param_flows_ptr = input_layer.param_flows,
-            pflow_base = csc_pflows_base + sparse_flow.col_start,
-            total_nnz = total_nnz,
-            logspace_flows = 1 if logspace_flows else 0,
-            BLOCK = BLOCK,
-        )
+        if sparse_flow.is_batched:
+            B = sparse_flow.batch_size
+            BLOCK = 64
+            BLOCK_B = 8
+            grid = (triton.cdiv(total_nnz, BLOCK), triton.cdiv(B, BLOCK_B))
+            _sparse_cat_backward_sparse_kernel[grid](
+                values_ptr = sparse_flow.values,
+                param_flows_ptr = input_layer.param_flows,
+                col_starts_ptr = sparse_flow.col_starts,
+                nnz_ptr = sparse_flow.nnz,
+                pflow_base = csc_pflows_base,
+                total_nnz = total_nnz,
+                batch_size = B,
+                v_stride = sparse_flow.values.stride(0),
+                logspace_flows = 1 if logspace_flows else 0,
+                BLOCK = BLOCK,
+                BLOCK_B = BLOCK_B,
+                IS_BATCHED = True,
+            )
+        else:
+            BLOCK = 256
+            grid = (triton.cdiv(total_nnz, BLOCK), 1)
+            _sparse_cat_backward_sparse_kernel[grid](
+                values_ptr = sparse_flow.values,
+                param_flows_ptr = input_layer.param_flows,
+                col_starts_ptr = sparse_flow.values,  # unused at B=1
+                nnz_ptr = sparse_flow.values,
+                pflow_base = csc_pflows_base + sparse_flow.col_start,
+                total_nnz = total_nnz,
+                batch_size = 1,
+                v_stride = 0,
+                logspace_flows = 1 if logspace_flows else 0,
+                BLOCK = BLOCK,
+                BLOCK_B = 1,
+                IS_BATCHED = False,
+            )
 
     def custom_em(self, layer, step_size: float, pseudocount: float,
                   keep_zero_params: bool = True):
@@ -604,26 +699,58 @@ def _sparse_cat_backward_kernel(
     tl.atomic_add(param_flows_ptr + pflow_base + slot_idx, flow, mask = slot_mask)
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize = ["pflow_base", "total_nnz", "batch_size", "v_stride"],
+)
 def _sparse_cat_backward_sparse_kernel(
     values_ptr,
-    param_flows_ptr, pflow_base, total_nnz,
+    param_flows_ptr,
+    col_starts_ptr, nnz_ptr,
+    pflow_base, total_nnz,
+    batch_size, v_stride,
     logspace_flows: tl.constexpr,
     BLOCK: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    IS_BATCHED: tl.constexpr,
 ):
-    """Atomically accumulate per-active-slot flows into ``param_flows`` at
-    ``pflow_base + j``. ``pflow_base`` is the caller-computed sum of the
-    CSC pflow base and the column's ``col_start`` (slots within the active
-    column are contiguous)."""
+    """Atomically accumulate per-active-slot flows into ``param_flows``.
+
+    B=1 (``IS_BATCHED == 0``): slot ``j`` lands at ``pflow_base + j`` where
+    ``pflow_base`` is the caller-computed sum of the CSC pflow base and the
+    column's ``col_start`` (slots within the active column are contiguous).
+
+    B>1: each batch lane addresses its own column —
+    ``pflow_base + col_starts[b] + j`` masked ``j < nnz[b]``; same-token
+    lanes collide on the same slots, and the atomic is exactly the
+    cross-sample sum EM expects."""
     pid = tl.program_id(0)
     offs = pid * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < total_nnz
 
-    flow = tl.load(values_ptr + offs, mask = mask, other = 0.0)
-    if logspace_flows:
-        flow = tl.exp(flow)
+    if IS_BATCHED:
+        pid_b = tl.program_id(1)
+        offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
+        mask_b = offs_b < batch_size
+        cs_b = tl.load(col_starts_ptr + offs_b, mask = mask_b, other = 0)
+        k_b = tl.load(nnz_ptr + offs_b, mask = mask_b, other = 0)
+        mask = mask_b[:, None] & (offs[None, :] < k_b[:, None])
 
-    tl.atomic_add(param_flows_ptr + pflow_base + offs, flow, mask = mask)
+        flow = tl.load(values_ptr + offs_b[:, None] * v_stride + offs[None, :],
+                       mask = mask, other = 0.0)
+        if logspace_flows:
+            flow = tl.exp(flow)
+
+        tl.atomic_add(
+            param_flows_ptr + pflow_base + cs_b[:, None] + offs[None, :],
+            flow, mask = mask,
+        )
+    else:
+        mask = offs < total_nnz
+
+        flow = tl.load(values_ptr + offs, mask = mask, other = 0.0)
+        if logspace_flows:
+            flow = tl.exp(flow)
+
+        tl.atomic_add(param_flows_ptr + pflow_base + offs, flow, mask = mask)
 
 
 @triton.jit

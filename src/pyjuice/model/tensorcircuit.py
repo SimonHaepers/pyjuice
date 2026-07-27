@@ -212,6 +212,10 @@ class TensorCircuit(nn.Module):
         # Running parameters
         self._run_params = dict()
 
+        # Per-query batched-sparse-pattern cache (set by forward/backward
+        # when the sparse chain runs at B>1; None otherwise).
+        self._run_pattern_cache = None
+
         # Cumulative flows
         self._cum_flow = 0.0
 
@@ -341,6 +345,15 @@ class TensorCircuit(nn.Module):
                 self._run_data_list = self._run_data_cpu[:, 0].tolist()
             else:
                 self._run_data_list = None
+            # Per-query cache for batched (B>1) sparse patterns: several
+            # layers (CoSparseProdLayer + its upstream SparseIOSumLayer)
+            # request the same (dist, var) column bounds within one pass; the
+            # dict dedups the host lookups + H2D copy. B=1 keeps the
+            # data_list path and never consults the cache.
+            if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
+                self._run_pattern_cache = dict()
+            else:
+                self._run_pattern_cache = None
 
             # ``missing_mask`` reaches the input layers via ``**kwargs`` on the
             # initial ``layer(inputs, ...)`` calls above; for inner layers it
@@ -363,6 +376,7 @@ class TensorCircuit(nn.Module):
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
+                                    pattern_cache = self._run_pattern_cache,
                                     missing_mask = missing_mask_for_prod)
 
                     elif layer_group.is_sum():
@@ -374,6 +388,7 @@ class TensorCircuit(nn.Module):
                                     data = self._run_data,
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
+                                    pattern_cache = self._run_pattern_cache,
                                     **kwargs)
 
                     else:
@@ -498,6 +513,11 @@ class TensorCircuit(nn.Module):
             self._run_data_list = self._run_data_cpu[:, 0].tolist()
         else:
             self._run_data_list = None
+        # See forward: per-query dedup cache for batched sparse patterns.
+        if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
+            self._run_pattern_cache = dict()
+        else:
+            self._run_pattern_cache = None
 
         with device_grad_controller(device = self.device, no_grad = True):
 
@@ -576,6 +596,7 @@ class TensorCircuit(nn.Module):
                             data = self._run_data,
                             data_cpu = self._run_data_cpu,
                             data_list = self._run_data_list,
+                            pattern_cache = self._run_pattern_cache,
                             missing_mask = missing_mask_for_prod,
                         )
 

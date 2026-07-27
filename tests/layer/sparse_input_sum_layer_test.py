@@ -195,9 +195,10 @@ def test_sparse_input_sum_backward_b1_equivalence():
         )
 
 
-def test_sparse_input_sum_b_gt_1_rejected():
-    """The sparse fast path is B=1-only; B>1 must raise a clear error so
-    users build with plain ``summate`` / ``multiply`` instead."""
+def test_sparse_input_sum_b_gt_1_batched():
+    """B>1 runs on the batched sparse fast path: the batched forward must
+    match a python loop of B single-sample calls. ``missing_mask`` stays
+    B=1-only and must still raise at B>1."""
     device = torch.device("cuda:0")
     T, H, V, bs = 4, 8, 16, 4
     B = 4
@@ -208,9 +209,17 @@ def test_sparse_input_sum_b_gt_1_rejected():
     )
     pc = TensorCircuit(root, use_dense_sum_layer=True, verbose=False).to(device)
 
+    torch.manual_seed(29)
     data = torch.randint(0, V, (B, T), device=device)
-    with pytest.raises(AssertionError, match="B=1 only"):
-        pc(data)
+    lls = pc(data)
+    assert lls.size(0) == B
+    lls_loop = torch.cat([pc(data[b:b + 1]) for b in range(B)], dim=0)
+    torch.testing.assert_close(lls, lls_loop, rtol=1e-5, atol=1e-6)
+
+    missing_mask = torch.zeros(T, dtype=torch.bool, device=device)
+    missing_mask[1] = True
+    with pytest.raises(AssertionError, match="batch_size == 1"):
+        pc(data, missing_mask=missing_mask)
 
 
 def test_sparse_prod_skip_scatter_when_all_consumers_sparse():
@@ -280,7 +289,7 @@ if __name__ == "__main__":
     test_sparse_input_sum_layer_is_used_b1()
     test_sparse_input_sum_forward_b1_equivalence()
     test_sparse_input_sum_backward_b1_equivalence()
-    test_sparse_input_sum_b_gt_1_rejected()
+    test_sparse_input_sum_b_gt_1_batched()
     test_sparse_prod_skip_scatter_when_all_consumers_sparse()
     test_sparse_prod_skip_scatter_forward_correctness()
     print("all sparse_input_sum_layer tests passed")
