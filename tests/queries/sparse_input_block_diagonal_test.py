@@ -309,6 +309,10 @@ def test_backward_matches_plain(T, H, V, bs):
     (6, 32, 10, 8, 1),
     (4, 16, 6, 4, 6),
     (6, 32, 10, 8, 8),
+    # bs=16 exercises the batched pflow pre-reduction kernels (tl.dot
+    # dims need every padded tile dim >= 16; smaller bs falls back to
+    # per-sample atomics).
+    (4, 64, 8, 16, 8),
 ])
 def test_param_flow_matches_plain(T, H, V, bs, B):
     if not torch.cuda.is_available():
@@ -357,6 +361,8 @@ def test_param_flow_matches_plain(T, H, V, bs, B):
 @pytest.mark.parametrize("T,H,V,bs,B", [
     (4, 16, 6, 4, 7),
     (6, 32, 10, 8, 9),
+    # bs=16: batched pflow pre-reduction path (see note on the plain test).
+    (5, 64, 8, 16, 7),
 ])
 def test_param_flow_batched_matches_loop(T, H, V, bs, B):
     """One batched backward on the sparse Monarch chain must accumulate the
