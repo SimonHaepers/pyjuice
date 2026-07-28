@@ -16,8 +16,11 @@ Tensor = Union[np.ndarray, torch.Tensor]
 class SparseSumNodes(SumNodes):
     """
     A :class:`SumNodes` whose single child is a :class:`SparseProdNodes`,
-    enabling the :class:`SparseInputSumLayer` column-selecting fast path at
-    compile time. The subclass exists purely as a dispatch marker; all sum
+    enabling the column-selecting sparse fast paths at compile time
+    (:class:`SparseInputSumLayer` for block-dense edges;
+    :class:`SparseInputBlockDiagonalSumLayer` /
+    :class:`SparseIOBlockDiagonalSumLayer` for the block-diagonal Monarch
+    pattern). The subclass exists purely as a dispatch marker; all sum
     semantics are inherited.
     """
 
@@ -41,10 +44,31 @@ class SparseSumNodes(SumNodes):
             f"SparseSumNodes requires a SparseProdNodes child; "
             f"got {type(self.chs[0]).__name__}."
         )
-        assert self.is_block_dense, (
-            "SparseSumNodes requires block-dense edges (the SparseInputSumLayer "
-            "fast path reads a block-dense parameter tile)."
+        assert self.is_block_dense or self._is_block_diagonal_edges(), (
+            "SparseSumNodes requires block-dense edges (SparseInputSumLayer "
+            "reads a block-dense parameter tile) or the block-diagonal "
+            "pattern arange(NB)[None,:].repeat(2,1) (routed to the BD "
+            "sparse fast paths)."
         )
+
+    def _is_block_diagonal_edges(self) -> bool:
+        """Structural replica of the compiler's
+        ``_is_block_diagonal_pattern`` (kept local — ``nodes`` must not
+        import ``model``), minus the NB >= 2 gate: at NB == 1 the pattern
+        coincides with block-dense, which the assert above accepts anyway.
+        """
+        if self.num_node_blocks != self.num_ch_node_blocks:
+            return False
+        if self.block_size != self.ch_block_size:
+            return False
+        NB = self.num_node_blocks
+        edge_ids = self.edge_ids
+        if edge_ids.size(1) != NB:
+            return False
+        expected = torch.arange(NB, dtype=edge_ids.dtype,
+                                device=edge_ids.device)
+        return (torch.equal(edge_ids[0], expected)
+                and torch.equal(edge_ids[1], expected))
 
     @property
     def sparse_prod_child(self) -> SparseProdNodes:

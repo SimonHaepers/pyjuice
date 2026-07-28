@@ -17,6 +17,7 @@ from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
     CoSparseProdLayer, SumLayer, DenseSumLayer, BlockDiagonalSumLayer,
     SparseInputSumLayer, SparseIOSumLayer, SparseIOBlockDiagonalSumLayer,
+    SparseInputBlockDiagonalSumLayer, SparseOutputBlockDiagonalSumLayer,
     LayerGroup,
 )
 from pyjuice.utils.grad_fns import ReverseGrad
@@ -1103,6 +1104,7 @@ class TensorCircuit(nn.Module):
         self._sparse_chain_info = sparse_chain_info
         demoted_sparse_prods = sparse_chain_info["demoted"]
         sparse_io_sums = sparse_chain_info["sparse_io_sums"]
+        sparse_out_sums = sparse_chain_info["sparse_out_sums"]
         cosparse_prods = sparse_chain_info["cosparse_prods"]
 
         self.input_layer_group = None
@@ -1335,6 +1337,20 @@ class TensorCircuit(nn.Module):
                             mode = "sparse_io_block_diagonal"
                         elif _sparse_sum_eligible(ns):
                             mode = "sparse_dense"
+                        elif id(ns) in sparse_out_sums:
+                            # BD-pattern sum with a DENSE child (e.g. the
+                            # Monarch permutation product) whose sole
+                            # consumer is a SparseProdNodes — dense-in /
+                            # sparse-out (the BD₂ half of a Monarch
+                            # transition).
+                            mode = "sparse_output_block_diagonal"
+                        elif _sparse_io_bd_eligible(ns):
+                            # BD-pattern sum over a SparseProdLayer child
+                            # whose OUTPUT is consumed densely (not in
+                            # ``sparse_io_sums`` — e.g. the BD₁ half of a
+                            # Monarch transition feeding the permutation
+                            # product). Sparse-in / dense-out.
+                            mode = "sparse_input_block_diagonal"
                         elif _dense_eligible(ns):
                             mode = "dense"
                         elif _block_diagonal_eligible(ns):
@@ -1375,6 +1391,24 @@ class TensorCircuit(nn.Module):
                         elif mode == "sparse_dense":
                             layer_cls = SparseInputSumLayer
                             extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
+                        elif mode == "sparse_input_block_diagonal":
+                            layer_cls = SparseInputBlockDiagonalSumLayer
+                            extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
+                        elif mode == "sparse_output_block_diagonal":
+                            out_var_ids = []
+                            out_dists = []
+                            out_num_rows = []
+                            for sum_ns in nodes:
+                                consumer = sparse_out_sums[id(sum_ns)]
+                                out_var_ids.append(consumer.var_id)
+                                out_dists.append(consumer.sparse_input_ns.dist)
+                                out_num_rows.append(consumer.num_nodes)
+                            layer_cls = SparseOutputBlockDiagonalSumLayer
+                            extra_kwargs = {
+                                "output_sparsity_var_ids": out_var_ids,
+                                "output_sparsity_dists": out_dists,
+                                "output_sparsity_num_rows": out_num_rows,
+                            }
                         elif mode == "dense":
                             layer_cls = DenseSumLayer
                             extra_kwargs = {}
@@ -1502,7 +1536,8 @@ class TensorCircuit(nn.Module):
                         all_sparse_consumers = False
                         break
                     for consumer in consumers:
-                        if not isinstance(consumer, SparseInputSumLayer):
+                        if not isinstance(consumer, (SparseInputSumLayer,
+                                                     SparseInputBlockDiagonalSumLayer)):
                             all_sparse_consumers = False
                             break
                     if not all_sparse_consumers:
@@ -1612,6 +1647,40 @@ class TensorCircuit(nn.Module):
                     continue
                 sparse_io_sums[id(ns)] = consumer
 
+        # Classify BD-pattern SumNodes with a DENSE child but a sparse
+        # consumer as sparse-OUT eligible (dense-in / sparse-out — the
+        # Monarch BD₂ slot: child is the plain permutation product, sole
+        # consumer is the next timestep's emission SparseProdNodes whose
+        # CSC column defines which outputs are ever read). Mutually
+        # exclusive with ``sparse_io_sums`` by construction (that map
+        # requires a sparse child).
+        sparse_out_sums: Dict[int, SparseProdNodes] = {}
+        for d in range(num_layers):
+            for ns in depth2nodes[d].get("sum", []):
+                if getattr(ns, "_force_plain_layer", False):
+                    continue
+                if id(ns) in sparse_io_sums:
+                    continue
+                if len(ns.chs) != 1:
+                    continue
+                if not _is_block_diagonal_pattern(ns):
+                    continue
+                child = ns.chs[0]
+                if isinstance(child, SparseProdNodes) and id(child) not in demoted:
+                    # Sparse child → the sparse-in BD variants own this ns.
+                    continue
+                cs_list = consumers.get(id(ns), [])
+                if len(cs_list) != 1:
+                    continue
+                consumer = cs_list[0]
+                if not isinstance(consumer, SparseProdNodes):
+                    continue
+                if id(consumer) in demoted:
+                    continue
+                if consumer.num_dense_chs != 1:
+                    continue
+                sparse_out_sums[id(ns)] = consumer
+
         # Classify SparseProdNodes as cosparse.
         cosparse_prods: set = set()
         for d in range(num_layers):
@@ -1623,12 +1692,14 @@ class TensorCircuit(nn.Module):
                 if ns.num_dense_chs != 1:
                     continue
                 dense_ch = ns.chs[ns.dense_ch_idxs[0]]
-                if id(dense_ch) in sparse_io_sums:
+                if id(dense_ch) in sparse_io_sums \
+                        or id(dense_ch) in sparse_out_sums:
                     cosparse_prods.add(id(ns))
 
         return {
             "demoted": demoted,
             "sparse_io_sums": sparse_io_sums,
+            "sparse_out_sums": sparse_out_sums,
             "cosparse_prods": cosparse_prods,
         }
 

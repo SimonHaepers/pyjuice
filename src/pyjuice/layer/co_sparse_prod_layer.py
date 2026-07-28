@@ -151,7 +151,11 @@ class CoSparseProdLayer(SparseProdLayer):
         from .sparse_io_block_diagonal_sum_layer import (
             SparseIOBlockDiagonalSumLayer,
         )
-        _sparse_io_layer_cls = (SparseIOSumLayer, SparseIOBlockDiagonalSumLayer)
+        from .sparse_output_block_diagonal_sum_layer import (
+            SparseOutputBlockDiagonalSumLayer,
+        )
+        _sparse_io_layer_cls = (SparseIOSumLayer, SparseIOBlockDiagonalSumLayer,
+                                SparseOutputBlockDiagonalSumLayer)
 
         for ns in self.nodes:
             dense_ch_ns = ns.chs[ns.dense_ch_idxs[0]]
