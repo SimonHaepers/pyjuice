@@ -16,6 +16,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.parameter_list import FastParamList
 from .layer import Layer
 from .sum_layer import SumLayer
+from .dense_sum_layer import DenseSumLayer, _select_bk_tiles
 
 
 class BlockDiagonalSumLayer(SumLayer):
@@ -300,19 +301,53 @@ class BlockDiagonalSumLayer(SumLayer):
         assert not allow_neg_flows, (
             "BlockDiagonalSumLayer.backward does not support allow_neg_flows."
         )
+        assert not (allow_modify_flows and logspace_flows), (
+            "`allow_modify_flows` must be False when `logspace_flows=True` "
+            "(same contract as SumLayer)."
+        )
 
         batch_size = node_mars.size(1)
+
+        # In-place ``log(flow) - log_marg`` transform on this layer's own
+        # parent rows — the pre-pass the ``ALLOW_MODIFY_FLOWS`` kernel
+        # branch reads. Same kernel + tiling as ``DenseSumLayer.backward``.
+        if allow_modify_flows:
+            for block in self._bd_blocks:
+                nid_start, _cid_start, _pid_start, _pfid_start, NB, bs, _cbs = block
+                layer_n_nodes = NB * bs
+                BATCH_SIZE_NP2 = triton.next_power_of_2(batch_size)
+                MF_BLOCK_B = min(2048, BATCH_SIZE_NP2)
+                MF_BLOCK_M = min(max(2048 // MF_BLOCK_B, 1), bs)
+                if MF_BLOCK_M < 1:
+                    MF_BLOCK_M = 1
+                grid = (triton.cdiv(batch_size, MF_BLOCK_B),
+                        triton.cdiv(layer_n_nodes, MF_BLOCK_M))
+                DenseSumLayer._bk_triton_dense_modify_flow_kernel[grid](
+                    node_flows = node_flows,
+                    node_mars = node_mars,
+                    nid_start = nid_start,
+                    batch_size = batch_size,
+                    num_parents = layer_n_nodes,
+                    BLOCK_B = MF_BLOCK_B,
+                    BLOCK_M = MF_BLOCK_M,
+                    propagation_alg_id = 0,
+                    alpha = 0.0,
+                )
 
         for block in self._bd_blocks:
             nid_start, cid_start, pid_start, _pfid_start, NB, bs, cbs = block
 
-            CBS_PADDED = triton.next_power_of_2(cbs)
-            BS_PADDED = triton.next_power_of_2(bs)
-            BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
-            if BLOCK_B < 1:
-                BLOCK_B = 1
+            # Same tile policy as the dense backward: 2-D [TILE_N, BLOCK_B]
+            # output tiles with a serial TILE_K loop over the parent rows.
+            # Passing ``NB_ch = NB`` makes the grid-saturation heuristic see
+            # the true total child-slot count (NB blocks × cbs slots each).
+            TILE_N, TILE_K, BLOCK_B, use_tl_dot = _select_bk_tiles(
+                cbs = cbs, bs = bs, batch_size = batch_size,
+                NB_ch = NB, force_use_fp32 = force_use_fp32,
+            )
+            K_NUM_TILES = bs // TILE_K
 
-            grid = (NB, triton.cdiv(batch_size, BLOCK_B))
+            grid = (triton.cdiv(batch_size, BLOCK_B), NB * (cbs // TILE_N))
 
             self._bk_bd_kernel[grid](
                 node_flows = node_flows,
@@ -326,12 +361,14 @@ class BlockDiagonalSumLayer(SumLayer):
                 pid_start = pid_start,
                 BS = bs,
                 CBS = cbs,
-                BS_PADDED = BS_PADDED,
-                CBS_PADDED = CBS_PADDED,
                 BLOCK_B = BLOCK_B,
+                TILE_N = TILE_N,
+                TILE_K = TILE_K,
+                K_NUM_TILES = K_NUM_TILES,
                 ALLOW_MODIFY_FLOWS = 1 if allow_modify_flows else 0,
                 ACCUMULATE_CH_FLOWS = 1 if accumulate_ch_flows else 0,
                 LOGSPACE_FLOWS = 1 if logspace_flows else 0,
+                USE_TL_DOT = use_tl_dot,
             )
 
         return None
@@ -460,181 +497,176 @@ class BlockDiagonalSumLayer(SumLayer):
                       batch_size,
                       nid_start, cid_start, pid_start,
                       BS, CBS,
-                      BS_PADDED: tl.constexpr,
-                      CBS_PADDED: tl.constexpr,
                       BLOCK_B: tl.constexpr,
+                      TILE_N: tl.constexpr,
+                      TILE_K: tl.constexpr,
+                      K_NUM_TILES: tl.constexpr,
                       ALLOW_MODIFY_FLOWS: tl.constexpr,
                       ACCUMULATE_CH_FLOWS: tl.constexpr,
-                      LOGSPACE_FLOWS: tl.constexpr):
+                      LOGSPACE_FLOWS: tl.constexpr,
+                      USE_TL_DOT: tl.constexpr):
         """
-        Element-flow backward for one BlockDiagonalSumLayer block, one
-        program per ``(parent_block, batch_tile)``.
+        Element-flow backward, one program per ``(batch_tile,
+        child_tile)`` where ``pid_n`` decomposes into ``(parent_block,
+        TILE_N-slot tile)``. Same 2-D-tile + serial-K structure as
+        ``DenseSumLayer._bk_triton_dense_ele_kernel`` — the block-diagonal
+        restriction just shrinks the K loop to THIS block's ``BS`` parent
+        rows (``K_NUM_TILES = BS // TILE_K``).
 
-        Math (LL, no param_flows):
+        Math (LL, no param_flows), per K tile ``kt``:
 
-          1. Load all ``BS`` parent flows + marginals for this block.
-          2. ``log_n_fdm[s, b] = log(parent_flow[s, b] + 1e-32) - log_marg[s, b]``
-             (or read directly if ``ALLOW_MODIFY_FLOWS=1`` because
-             ``DenseSumLayer.modify_flows`` already wrote it in place).
-          3. Per-batch stabilisation:
-             ``m_b = max_s log_n_fdm[s, b]``,
-             ``n_fdm_sub[s, b] = exp(log_n_fdm[s, b] - m_b)`` (0 if m_b is
-             -inf).
-          4. ``partial[c, b] = sum_s weight[s, c] * n_fdm_sub[s, b]``.
-          5. ``log_child_marg[c, b]`` from element_mars (block-local slice).
-          6. ``eflows[c, b] = partial[c, b] * exp(log_child_marg[c, b] + m_b)``
-             (with -inf passthrough).
-          7. Store into ``element_flows[cid_start + pblock*CBS + c, batch]``.
-             Disjoint child slices per block ⇒ no atomic-add needed even
-             across program-grid neighbours (a child slot belongs to
-             exactly one parent block).
+          1. ``log_n_fdm[s, b] = log(parent_flow[s, b]) - log_marg[s, b]``
+             (read directly if ``ALLOW_MODIFY_FLOWS=1`` — the pre-pass in
+             :meth:`backward` already wrote it in place).
+          2. Per-tile stabilisation: ``m_b = max_s log_n_fdm[s, b]``,
+             ``n_fdm_sub = exp(log_n_fdm - m_b)`` (0 if m_b is -inf).
+          3. ``partial[n, b] = Σ_s W[s, n] · n_fdm_sub[s, b]`` — ``tl.dot``
+             when every tile dim is ≥ 16, broadcast-sum otherwise.
+          4. Linear: ``acc += partial · exp(emars + m_b)``; logspace:
+             online logsumexp merge of ``log(partial) + emars + m_b``.
 
-        ``ACCUMULATE_CH_FLOWS=1`` adds the result onto existing
-        ``element_flows`` content rather than overwriting (used when the
-        child has multiple sum-layer parents).
+        The former single-program-per-block version materialised the full
+        ``[BS, CBS, BLOCK_B]`` broadcast product in registers — at
+        ``bs = 128, BLOCK_B = 64`` that's 1M floats/program, which spilled
+        to local memory and made backward scale ~linearly with B (and OOM
+        under memory pressure). The tiled form keeps live registers at
+        ``TILE_N × (TILE_K + BLOCK_B)``-scale and engages tensor cores.
+
+        Each child slot belongs to exactly one parent block ⇒ plain
+        stores, no atomics. ``ACCUMULATE_CH_FLOWS=1`` adds onto existing
+        ``element_flows`` (logaddexp under ``LOGSPACE_FLOWS=1``).
+
+        ``TILE_N`` divides ``CBS`` and ``TILE_K`` divides ``BS`` (both are
+        powers of two from ``_select_bk_tiles``), so the child / parent
+        dims need no masks — only the batch dim is masked.
         """
 
-        pid_nb = tl.program_id(0)       # parent block id
-        pid_b = tl.program_id(1)        # batch tile
+        pid_b = tl.program_id(0)        # batch tile
+        pid_n = tl.program_id(1)        # (parent block, child tile)
+
+        pblock_id = pid_n // (CBS // TILE_N)
+        tile_id_n = pid_n % (CBS // TILE_N)
+
+        offs_child = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
+        offs_child = tl.max_contiguous(tl.multiple_of(offs_child, TILE_N), TILE_N)
+        off_cid = cid_start + pblock_id * CBS + offs_child
 
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
         mask_batch = offs_batch < batch_size
 
-        offs_s = tl.arange(0, BS_PADDED)
-        mask_s = offs_s < BS
-
-        offs_c = tl.arange(0, CBS_PADDED)
-        mask_c = offs_c < CBS
-
-        par_ptr = (
-            (nid_start + pid_nb * BS + offs_s)[:, None] * batch_size
-            + offs_batch[None, :]
-        )                                                                       # [BS_PADDED, BLOCK_B]
-        nflows = tl.load(
-            node_flows + par_ptr,
-            mask = mask_s[:, None] & mask_batch[None, :],
-            other = 0.0,
-        )
-        if ALLOW_MODIFY_FLOWS == 1:
-            # The TensorCircuit-level ``modify_flows`` pre-pass already
-            # wrote ``log(parent_flow) - log_marg`` (or
-            # ``log_parent_flow - log_marg`` under logspace_flows) into
-            # ``node_flows`` in place — both produce the canonical
-            # ``log_n_fdm`` we want.
-            log_n_fdm = nflows
-        else:
-            nmars = tl.load(
-                node_mars + par_ptr,
-                mask = mask_s[:, None] & mask_batch[None, :],
-                other = -float("inf"),
-            )
-            if LOGSPACE_FLOWS == 1:
-                # ``node_flows`` is already in log-space when callers set
-                # ``logspace_flows=True`` (typical for large-fan circuits
-                # where linear flows would underflow). Subtract log-marg
-                # directly without taking another ``log``.
-                log_n_fdm = tl.where(
-                    nmars == -float("inf"),
-                    -float("inf"),
-                    nflows - nmars,
-                )
-            else:
-                log_n_fdm = tl.where(
-                    nmars == -float("inf"),
-                    -float("inf"),
-                    tl.log(nflows + 1e-32) - nmars,
-                )                                                                   # [BS_PADDED, BLOCK_B]
-
-        # Mask padded parent rows so they don't poison the max / sum.
-        log_n_fdm = tl.where(mask_s[:, None], log_n_fdm, -float("inf"))
-
-        # Per-batch stabilisation across BS parent rows.
-        log_n_fdm_max = tl.max(log_n_fdm, axis = 0)                             # [BLOCK_B]
-        log_n_fdm_max_safe = tl.where(
-            log_n_fdm_max == -float("inf"), 0.0, log_n_fdm_max,
-        )
-        n_fdm_sub = tl.where(
-            mask_s[:, None],
-            tl.exp(log_n_fdm - log_n_fdm_max_safe[None, :]),
-            0.0,
-        )                                                                       # [BS_PADDED, BLOCK_B]
-
-        # Load this block's child marginals (log space).
-        emars_ptr = (
-            (cid_start + pid_nb * CBS + offs_c)[:, None] * batch_size
-            + offs_batch[None, :]
-        )
+        # Child marginals for this tile (log space). Masked batch lanes are
+        # never stored, so no ``other`` needed.
         emars = tl.load(
-            element_mars + emars_ptr,
-            mask = mask_c[:, None] & mask_batch[None, :],
-            other = -float("inf"),
-        )                                                                       # [CBS_PADDED, BLOCK_B]
-
-        # Load weights ``[BS_PADDED, CBS_PADDED]`` (same layout as forward).
-        block_base = pid_start + pid_nb.to(tl.int64) * BS * CBS
-        weight_addr = (
-            block_base
-            + offs_c[None, :] * BS
-            + offs_s[:, None]
-        )
-        weight = tl.load(
-            mparams + weight_addr,
-            mask = mask_s[:, None] & mask_c[None, :],
-            other = 0.0,
-        )
-        weight = weight.to(tl.float32)
-
-        # partial[c, b] = sum_s weight[s, c] * n_fdm_sub[s, b]
-        partial = tl.sum(
-            weight[:, :, None] * n_fdm_sub[:, None, :],
-            axis = 0,
-        )                                                                       # [CBS_PADDED, BLOCK_B]
-
-        # eflows[c, b] = partial * exp(emars + log_n_fdm_max).
-        log_factor = emars + log_n_fdm_max[None, :]                             # [CBS_PADDED, BLOCK_B]
-
-        out_ptr = (
-            (cid_start + pid_nb * CBS + offs_c)[:, None] * batch_size
-            + offs_batch[None, :]
-        )
-        out_mask = mask_c[:, None] & mask_batch[None, :]
+            element_mars + off_cid[:, None] * batch_size + offs_batch[None, :],
+            mask = mask_batch[None, :],
+        )                                                              # [TILE_N, BLOCK_B]
 
         if LOGSPACE_FLOWS == 1:
-            # Logspace path: store ``log(eflows) = log(partial) + emars
-            # + log_n_fdm_max``. ``partial <= 0`` (numeric underflow on
-            # otherwise-zero rows) gets mapped to -inf.
-            log_eflows = tl.where(
-                (log_factor == -float("inf")) | (~mask_c[:, None]),
-                -float("inf"),
-                tl.log(partial + 1e-32) + log_factor,
+            acc = tl.zeros([TILE_N, BLOCK_B], dtype = tl.float32) - float("inf")
+        else:
+            acc = tl.zeros([TILE_N, BLOCK_B], dtype = tl.float32)
+
+        # int64 cast on pblock_id: same int32 worst-case-range fix as the
+        # forward kernel.
+        block_base = pid_start + pblock_id.to(tl.int64) * BS * CBS
+
+        for kt in range(0, K_NUM_TILES):
+            off_pwithin = tl.arange(0, TILE_K) + kt * TILE_K           # [TILE_K]
+            off_pwithin = tl.max_contiguous(
+                tl.multiple_of(off_pwithin, TILE_K), TILE_K
             )
-            if ACCUMULATE_CH_FLOWS == 1:
+            off_mid = nid_start + pblock_id * BS + off_pwithin
+
+            # Weights [TILE_N, TILE_K]: mparams[block_base + c*BS + s]
+            # (child-major rows, parent stride 1 — coalesced inner dim).
+            epars = tl.load(
+                mparams + block_base
+                + offs_child[:, None] * BS + off_pwithin[None, :]
+            ).to(tl.float32)                                           # [TILE_N, TILE_K]
+
+            off_mb = off_mid[:, None] * batch_size + offs_batch[None, :]
+            nflows = tl.load(node_flows + off_mb, mask = mask_batch[None, :])
+
+            if ALLOW_MODIFY_FLOWS == 1:
+                # The pre-pass in ``backward`` wrote ``log(flow) - nmars``
+                # in place (-inf where nmars is -inf).
+                log_n_fdm = nflows
+            else:
+                nmars = tl.load(node_mars + off_mb, mask = mask_batch[None, :])
+                if LOGSPACE_FLOWS == 1:
+                    # ``node_flows`` is already log-space — subtract
+                    # log-marg directly.
+                    log_n_fdm = tl.where(
+                        nmars == -float("inf"),
+                        -float("inf"),
+                        nflows - nmars,
+                    )
+                else:
+                    log_n_fdm = tl.where(
+                        nmars == -float("inf"),
+                        -float("inf"),
+                        tl.log(nflows + 1e-32) - nmars,
+                    )                                                  # [TILE_K, BLOCK_B]
+
+            # Per-tile stabilisation (exact rescaling — merged back via
+            # ``exp(emars + m_b)`` / the logspace merge below).
+            log_n_fdm_max = tl.max(log_n_fdm, axis = 0)[None, :]       # [1, BLOCK_B]
+            n_fdm_sub = tl.where(
+                log_n_fdm_max != -float("inf"),
+                tl.exp(log_n_fdm - log_n_fdm_max),
+                0.0,
+            )                                                          # [TILE_K, BLOCK_B]
+
+            if USE_TL_DOT == 1:
+                partial = tl.dot(epars, n_fdm_sub)                     # [TILE_N, BLOCK_B]
+            else:
+                partial = tl.sum(
+                    epars[:, :, None] * n_fdm_sub[None, :, :], axis = 1,
+                )
+
+            if LOGSPACE_FLOWS == 1:
+                # Online logsumexp merge:
+                # acc <- logaddexp(acc, log(partial) + emars + m_b).
+                partial_max = emars + log_n_fdm_max                    # [TILE_N, BLOCK_B]
+                acc = tl.where(
+                    partial_max == -float("inf"),
+                    acc,
+                    tl.where(
+                        partial_max > acc,
+                        tl.log(partial + tl.exp(acc - partial_max) + 1e-32) + partial_max,
+                        tl.log(tl.exp(partial_max - acc) * partial + 1.0) + acc,
+                    ),
+                )
+            else:
+                factor = tl.where(
+                    log_n_fdm_max == -float("inf"),
+                    0.0,
+                    tl.exp(emars + log_n_fdm_max),
+                )
+                acc = acc + partial * factor
+
+        out_ptr = off_cid[:, None] * batch_size + offs_batch[None, :]
+        if ACCUMULATE_CH_FLOWS == 1:
+            if LOGSPACE_FLOWS == 1:
                 ori = tl.load(
                     element_flows + out_ptr,
-                    mask = out_mask,
+                    mask = mask_batch[None, :],
                     other = -float("inf"),
                 )
-                # logaddexp(a, b) with -inf passthrough.
-                hi = tl.maximum(log_eflows, ori)
-                lo = tl.minimum(log_eflows, ori)
-                log_eflows = tl.where(
+                # logaddexp(acc, ori) with -inf passthrough.
+                hi = tl.maximum(acc, ori)
+                lo = tl.minimum(acc, ori)
+                acc = tl.where(
                     hi == -float("inf"),
                     -float("inf"),
                     hi + tlmath.log1p(tl.exp(lo - hi)),
                 )
-            tl.store(element_flows + out_ptr, log_eflows, mask = out_mask)
-        else:
-            eflows = tl.where(
-                (log_factor == -float("inf")) | (~mask_c[:, None]),
-                0.0,
-                partial * tl.exp(log_factor),
-            )
-            if ACCUMULATE_CH_FLOWS == 1:
+            else:
                 ori = tl.load(
                     element_flows + out_ptr,
-                    mask = out_mask,
+                    mask = mask_batch[None, :],
                     other = 0.0,
                 )
-                eflows = eflows + ori
-            tl.store(element_flows + out_ptr, eflows, mask = out_mask)
+                acc = acc + ori
+        tl.store(element_flows + out_ptr, acc, mask = mask_batch[None, :])
