@@ -21,9 +21,9 @@ from .sum_layer import SumLayer
 
 class DenseSumLayer(SumLayer):
     """
-    Inference-only fast path for sum layers with fully-connected (dense) block
-    topology. Skips the block-sparse partitioning in ``SumLayer.__init__`` and
-    uses Triton kernels that address parameters by direct pointer arithmetic.
+    Fast path for sum layers with fully-connected (dense) block topology.
+    Skips the block-sparse partitioning in ``SumLayer.__init__`` and uses
+    Triton kernels that address parameters by direct pointer arithmetic.
 
     Only supports:
       * ``SumNodes`` with ``is_block_dense == True``
@@ -36,8 +36,15 @@ class DenseSumLayer(SumLayer):
     same circuit so its ``_param_range`` is already set by the time the
     tied duplicates compile.
 
-    Parameter flow accumulation (learning) is not implemented; callers must
-    pass ``param_flows=None`` to :meth:`backward`.
+    Parameter flows (EM learning) are supported: :meth:`backward` with a
+    ``param_flows`` buffer accumulates per-edge flows at the same flat
+    offsets as the params (``_param_flow_ids`` mirrors ``_param_ids``).
+    Tied duplicates alias the source's pflow region, so their flows
+    accumulate directly into one shared block — no ``compute_cum_par_flows``
+    fusing needed. The pflow kernel loops over the batch inside each
+    program, so every flat offset is owned by exactly one program per
+    launch and accumulation is a deterministic read-modify-write (kernel
+    launches for aliased tied blocks are ordered by the CUDA stream).
     """
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
@@ -153,7 +160,7 @@ class DenseSumLayer(SumLayer):
                 curr_nid,                      # nid_start in node_mars
                 cs._output_ind_range[0],       # cid_start in element_mars
                 block_pid_start,               # pid_start in flat params
-                block_pfid_start,              # pfid_start (unused for inference)
+                block_pfid_start,              # pfid_start in flat param_flows
                 NB, NB_ch, bs, cbs,
             ))
 
@@ -371,7 +378,7 @@ class DenseSumLayer(SumLayer):
         return buf
 
     # ------------------------------------------------------------------ #
-    # Backward (element flows only)
+    # Backward (element flows + optional param flows)
     # ------------------------------------------------------------------ #
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
@@ -383,10 +390,9 @@ class DenseSumLayer(SumLayer):
                  force_use_fp32: bool = False, **kwargs) -> None:
 
         if param_flows is not None:
-            raise NotImplementedError(
-                "DenseSumLayer is inference-only; parameter-flow accumulation "
-                "is not supported. Set use_dense_sum_layer=False on "
-                "TensorCircuit for learning."
+            assert param_flows.dim() == 1, (
+                "DenseSumLayer only supports flat 1-D param_flows; got "
+                f"param_flows.dim()={param_flows.dim()}."
             )
 
         propagation_alg_id = self.propagation_alg_mapping[propagation_alg]
@@ -423,7 +429,7 @@ class DenseSumLayer(SumLayer):
                 )
 
         for block in self._dense_blocks:
-            nid_start, cid_start, pid_start, _pfid_start, NB, NB_ch, bs, cbs = block
+            nid_start, cid_start, pid_start, pfid_start, NB, NB_ch, bs, cbs = block
 
             TILE_N, TILE_K, BLOCK_B, use_tl_dot = _select_bk_tiles(
                 cbs = cbs, bs = bs, batch_size = batch_size,
@@ -459,6 +465,42 @@ class DenseSumLayer(SumLayer):
                 use_tl_dot = use_tl_dot,
                 alpha = alpha,
             )
+
+            if param_flows is not None:
+                P_TILE_M, P_TILE_N, P_TILE_B, use_tl_dot_p = _select_par_tiles(
+                    bs = bs, cbs = cbs, batch_size = batch_size,
+                    NB = NB, NB_ch = NB_ch,
+                    mpe = (propagation_alg_id == 1),
+                )
+                B_NUM_TILES = triton.cdiv(batch_size, P_TILE_B)
+                par_grid = (NB_ch * (cbs // P_TILE_N), NB * (bs // P_TILE_M))
+
+                self._bk_triton_dense_par_kernel[par_grid](
+                    node_flows = node_flows,
+                    node_mars = node_mars,
+                    element_mars = element_mars,
+                    mparams = params,
+                    param_flows = param_flows,
+                    batch_size = batch_size,
+                    nid_start = nid_start,
+                    cid_start = cid_start,
+                    pid_start = pid_start,
+                    pfid_start = pfid_start,
+                    NB_ch = NB_ch,
+                    BS = bs,
+                    CBS = cbs,
+                    allow_modify_flows = 1 if allow_modify_flows else 0,
+                    logspace_flows = 1 if logspace_flows else 0,
+                    allow_neg_flows = 1 if allow_neg_flows else 0,
+                    negate_pflows = 1 if negate_pflows else 0,
+                    TILE_M = P_TILE_M,
+                    TILE_N = P_TILE_N,
+                    TILE_B = P_TILE_B,
+                    B_NUM_TILES = B_NUM_TILES,
+                    propagation_alg_id = propagation_alg_id,
+                    use_tl_dot = use_tl_dot_p,
+                    alpha = alpha,
+                )
 
         return None
 
@@ -959,6 +1001,219 @@ class DenseSumLayer(SumLayer):
         # Store [TILE_N, BLOCK_B]: contiguous / coalesced along BLOCK_B.
         tl.store(element_flows + off_emfs, acc, mask = mask_batch[None, :])
 
+    @staticmethod
+    @triton_jit
+    def _bk_triton_dense_par_kernel(node_flows, node_mars, element_mars,
+                                    mparams, param_flows,
+                                    batch_size: tl.constexpr,
+                                    nid_start: tl.constexpr,
+                                    cid_start: tl.constexpr,
+                                    pid_start: tl.constexpr,
+                                    pfid_start: tl.constexpr,
+                                    NB_ch: tl.constexpr,
+                                    BS: tl.constexpr, CBS: tl.constexpr,
+                                    allow_modify_flows: tl.constexpr,
+                                    logspace_flows: tl.constexpr,
+                                    allow_neg_flows: tl.constexpr,
+                                    negate_pflows: tl.constexpr,
+                                    TILE_M: tl.constexpr, TILE_N: tl.constexpr,
+                                    TILE_B: tl.constexpr,
+                                    B_NUM_TILES: tl.constexpr,
+                                    propagation_alg_id: tl.constexpr,
+                                    use_tl_dot: tl.constexpr, alpha = 0.0):
+        """
+        Param-flow kernel for one DenseSumLayer block. Each program owns one
+        ``[TILE_M, TILE_N]`` (parent, child) tile of a single ``(pblock,
+        cblock)`` edge block and loops over the full batch, so every flat
+        pflow offset is written by exactly one program per launch — the final
+        accumulate is a plain load-add-store (deterministic, no atomics).
+        Aliased pflow regions (tied duplicates) are safe because their
+        launches are ordered on the CUDA stream.
+
+        Math per batch column (LL, mirrors the plain block-sparse par
+        kernel): ``pflow[m, n] += w[m, n] * sum_b exp(emars[n, b] +
+        log_n_fdm[m, b])`` with the per-column max of ``log_n_fdm`` factored
+        out for stability.
+
+        Grid: ``(NB_ch * CBS // TILE_N, NB * BS // TILE_M)``.
+        """
+
+        pid_n = tl.program_id(0)
+        pid_m = tl.program_id(1)
+
+        cblock_id = pid_n // (CBS // TILE_N)
+        tile_id_n = pid_n % (CBS // TILE_N)
+        pblock_id = pid_m // (BS // TILE_M)
+        tile_id_m = pid_m % (BS // TILE_M)
+
+        # Parent (s) / child (c) offsets within their blocks. Both come from
+        # pid modulos, so hint divisibility explicitly.
+        offs_par = tl.arange(0, TILE_M) + tile_id_m * TILE_M       # [TILE_M]
+        offs_par = tl.max_contiguous(tl.multiple_of(offs_par, TILE_M), TILE_M)
+        offs_ch = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
+        offs_ch = tl.max_contiguous(tl.multiple_of(offs_ch, TILE_N), TILE_N)
+
+        off_nid = nid_start + pblock_id * BS + offs_par            # [TILE_M]
+        off_cid = cid_start + cblock_id * CBS + offs_ch            # [TILE_N]
+
+        # Flat (pid, pfid) offsets share the dense layout: edge block
+        # (pblock, cblock) at ``(pblock*NB_ch + cblock) * CBS * BS``, entry
+        # (c, s) at ``c*BS + s`` within it. int64 cast: same int32-range fix
+        # as the other dense kernels.
+        edge_block_off = (pblock_id.to(tl.int64) * NB_ch + cblock_id) * CBS * BS
+        intra_block_offs = offs_ch[None, :] * BS + offs_par[:, None]  # [TILE_M, TILE_N]
+        epars_offs = pid_start + edge_block_off + intra_block_offs
+
+        # MPE compares against log-params inside the batch loop.
+        if propagation_alg_id == 1:
+            epars = tl.load(mparams + epars_offs).to(tl.float32)
+            elpars = tl.log(epars)
+
+        offs_batch = tl.arange(0, TILE_B)
+
+        acc = tl.zeros([TILE_M, TILE_N], dtype = tl.float32)
+
+        for _b in range(0, B_NUM_TILES):
+            mask_batch = offs_batch < batch_size
+
+            # [TILE_M, TILE_B] node-side offsets; BLOCK/TILE_B inner dim is
+            # stride 1 (coalesced).
+            off_node_b = off_nid[:, None] * batch_size + offs_batch[None, :]
+
+            if propagation_alg_id == 1:
+                # MPE: count argmax matches. ``other=inf`` on emars keeps
+                # masked batch columns from ever satisfying the match
+                # predicate.
+                emars = tl.load(
+                    element_mars + off_cid[None, :] * batch_size +
+                    offs_batch[:, None],
+                    mask = mask_batch[:, None], other = float("inf"),
+                )  # [TILE_B, TILE_N]
+                nmars = tl.load(
+                    node_mars + off_node_b, mask = mask_batch[None, :],
+                    other = 0.0,
+                )  # [TILE_M, TILE_B]
+                if logspace_flows == 1:
+                    nflows_log = tl.load(
+                        node_flows + off_node_b, mask = mask_batch[None, :],
+                        other = -float("inf"),
+                    )
+                    nflows = tl.exp(nflows_log)
+                else:
+                    nflows = tl.load(
+                        node_flows + off_node_b, mask = mask_batch[None, :],
+                        other = 0.0,
+                    )
+
+                cond = tl.abs(
+                    elpars[:, None, :] + emars[None, :, :]
+                    - nmars[:, :, None]
+                ) < 1e-6
+                acc += tl.sum(
+                    tl.where(cond, nflows[:, :, None], 0.0), axis = 1,
+                )
+            else:
+                # LL / GeneralLL. emars ``other=0.0`` is safe: masked batch
+                # columns have ``log_n_fdm_max == -inf`` so their
+                # ``scaled_emars`` column is exp(-inf) = 0.
+                emars = tl.load(
+                    element_mars + off_cid[None, :] * batch_size +
+                    offs_batch[:, None],
+                    mask = mask_batch[:, None], other = 0.0,
+                )  # [TILE_B, TILE_N]
+
+                if allow_modify_flows == 1:
+                    # node_flows pre-transformed to log(flow) - nmars
+                    # (times alpha for GeneralLL) by the modify pre-pass.
+                    log_n_fdm = tl.load(
+                        node_flows + off_node_b, mask = mask_batch[None, :],
+                        other = -float("inf"),
+                    )  # [TILE_M, TILE_B]
+                    if propagation_alg_id == 2:
+                        nmars = tl.load(
+                            node_mars + off_node_b,
+                            mask = mask_batch[None, :], other = 0.0,
+                        )
+                        log_n_fdm += (alpha - 1.0) * nmars
+                else:
+                    nmars = tl.load(
+                        node_mars + off_node_b, mask = mask_batch[None, :],
+                        other = 0.0,
+                    )  # [TILE_M, TILE_B]
+                    if logspace_flows == 1:
+                        nflows_log = tl.load(
+                            node_flows + off_node_b,
+                            mask = mask_batch[None, :],
+                            other = -float("inf"),
+                        )
+                        log_n_fdm = tl.where(
+                            nmars == -float("inf"), -float("inf"),
+                            nflows_log - nmars,
+                        )
+                    elif allow_neg_flows == 1:
+                        log_n_fdm = tl.where(
+                            nmars == -float("inf"), -float("inf"), -nmars,
+                        )
+                    else:
+                        nflows = tl.load(
+                            node_flows + off_node_b,
+                            mask = mask_batch[None, :], other = 0.0,
+                        )
+                        log_n_fdm = tl.where(
+                            nmars == -float("inf"), -float("inf"),
+                            tl.log(nflows) - nmars,
+                        )
+
+                # Factor out the per-batch-column max across the parent tile.
+                log_n_fdm_max = tl.max(log_n_fdm, axis = 0)        # [TILE_B]
+                n_fdm_sub = tl.where(
+                    log_n_fdm_max[None, :] != -float("inf"),
+                    tl.exp(log_n_fdm - log_n_fdm_max[None, :]), 0.0,
+                )  # [TILE_M, TILE_B]
+                scaled_emars = tl.exp(
+                    emars + log_n_fdm_max[:, None],
+                )  # [TILE_B, TILE_N]
+
+                if allow_neg_flows == 1:
+                    nflows = tl.load(
+                        node_flows + off_node_b, mask = mask_batch[None, :],
+                        other = 0.0,
+                    )
+                    if use_tl_dot == 1:
+                        partial_flows = tl.dot(n_fdm_sub * nflows, scaled_emars)
+                    else:
+                        partial_flows = tl.sum(
+                            (n_fdm_sub * nflows)[:, :, None]
+                            * scaled_emars[None, :, :], axis = 1,
+                        )
+                else:
+                    if use_tl_dot == 1:
+                        partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                    else:
+                        partial_flows = tl.sum(
+                            n_fdm_sub[:, :, None] * scaled_emars[None, :, :],
+                            axis = 1,
+                        )
+
+                acc += partial_flows
+
+            offs_batch += TILE_B
+
+        if propagation_alg_id != 1:
+            # Upcast covers bf16 params transparently (mirrors the ele
+            # kernel); pflows always accumulate in fp32.
+            epars = tl.load(mparams + epars_offs).to(tl.float32)
+            pflows = acc * epars
+        else:
+            pflows = acc
+
+        pf_offs = pfid_start + edge_block_off + intra_block_offs
+        ori = tl.load(param_flows + pf_offs)
+        if negate_pflows == 1:
+            tl.store(param_flows + pf_offs, ori - pflows)
+        else:
+            tl.store(param_flows + pf_offs, ori + pflows)
+
 
 def _greatest_power_of_2_divisor(n: int, cap: int) -> int:
     # Largest power of 2 that divides n and is ≤ cap.
@@ -1016,6 +1271,14 @@ def _select_fw_tiles(bs: int, total_edges: int, batch_size: int, NB: int,
     BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
     if BLOCK_B < 1:
         BLOCK_B = 1
+    # Triton (observed on 3.6 / H100) miscompiles a 3-D broadcast reduction
+    # over the MIDDLE axis — ``tl.sum(a[:,:,None] * b[None,:,:], axis=1)`` —
+    # when that axis is < 8 and BOTH outer dims are >= 16: the result comes
+    # out scaled by 8/axis_size. The non-tl.dot path reduces over TILE_K, so
+    # when TILE_K < 8 keep one outer dim (BLOCK_B) below 16 to stay on
+    # verified-safe shapes.
+    if TILE_K < 8:
+        BLOCK_B = min(BLOCK_B, 8)
 
     target_grid = _target_grid_size(torch.cuda.current_device())
     TILE_M, BLOCK_B = _shrink_for_grid(
@@ -1036,6 +1299,37 @@ def _select_fw_tiles(bs: int, total_edges: int, batch_size: int, NB: int,
     return TILE_M, TILE_K, BLOCK_B, use_bf16, use_tl_dot
 
 
+def _select_par_tiles(bs: int, cbs: int, batch_size: int, NB: int, NB_ch: int,
+                      mpe: bool = False):
+    # Param-flow grid is (NB_ch * cbs/TILE_N, NB * bs/TILE_M); the batch is
+    # looped inside each program (deterministic accumulation, no atomics), so
+    # only TILE_M / TILE_N can grow the grid — shrink them toward the
+    # tl.dot-friendly 16 floor when the launch is too small. Reuse
+    # ``_shrink_for_grid`` with the child-edge count standing in for the
+    # batch axis.
+    #
+    # MPE materialises a [TILE_M, TILE_B, TILE_N] broadcast (no tl.dot), so
+    # cap its tiles at 16 to keep register pressure sane.
+    tile_cap = 16 if mpe else 64
+    TILE_M = _greatest_power_of_2_divisor(bs, tile_cap)
+    TILE_N = _greatest_power_of_2_divisor(cbs, tile_cap)
+    # Floor TILE_B at 8: Triton (observed on 3.x / H100) miscompiles
+    # ``tl.sum(a[:,:,None] * b[None,:,:], axis=1)`` when the reduction axis
+    # is < 8, scaling the result by 8/axis_size. Masked tail lanes
+    # contribute exact zeros, so an oversized batch tile is always safe.
+    TILE_B = max(min(triton.next_power_of_2(batch_size), tile_cap), 8)
+
+    target_grid = _target_grid_size(torch.cuda.current_device())
+    TILE_M, TILE_N = _shrink_for_grid(
+        tile_m = TILE_M, block_b = TILE_N,
+        m_total = NB * bs, batch_size = NB_ch * cbs,
+        target_grid = target_grid,
+    )
+
+    use_tl_dot = 1 if (TILE_M >= 16 and TILE_N >= 16 and TILE_B >= 16) else 0
+    return TILE_M, TILE_N, TILE_B, use_tl_dot
+
+
 def _select_bk_tiles(cbs: int, bs: int, batch_size: int, NB_ch: int,
                      force_use_fp32: bool):
     # Backward grid is (ceil(B/BLOCK_B), NB_ch * cbs/TILE_N). TILE_K loops
@@ -1046,6 +1340,13 @@ def _select_bk_tiles(cbs: int, bs: int, batch_size: int, NB_ch: int,
     BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
     if BLOCK_B < 1:
         BLOCK_B = 1
+    # Same Triton middle-axis-reduction guard as ``_select_fw_tiles``: the
+    # non-tl.dot backward path reduces over TILE_K (the parent axis), which
+    # is < 8 for bs < 8 layers (e.g. every block_size-1 root). Without the
+    # cap, element flows at BLOCK_B >= 16 come out scaled by 8/TILE_K —
+    # invisible to normalised queries but fatal for param-flow accumulation.
+    if TILE_K < 8:
+        BLOCK_B = min(BLOCK_B, 8)
 
     target_grid = _target_grid_size(torch.cuda.current_device())
     TILE_N, BLOCK_B = _shrink_for_grid(

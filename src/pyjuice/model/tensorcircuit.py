@@ -1258,13 +1258,14 @@ class TensorCircuit(nn.Module):
                     # state with the block-sparse path we cannot round-trip
                     # through yet).
                     def _dense_eligible(ns):
-                        # Tied nodes are fine here: both DenseSumLayer and
-                        # SparseInputSumLayer are inference-only and just need
-                        # ``_param_range`` (which a tied ns aliases from its
-                        # source). Supporting tied is what makes homogeneous
-                        # HMMs at realistic sizes feasible — untied builds
-                        # duplicate H×H transitions × (T-1) on the CPU at DAG
-                        # construction.
+                        # Tied nodes are fine here: a tied ns aliases the
+                        # source's ``_param_range`` / ``_param_flow_range``,
+                        # so tied duplicates share one param block and
+                        # accumulate pflows straight into the source's
+                        # region (no cum-par-flow fusing). Supporting tied
+                        # is what makes homogeneous HMMs at realistic sizes
+                        # feasible — untied builds duplicate H×H transitions
+                        # × (T-1) on the CPU at DAG construction.
                         return (self.use_dense_sum_layer
                                 and ns.is_block_dense
                                 and len(ns.chs) == 1)
