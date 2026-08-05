@@ -585,8 +585,11 @@ class DenseSumLayer(SumLayer):
             emars_ptr = emars_bf16_in + \
                 offs_edge[:, None] * batch_size + offs_batch[None, :]
         else:
+            # int64 cast on the row index: ``node_id * batch_size`` exceeds
+            # 2^31 once the mars/flows buffers pass 2^31 elements, and Triton
+            # computes scalar-offset arithmetic in int32.
             emars_ptr = element_mars + \
-                (cid_start + offs_edge)[:, None] * batch_size + \
+                (cid_start + offs_edge).to(tl.int64)[:, None] * batch_size + \
                 offs_batch[None, :]                         # [TILE_K, BLOCK_B]
         # Pointer into the per-tile max: element_mars_max[k_tile, batch_tile].
         emax_ptr = element_mars_max + pid_b * BLOCK_B + tl.arange(0, BLOCK_B)
@@ -660,8 +663,9 @@ class DenseSumLayer(SumLayer):
             acc = acc * (1.0 / alpha)
 
         # Store [TILE_M, BLOCK_B]: inner dim BLOCK_B is stride 1 (contiguous,
-        # coalesced), outer dim TILE_M is stride batch_size.
-        off_out = off_nid[:, None] * batch_size + offs_batch[None, :]
+        # coalesced), outer dim TILE_M is stride batch_size. int64: the flat
+        # node_mars offset can exceed 2^31.
+        off_out = off_nid.to(tl.int64)[:, None] * batch_size + offs_batch[None, :]
         tl.store(node_mars + off_out, acc, mask = mask_batch[None, :])
 
     @staticmethod
@@ -703,8 +707,9 @@ class DenseSumLayer(SumLayer):
         offs_edge = tl.arange(0, TILE_K)
         offs_child = cid_start + k_tile_id * TILE_K + offs_edge
 
-        # emars tile: [TILE_K, BLOCK_B], BLOCK_B inner dim stride 1.
-        emars_ptr = element_mars + offs_child[:, None] * batch_size + \
+        # emars tile: [TILE_K, BLOCK_B], BLOCK_B inner dim stride 1. int64:
+        # the flat element_mars offset can exceed 2^31.
+        emars_ptr = element_mars + offs_child.to(tl.int64)[:, None] * batch_size + \
             offs_batch[None, :]
         emars = tl.load(
             emars_ptr, mask = mask_batch[None, :], other = -float("inf"),
@@ -770,7 +775,8 @@ class DenseSumLayer(SumLayer):
         # [BLOCK_M, BLOCK_B] tile:
         #   inner dim (BLOCK_B): stride 1         — contiguous / coalesced
         #   outer dim (BLOCK_M): stride batch_size
-        off_nmfs = (nid_start + offs_m)[:, None] * batch_size + offs_batch[None, :]
+        # int64: the flat node_flows offset can exceed 2^31.
+        off_nmfs = (nid_start + offs_m).to(tl.int64)[:, None] * batch_size + offs_batch[None, :]
         mask = mask_m[:, None] & mask_batch[None, :]
 
         # Both loads: BLOCK_B inner dim is stride 1 (contiguous).
@@ -823,7 +829,8 @@ class DenseSumLayer(SumLayer):
         # by TILE_N is not inferred automatically — hint it.
         offs_child = tl.arange(0, TILE_N) + tile_id_n * TILE_N    # [TILE_N]
         offs_child = tl.max_contiguous(tl.multiple_of(offs_child, TILE_N), TILE_N)
-        off_cid = cid_start + cblock_id * CBS + offs_child
+        # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
+        off_cid = (cid_start + cblock_id * CBS + offs_child).to(tl.int64)
 
         # Batch offsets: mult/contig of BLOCK_B.
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
@@ -857,7 +864,9 @@ class DenseSumLayer(SumLayer):
             off_pwithin = tl.max_contiguous(
                 tl.multiple_of(off_pwithin, TILE_K), TILE_K
             )
-            off_mid = nid_start + pblock_id * BS + off_pwithin
+            # int64: ``* batch_size`` offsets can exceed 2^31 (see forward
+            # kernel).
+            off_mid = (nid_start + pblock_id * BS + off_pwithin).to(tl.int64)
 
             # Edge block base for (pblock_id, cblock_id). Scalar multiple of BS.
             # int64 cast: same int32-range fix as the forward kernel — the
@@ -1053,8 +1062,9 @@ class DenseSumLayer(SumLayer):
         offs_ch = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
         offs_ch = tl.max_contiguous(tl.multiple_of(offs_ch, TILE_N), TILE_N)
 
-        off_nid = nid_start + pblock_id * BS + offs_par            # [TILE_M]
-        off_cid = cid_start + cblock_id * CBS + offs_ch            # [TILE_N]
+        # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
+        off_nid = (nid_start + pblock_id * BS + offs_par).to(tl.int64)   # [TILE_M]
+        off_cid = (cid_start + cblock_id * CBS + offs_ch).to(tl.int64)   # [TILE_N]
 
         # Flat (pid, pfid) offsets share the dense layout: edge block
         # (pblock, cblock) at ``(pblock*NB_ch + cblock) * CBS * BS``, entry

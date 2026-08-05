@@ -466,8 +466,11 @@ class BlockDiagonalSumLayer(SumLayer):
         # Load all CBS child marginals for this parent block. Children for
         # block ``pid_nb`` live at ``cid_start + pid_nb*CBS + c`` — disjoint
         # from every other parent block (no cross-block read).
+        # int64 cast on the row index: ``node_id * batch_size`` exceeds 2^31
+        # once the mars/flows buffers pass 2^31 elements (e.g. ~385k nodes at
+        # B=8192), and Triton computes scalar-offset arithmetic in int32.
         emars_ptr = (
-            (cid_start + pid_nb * CBS + offs_c)[:, None] * batch_size
+            (cid_start + pid_nb * CBS + offs_c).to(tl.int64)[:, None] * batch_size
             + offs_batch[None, :]
         )
         emars = tl.load(
@@ -517,7 +520,7 @@ class BlockDiagonalSumLayer(SumLayer):
         )
 
         out_ptr = (
-            (nid_start + pid_nb * BS + offs_s)[:, None] * batch_size
+            (nid_start + pid_nb * BS + offs_s).to(tl.int64)[:, None] * batch_size
             + offs_batch[None, :]
         )
         tl.store(
@@ -585,7 +588,8 @@ class BlockDiagonalSumLayer(SumLayer):
 
         offs_child = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
         offs_child = tl.max_contiguous(tl.multiple_of(offs_child, TILE_N), TILE_N)
-        off_cid = cid_start + pblock_id * CBS + offs_child
+        # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
+        off_cid = (cid_start + pblock_id * CBS + offs_child).to(tl.int64)
 
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
@@ -612,7 +616,9 @@ class BlockDiagonalSumLayer(SumLayer):
             off_pwithin = tl.max_contiguous(
                 tl.multiple_of(off_pwithin, TILE_K), TILE_K
             )
-            off_mid = nid_start + pblock_id * BS + off_pwithin
+            # int64: ``* batch_size`` offsets can exceed 2^31 (see forward
+            # kernel).
+            off_mid = (nid_start + pblock_id * BS + off_pwithin).to(tl.int64)
 
             # Weights [TILE_N, TILE_K]: mparams[block_base + c*BS + s]
             # (child-major rows, parent stride 1 — coalesced inner dim).
@@ -760,8 +766,9 @@ class BlockDiagonalSumLayer(SumLayer):
         offs_ch = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
         offs_ch = tl.max_contiguous(tl.multiple_of(offs_ch, TILE_N), TILE_N)
 
-        off_nid = nid_start + pblock_id * BS + offs_par            # [TILE_M]
-        off_cid = cid_start + pblock_id * CBS + offs_ch            # [TILE_N]
+        # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
+        off_nid = (nid_start + pblock_id * BS + offs_par).to(tl.int64)  # [TILE_M]
+        off_cid = (cid_start + pblock_id * CBS + offs_ch).to(tl.int64)  # [TILE_N]
 
         # Flat (pid, pfid) offsets share the BD layout: diagonal block
         # ``pblock`` at ``pblock * BS * CBS``, entry (c, s) at ``c*BS + s``
