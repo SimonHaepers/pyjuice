@@ -16,7 +16,7 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.parameter_list import FastParamList
 from .layer import Layer
 from .sum_layer import SumLayer
-from .dense_sum_layer import DenseSumLayer, _select_bk_tiles
+from .dense_sum_layer import DenseSumLayer, _select_bk_tiles, _select_par_tiles
 
 
 class BlockDiagonalSumLayer(SumLayer):
@@ -43,8 +43,12 @@ class BlockDiagonalSumLayer(SumLayer):
       * ``NB == NB_ch`` and ``bs == cbs`` (square blocks — the natural
         Monarch case; relax later if a non-square use case appears).
       * ``edge_ids`` is exactly ``arange(NB)[None, :].repeat(2, 1)``.
-      * ``param_flows`` writes are rejected (inference-only in phase 1 —
-        see plan ``look-i-m-trying-to-eventual-waterfall.md``).
+
+    Param flows are supported: :meth:`backward` accumulates them via
+    :meth:`_bk_bd_par_kernel` — each program owns one ``[TILE_M, TILE_N]``
+    tile of a single diagonal block and loops over the batch, so writes
+    are deterministic load-add-stores (no atomics), same contract as
+    :class:`DenseSumLayer`.
 
     Tied ``SumNodes`` are supported: ``_param_range`` / ``_param_flow_range``
     alias the source's, same protocol as :class:`DenseSumLayer`.
@@ -180,7 +184,7 @@ class BlockDiagonalSumLayer(SumLayer):
                 curr_nid,                      # nid_start in node_mars
                 cs._output_ind_range[0],       # cid_start in element_mars
                 block_pid_start,               # pid_start in flat params
-                block_pfid_start,              # pfid_start (unused phase 1)
+                block_pfid_start,              # pfid_start in flat param_flows
                 NB, bs, cbs,
             ))
 
@@ -274,7 +278,7 @@ class BlockDiagonalSumLayer(SumLayer):
         return None
 
     # ------------------------------------------------------------------ #
-    # Backward (element flows only — phase 1)
+    # Backward
     # ------------------------------------------------------------------ #
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
@@ -285,16 +289,11 @@ class BlockDiagonalSumLayer(SumLayer):
                  accumulate_ch_flows: bool = False, allow_neg_flows: bool = False,
                  force_use_fp32: bool = False, **kwargs) -> None:
 
-        # ``param_flows`` is accepted (so the standard
-        # :meth:`TensorCircuit.backward` pipeline runs through cleanly with
-        # ``compute_param_flows=True`` for the input layers / other sums)
-        # but **silently ignored** here — the BD kernel writes element
-        # flows only. See the plan in
-        # ``look-i-m-trying-to-eventual-waterfall.md``; EM-style param-flow
-        # accumulation is phase 2 work. Callers that need correct
-        # ``param_flows`` for this sum's parameters must use the plain
-        # :class:`SumLayer` (e.g. via ``summate(_force_plain=True)``).
-        del param_flows
+        if param_flows is not None:
+            assert param_flows.dim() == 1, (
+                "BlockDiagonalSumLayer only supports flat 1-D param_flows; "
+                f"got param_flows.dim()={param_flows.dim()}."
+            )
         assert propagation_alg == "LL", (
             "BlockDiagonalSumLayer.backward currently supports only LL."
         )
@@ -335,7 +334,7 @@ class BlockDiagonalSumLayer(SumLayer):
                 )
 
         for block in self._bd_blocks:
-            nid_start, cid_start, pid_start, _pfid_start, NB, bs, cbs = block
+            nid_start, cid_start, pid_start, pfid_start, NB, bs, cbs = block
 
             # Same tile policy as the dense backward: 2-D [TILE_N, BLOCK_B]
             # output tiles with a serial TILE_K loop over the parent rows.
@@ -370,6 +369,43 @@ class BlockDiagonalSumLayer(SumLayer):
                 LOGSPACE_FLOWS = 1 if logspace_flows else 0,
                 USE_TL_DOT = use_tl_dot,
             )
+
+            if param_flows is not None:
+                # ``NB_ch = 1``: only the diagonal ``(pblock, pblock)`` edge
+                # blocks exist, so the true launch grid is
+                # ``NB * (cbs/TILE_N) * (bs/TILE_M)`` — with the child-slot
+                # stand-in reduced to a single block's ``cbs``, the
+                # grid-saturation estimate inside ``_select_par_tiles``
+                # matches it exactly.
+                P_TILE_M, P_TILE_N, P_TILE_B, use_tl_dot_p = _select_par_tiles(
+                    bs = bs, cbs = cbs, batch_size = batch_size,
+                    NB = NB, NB_ch = 1,
+                )
+                B_NUM_TILES = triton.cdiv(batch_size, P_TILE_B)
+                par_grid = (NB * (cbs // P_TILE_N), bs // P_TILE_M)
+
+                self._bk_bd_par_kernel[par_grid](
+                    node_flows = node_flows,
+                    node_mars = node_mars,
+                    element_mars = element_mars,
+                    mparams = params,
+                    param_flows = param_flows,
+                    batch_size = batch_size,
+                    nid_start = nid_start,
+                    cid_start = cid_start,
+                    pid_start = pid_start,
+                    pfid_start = pfid_start,
+                    BS = bs,
+                    CBS = cbs,
+                    TILE_M = P_TILE_M,
+                    TILE_N = P_TILE_N,
+                    TILE_B = P_TILE_B,
+                    B_NUM_TILES = B_NUM_TILES,
+                    ALLOW_MODIFY_FLOWS = 1 if allow_modify_flows else 0,
+                    LOGSPACE_FLOWS = 1 if logspace_flows else 0,
+                    NEGATE_PFLOWS = 1 if negate_pflows else 0,
+                    USE_TL_DOT = use_tl_dot_p,
+                )
 
         return None
 
@@ -670,3 +706,152 @@ class BlockDiagonalSumLayer(SumLayer):
                 )
                 acc = acc + ori
         tl.store(element_flows + out_ptr, acc, mask = mask_batch[None, :])
+
+    @staticmethod
+    @triton_jit
+    def _bk_bd_par_kernel(node_flows, node_mars, element_mars, mparams,
+                          param_flows,
+                          batch_size,
+                          nid_start, cid_start, pid_start, pfid_start,
+                          BS, CBS,
+                          TILE_M: tl.constexpr,
+                          TILE_N: tl.constexpr,
+                          TILE_B: tl.constexpr,
+                          B_NUM_TILES: tl.constexpr,
+                          ALLOW_MODIFY_FLOWS: tl.constexpr,
+                          LOGSPACE_FLOWS: tl.constexpr,
+                          NEGATE_PFLOWS: tl.constexpr,
+                          USE_TL_DOT: tl.constexpr):
+        """
+        Param-flow kernel for one BlockDiagonalSumLayer block — the BD
+        specialisation of ``DenseSumLayer._bk_triton_dense_par_kernel``:
+        only the diagonal ``(pblock, pblock)`` edge blocks exist, so
+        ``pid_n`` decomposes into ``(parent_block, TILE_N child tile)`` and
+        the parent/child rows both come from block ``pblock_id``.
+
+        Each program owns one ``[TILE_M, TILE_N]`` (parent, child) tile of
+        a single diagonal block and loops over the full batch, so every
+        flat pflow offset is written by exactly one program per launch —
+        the final accumulate is a plain load-add-store (deterministic, no
+        atomics). Aliased pflow regions (tied duplicates, e.g. an HMM chain
+        sharing one ``pfid_start``) are safe because their launches are
+        ordered on the CUDA stream.
+
+        Math per batch column (LL only — the layer asserts LL):
+        ``pflow[s, c] += w[s, c] * sum_b exp(emars[c, b] + log_n_fdm[s, b])``
+        with ``log_n_fdm = log(parent_flow) - log_marg`` and its per-column
+        max factored out for stability.
+
+        Grid: ``(NB * CBS // TILE_N, BS // TILE_M)``.
+
+        ``TILE_M`` divides ``BS`` and ``TILE_N`` divides ``CBS`` (both
+        powers of two from ``_select_par_tiles``), so only the batch dim is
+        masked.
+        """
+
+        pid_n = tl.program_id(0)        # (parent block, child tile)
+        pid_m = tl.program_id(1)        # parent tile within the block
+
+        pblock_id = pid_n // (CBS // TILE_N)
+        tile_id_n = pid_n % (CBS // TILE_N)
+
+        offs_par = tl.arange(0, TILE_M) + pid_m * TILE_M           # [TILE_M]
+        offs_par = tl.max_contiguous(tl.multiple_of(offs_par, TILE_M), TILE_M)
+        offs_ch = tl.arange(0, TILE_N) + tile_id_n * TILE_N        # [TILE_N]
+        offs_ch = tl.max_contiguous(tl.multiple_of(offs_ch, TILE_N), TILE_N)
+
+        off_nid = nid_start + pblock_id * BS + offs_par            # [TILE_M]
+        off_cid = cid_start + pblock_id * CBS + offs_ch            # [TILE_N]
+
+        # Flat (pid, pfid) offsets share the BD layout: diagonal block
+        # ``pblock`` at ``pblock * BS * CBS``, entry (c, s) at ``c*BS + s``
+        # within it. int64 cast: same int32 worst-case-range fix as the
+        # other BD kernels.
+        block_off = pblock_id.to(tl.int64) * BS * CBS
+        intra_block_offs = offs_ch[None, :] * BS + offs_par[:, None]  # [TILE_M, TILE_N]
+
+        offs_batch = tl.arange(0, TILE_B)
+
+        acc = tl.zeros([TILE_M, TILE_N], dtype = tl.float32)
+
+        for _b in range(0, B_NUM_TILES):
+            mask_batch = offs_batch < batch_size
+
+            # [TILE_M, TILE_B] node-side offsets; the TILE_B inner dim is
+            # stride 1 (coalesced).
+            off_node_b = off_nid[:, None] * batch_size + offs_batch[None, :]
+
+            # ``other=0.0`` on emars is safe: masked batch columns have
+            # ``log_n_fdm_max == -inf`` so their ``scaled_emars`` column is
+            # exp(-inf) = 0.
+            emars = tl.load(
+                element_mars + off_cid[None, :] * batch_size +
+                offs_batch[:, None],
+                mask = mask_batch[:, None], other = 0.0,
+            )  # [TILE_B, TILE_N]
+
+            if ALLOW_MODIFY_FLOWS == 1:
+                # node_flows pre-transformed to log(flow) - nmars by the
+                # modify pre-pass in :meth:`backward`.
+                log_n_fdm = tl.load(
+                    node_flows + off_node_b, mask = mask_batch[None, :],
+                    other = -float("inf"),
+                )  # [TILE_M, TILE_B]
+            else:
+                nmars = tl.load(
+                    node_mars + off_node_b, mask = mask_batch[None, :],
+                    other = 0.0,
+                )  # [TILE_M, TILE_B]
+                if LOGSPACE_FLOWS == 1:
+                    nflows_log = tl.load(
+                        node_flows + off_node_b,
+                        mask = mask_batch[None, :],
+                        other = -float("inf"),
+                    )
+                    log_n_fdm = tl.where(
+                        nmars == -float("inf"), -float("inf"),
+                        nflows_log - nmars,
+                    )
+                else:
+                    nflows = tl.load(
+                        node_flows + off_node_b,
+                        mask = mask_batch[None, :], other = 0.0,
+                    )
+                    log_n_fdm = tl.where(
+                        nmars == -float("inf"), -float("inf"),
+                        tl.log(nflows) - nmars,
+                    )
+
+            # Factor out the per-batch-column max across the parent tile.
+            log_n_fdm_max = tl.max(log_n_fdm, axis = 0)            # [TILE_B]
+            n_fdm_sub = tl.where(
+                log_n_fdm_max[None, :] != -float("inf"),
+                tl.exp(log_n_fdm - log_n_fdm_max[None, :]), 0.0,
+            )  # [TILE_M, TILE_B]
+            scaled_emars = tl.exp(
+                emars + log_n_fdm_max[:, None],
+            )  # [TILE_B, TILE_N]
+
+            if USE_TL_DOT == 1:
+                partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+            else:
+                partial_flows = tl.sum(
+                    n_fdm_sub[:, :, None] * scaled_emars[None, :, :],
+                    axis = 1,
+                )
+
+            acc += partial_flows
+
+            offs_batch += TILE_B
+
+        # Upcast covers bf16 params transparently; pflows always accumulate
+        # in fp32.
+        epars = tl.load(mparams + pid_start + block_off + intra_block_offs)
+        pflows = acc * epars.to(tl.float32)
+
+        pf_offs = pfid_start + block_off + intra_block_offs
+        ori = tl.load(param_flows + pf_offs)
+        if NEGATE_PFLOWS == 1:
+            tl.store(param_flows + pf_offs, ori - pflows)
+        else:
+            tl.store(param_flows + pf_offs, ori + pflows)

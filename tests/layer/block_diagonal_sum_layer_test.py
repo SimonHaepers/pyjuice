@@ -219,22 +219,16 @@ def test_backward_parity(device, NB, block_size):
     # plumbing (node_mars, element_mars, node_flows, element_flows) is set
     # up identically on both sides. ``allow_modify_flows=False`` keeps
     # ``node_flows`` in canonical (parent-flow) form so the comparison is
-    # apples-to-apples. We compare only the sum-layer's element-flow
-    # output (not the input-layer param_flows), but pyjuice's backward
-    # always accumulates input-layer param_flows so we leave
-    # ``compute_param_flows`` at the default. The BD layer's own
-    # ``param_flows=None`` path is exercised because the sum-layer
-    # ``backward`` dispatch routes through ``param_flows`` only when
-    # ``flows_memory > 0`` and the param_flows kernel is the sum-layer
-    # one (not the input layer's), which we don't reach.
+    # apples-to-apples. Param-flow parity has its own tests below — here we
+    # compare only the flow tensors.
     pc_bd(data)
     pc_plain(data)
     pc_bd.backward(data, allow_modify_flows=False)
     pc_plain.backward(data, allow_modify_flows=False)
 
     # Compare element_flows directly — that's what the BD backward kernel
-    # writes (no param_flows path). ``node_flows`` parity falls out of
-    # parent-side propagation through the rest of the circuit.
+    # writes. ``node_flows`` parity falls out of parent-side propagation
+    # through the rest of the circuit.
     ef_bd = pc_bd.element_flows.detach()
     ef_plain = pc_plain.element_flows.detach()
     diff = (ef_bd - ef_plain).abs().max().item()
@@ -250,6 +244,131 @@ def test_backward_parity(device, NB, block_size):
         f"backward node_flows mismatch (NB={NB}, bs={block_size}): "
         f"max abs diff = {diff_nf:.3e}"
     )
+
+
+# ---------------------------------------------------------------------- #
+# Param flows
+# ---------------------------------------------------------------------- #
+
+
+def _matched_sum_nodes(pc_a, pc_b):
+    ns_a = [ns for ns in pc_a.root_ns if ns.is_sum() and not ns.is_tied()]
+    ns_b = [ns for ns in pc_b.root_ns if ns.is_sum() and not ns.is_tied()]
+    assert len(ns_a) == len(ns_b), "DAG topology mismatch"
+    return list(zip(ns_a, ns_b))
+
+
+# NOTE: plain-referenced rows keep B a power of 2 — the plain SumLayer's own
+# B>1 pflow path writes at wrong offsets for non-pow2 B at bs>=8
+# (pre-existing bug, present on main). Non-pow2 B coverage lives in
+# test_param_flows_batched_matches_loop, which needs no plain reference.
+@pytest.mark.parametrize("NB,block_size", [
+    (4, 8),
+    (8, 16),
+])
+@pytest.mark.parametrize("B", [1, 8, 32])
+@pytest.mark.parametrize("allow_modify_flows", [True, False])
+def test_param_flows_match_plain(device, NB, block_size, B, allow_modify_flows):
+    pc_bd, pc_plain = _build_bd_summate_pair(
+        num_vars=3, V=8, NB=NB, block_size=block_size, seed=17 + NB,
+        device=device,
+    )
+
+    torch.manual_seed(23)
+    data = torch.randint(0, 8, (B, 3), device=device)
+
+    pc_bd(data)
+    pc_plain(data)
+    pc_bd.backward(data, compute_param_flows=True, flows_memory=0.0,
+                   allow_modify_flows=allow_modify_flows)
+    pc_plain.backward(data, compute_param_flows=True, flows_memory=0.0,
+                      allow_modify_flows=allow_modify_flows)
+
+    for ns_bd, ns_p in _matched_sum_nodes(pc_bd, pc_plain):
+        ns_bd.update_param_flows(pc_bd.param_flows, origin_ns_only=True)
+        ns_p.update_param_flows(pc_plain.param_flows, origin_ns_only=True)
+        pf_bd = ns_bd._param_flows.detach()
+        pf_p = ns_p._param_flows.detach()
+        abs_diff = (pf_bd - pf_p).abs().max().item()
+        rel_scale = max(pf_p.abs().max().item(), 1e-6)
+        assert abs_diff / rel_scale < 5e-3, (
+            f"param_flow mismatch (NB={NB}, bs={block_size}, B={B}, "
+            f"modify={allow_modify_flows}): max abs diff = {abs_diff:.3e}, "
+            f"scale = {rel_scale:.3e}"
+        )
+
+
+@pytest.mark.parametrize("B", [7, 13])
+def test_param_flows_batched_matches_loop(device, B):
+    """One batched backward must accumulate the same param flows as B
+    single-sample backward calls summed on host. Covers non-power-of-2 B
+    (batch-tile tail masking) without relying on the plain reference."""
+    pc, _ = _build_bd_summate_pair(
+        num_vars=3, V=8, NB=4, block_size=16, seed=29, device=device,
+    )
+
+    torch.manual_seed(41)
+    data = torch.randint(0, 8, (B, 3), device=device)
+
+    sum_nodes = [ns for ns in pc.root_ns if ns.is_sum() and not ns.is_tied()]
+
+    pf_loop = {}
+    for b in range(B):
+        pc(data[b:b + 1])
+        pc.backward(data[b:b + 1], compute_param_flows=True, flows_memory=0.0)
+        for ns in sum_nodes:
+            ns.update_param_flows(pc.param_flows, origin_ns_only=True)
+            pf_b = ns._param_flows.detach().clone()
+            key = id(ns)
+            pf_loop[key] = pf_b if key not in pf_loop else pf_loop[key] + pf_b
+
+    pc(data)
+    pc.backward(data, compute_param_flows=True, flows_memory=0.0)
+    for ns in sum_nodes:
+        ns.update_param_flows(pc.param_flows, origin_ns_only=True)
+        pf_batched = ns._param_flows.detach()
+        # rtol accommodates TF32: the batched pass can take the tl.dot path
+        # while the B=1 loop passes use the fp32 non-dot path.
+        torch.testing.assert_close(
+            pf_batched, pf_loop[id(ns)], rtol=5e-3, atol=1e-4,
+        )
+
+
+def test_em_step_matches_plain(device):
+    """One full EM update lands on the same params as the plain path."""
+    NB, block_size, B = 4, 16, 8
+    pc_bd, pc_plain = _build_bd_summate_pair(
+        num_vars=3, V=8, NB=NB, block_size=block_size, seed=37, device=device,
+    )
+
+    torch.manual_seed(43)
+    data = torch.randint(0, 8, (B, 3), device=device)
+
+    pc_bd(data)
+    pc_plain(data)
+    pc_bd.backward(data, compute_param_flows=True, flows_memory=0.0)
+    pc_plain.backward(data, compute_param_flows=True, flows_memory=0.0)
+
+    pc_bd.mini_batch_em(step_size=1.0, pseudocount=0.01)
+    pc_plain.mini_batch_em(step_size=1.0, pseudocount=0.01)
+
+    # The two flat param buffers can use different edge orderings, so
+    # compare in canonical per-ns [NB, bs, cbs] space.
+    pc_bd.update_parameters()
+    pc_plain.update_parameters()
+    for ns_bd, ns_p in _matched_sum_nodes(pc_bd, pc_plain):
+        diff = (ns_bd._params - ns_p._params).abs().max().item()
+        assert diff < 5e-3, (
+            f"post-EM params mismatch (scope={ns_p.scope}): "
+            f"max abs diff = {diff:.3e}"
+        )
+
+    torch.manual_seed(44)
+    test_seq = torch.randint(0, 8, (B, 3), device=device)
+    ll_bd = pc_bd(test_seq).detach()
+    ll_p = pc_plain(test_seq).detach()
+    ll_diff = (ll_bd - ll_p).abs().max().item()
+    assert ll_diff < 0.1, f"post-EM LL mismatch: {ll_diff:.3e}"
 
 
 # ---------------------------------------------------------------------- #
@@ -399,4 +518,46 @@ def test_monarch_end_to_end(device, homogeneous):
     assert diff < 1e-2, (
         f"Monarch LL mismatch (homogeneous={homogeneous}): "
         f"max abs diff = {diff:.3e}"
+    )
+
+
+@pytest.mark.parametrize("homogeneous", [False, True])
+def test_monarch_em_matches_plain(device, homogeneous):
+    """One full EM update through the Monarch chain lands on the same params
+    as the plain path. The homogeneous case exercises tied duplicates
+    accumulating into the source's aliased pflow region across successive
+    BD launches (stream-ordered load-add-store, no atomics) — vs. the plain
+    path's separate parflow blocks fused by ``compute_cum_par_flows``."""
+    pc_bd, pc_plain = _build_monarch_pair(
+        NB=4, block_size=8, num_layers=3, homogeneous=homogeneous,
+        device=device,
+    )
+
+    torch.manual_seed(2028)
+    data = torch.randint(0, 8, (16, 3), device=device)
+
+    pc_bd(data)
+    pc_plain(data)
+    pc_bd.backward(data, compute_param_flows=True, flows_memory=0.0)
+    pc_plain.backward(data, compute_param_flows=True, flows_memory=0.0)
+
+    pc_bd.mini_batch_em(step_size=1.0, pseudocount=0.01)
+    pc_plain.mini_batch_em(step_size=1.0, pseudocount=0.01)
+
+    # The Monarch pair syncs flat params buffers directly (same layout on
+    # both paths), so post-EM params are directly comparable.
+    diff = (pc_bd.params - pc_plain.params).abs().max().item()
+    assert diff < 5e-3, (
+        f"post-EM Monarch params mismatch (homogeneous={homogeneous}): "
+        f"max abs diff = {diff:.3e}"
+    )
+
+    torch.manual_seed(2029)
+    test_seq = torch.randint(0, 8, (16, 3), device=device)
+    ll_bd = pc_bd(test_seq).detach()
+    ll_p = pc_plain(test_seq).detach()
+    ll_diff = (ll_bd - ll_p).abs().max().item()
+    assert ll_diff < 0.1, (
+        f"post-EM Monarch LL mismatch (homogeneous={homogeneous}): "
+        f"{ll_diff:.3e}"
     )
