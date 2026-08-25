@@ -13,7 +13,9 @@ from .prod_nodes import ProdNodes
 from .sum_nodes import SumNodes
 from .sparse_prod_nodes import SparseProdNodes
 from .sparse_sum_nodes import SparseSumNodes
-from .distributions import Distribution, SparseCategorical
+from .blocked_prod_nodes import BlockedProdNodes
+from .blocked_sum_nodes import BlockedSumNodes
+from .distributions import Distribution, SparseCategorical, BlockedCategorical
 from pyjuice.graph import RegionGraph
 
 Tensor = Union[np.ndarray,torch.Tensor]
@@ -119,7 +121,12 @@ def multiply(nodes1: ProdNodesChs, *args, edge_ids: Optional[Tensor] = None, spa
             num_node_blocks = edge_ids.shape[0]
         assert edge_ids.shape[0] == num_node_blocks or edge_ids.shape[0] == num_node_blocks * block_size
 
-    cls = SparseProdNodes if (not _force_plain and _is_sparse_prod_pattern(chs)) else ProdNodes
+    if not _force_plain and _is_sparse_prod_pattern(chs):
+        cls = SparseProdNodes
+    elif not _force_plain and _is_blocked_prod_pattern(chs):
+        cls = BlockedProdNodes
+    else:
+        cls = ProdNodes
     ns = cls(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
     if _force_plain:
         ns._force_plain_layer = True
@@ -198,6 +205,9 @@ def summate(nodes1: SumNodesChs, *args, num_node_blocks: int = 0, num_nodes: int
     cls = SumNodes
     if (not _force_plain) and len(chs) == 1 and isinstance(chs[0], SparseProdNodes):
         cls = SparseSumNodes
+    elif (not _force_plain) and len(chs) == 1 and isinstance(chs[0], BlockedProdNodes) \
+            and _is_block_dense_edges(chs[0], num_node_blocks, num_nodes, edge_ids, block_size, **kwargs):
+        cls = BlockedSumNodes
     ns = cls(num_node_blocks, chs, edge_ids, block_size = block_size, **kwargs)
     if _force_plain:
         # Pin this node so the compile-time structural fallback in
@@ -232,6 +242,60 @@ def _is_sparse_prod_pattern(chs) -> bool:
         return False
     return all(not isinstance(cs, InputNodes)
                for i, cs in enumerate(chs) if i != sparse_ch_idxs[0])
+
+
+def _is_blocked_prod_pattern(chs) -> bool:
+    """Cheap gate for the blocked-prod pattern (blocked twin of
+    :func:`_is_sparse_prod_pattern`): exactly one :class:`BlockedCategorical`
+    input child, every other child non-input. Full invariants are checked in
+    :class:`BlockedProdNodes.__init__`."""
+    if len(chs) == 0:
+        return False
+    blocked_ch_idxs = [
+        i for i, cs in enumerate(chs)
+        if isinstance(cs, InputNodes) and isinstance(cs.dist, BlockedCategorical)
+    ]
+    if len(blocked_ch_idxs) != 1:
+        return False
+    return all(not isinstance(cs, InputNodes)
+               for i, cs in enumerate(chs) if i != blocked_ch_idxs[0])
+
+
+def _is_block_dense_edges(ch, num_node_blocks, num_nodes, edge_ids, block_size, **kwargs) -> bool:
+    """Whether :func:`summate` will end up with block-dense edges: no explicit
+    ``edge_ids`` (the default constructor builds the full Cartesian product)."""
+    return edge_ids is None and kwargs.get("sum_edge_ids_constructor", None) is None
+
+
+def blocked_multiply(nodes1: ProdNodesChs, *args, **kwargs) -> BlockedProdNodes:
+    """
+    Explicit blocked counterpart of :func:`multiply` — asserts that the
+    resulting :class:`ProdNodes` is a :class:`BlockedProdNodes` (one
+    :class:`BlockedCategorical` input child + ≥0 non-input siblings, identity
+    edges on the blocked slot, ``k`` a multiple of the block size).
+    """
+    ns = multiply(nodes1, *args, **kwargs)
+    assert isinstance(ns, BlockedProdNodes), (
+        "blocked_multiply: children do not match the blocked-prod pattern "
+        "(need exactly one BlockedCategorical input child; every other child "
+        "non-input)."
+    )
+    return ns
+
+
+def blocked_summate(nodes1: SumNodesChs, *args, **kwargs) -> BlockedSumNodes:
+    """
+    Explicit blocked counterpart of :func:`summate` — asserts that the
+    resulting :class:`SumNodes` is a :class:`BlockedSumNodes` (single
+    :class:`BlockedProdNodes` child, block-dense edges).
+    """
+    ns = summate(nodes1, *args, **kwargs)
+    assert isinstance(ns, BlockedSumNodes), (
+        "blocked_summate: the single child must be a `BlockedProdNodes` "
+        "(built via `multiply` / `blocked_multiply` over a BlockedCategorical "
+        "input) and the edges must be block-dense (no custom edge_ids)."
+    )
+    return ns
 
 
 def sparse_multiply(nodes1: ProdNodesChs, *args, **kwargs) -> SparseProdNodes:

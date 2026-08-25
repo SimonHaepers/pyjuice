@@ -410,20 +410,24 @@ class SumNodes(CircuitNodes):
         # Lazy import — SparseProdNodes lives in a sibling module and would
         # create a cycle at module import time.
         from .sparse_prod_nodes import SparseProdNodes
-        from .distributions import SparseCategorical
+        from .blocked_prod_nodes import BlockedProdNodes
+        from .distributions import SparseCategorical, BlockedCategorical
 
         new_chs = []
         for cs in chs:
             if cs.is_input():
-                # Use SparseProdNodes for a single SparseCategorical input
-                # so the consumer sum can dispatch to SparseInputSumLayer
+                # Use SparseProdNodes / BlockedProdNodes for a single
+                # SparseCategorical / BlockedCategorical input so the consumer
+                # sum can dispatch to the sparse-/blocked-input sum layers
                 # instead of the dense fallback at the innermost HMM depth.
-                # SparseProdNodes inherits from ProdNodes so downstream code
-                # that branches on ``is_prod()`` is unaffected.
-                cls = (
-                    SparseProdNodes if isinstance(cs.dist, SparseCategorical)
-                    else ProdNodes
-                )
+                # Both inherit from ProdNodes so downstream code that
+                # branches on ``is_prod()`` is unaffected.
+                if isinstance(cs.dist, SparseCategorical):
+                    cls = SparseProdNodes
+                elif isinstance(cs.dist, BlockedCategorical):
+                    cls = BlockedProdNodes
+                else:
+                    cls = ProdNodes
                 new_cs = cls(
                     num_node_blocks = cs.num_node_blocks,
                     chs = [cs],

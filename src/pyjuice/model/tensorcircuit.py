@@ -11,13 +11,14 @@ from functools import partial
 from typing import Optional, Sequence, Callable, Union, Tuple, Dict
 from contextlib import contextmanager
 
-from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, SparseProdNodes, SparseSumNodes, foreach, summate, multiply
-from pyjuice.nodes.distributions import SparseCategorical
+from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, SparseProdNodes, SparseSumNodes, foreach, summate, multiply, BlockedProdNodes
+from pyjuice.nodes.distributions import SparseCategorical, BlockedCategorical
 from pyjuice.layer import (
     Layer, InputLayer, DenseCategoricalInputLayer, ProdLayer, SparseProdLayer,
     CoSparseProdLayer, SumLayer, DenseSumLayer, BlockDiagonalSumLayer,
     SparseInputSumLayer, SparseIOSumLayer, SparseIOBlockDiagonalSumLayer,
     SparseInputBlockDiagonalSumLayer, SparseOutputBlockDiagonalSumLayer,
+    BlockedProdLayer, CoBlockedProdLayer, BlockedInputSumLayer, BlockedIOSumLayer,
     LayerGroup,
 )
 from pyjuice.utils.grad_fns import ReverseGrad
@@ -1106,6 +1107,11 @@ class TensorCircuit(nn.Module):
         sparse_io_sums = sparse_chain_info["sparse_io_sums"]
         sparse_out_sums = sparse_chain_info["sparse_out_sums"]
         cosparse_prods = sparse_chain_info["cosparse_prods"]
+        blocked_chain_info = self._classify_blocked_chains(depth2nodes, num_layers)
+        self._blocked_chain_info = blocked_chain_info
+        demoted_blocked_prods = blocked_chain_info["demoted"]
+        blocked_io_sums = blocked_chain_info["blocked_io_sums"]
+        coblocked_prods = blocked_chain_info["coblocked_prods"]
 
         self.input_layer_group = None
         self.inner_layer_groups = []
@@ -1200,6 +1206,13 @@ class TensorCircuit(nn.Module):
                                 mode = "cosparse"
                             else:
                                 mode = "sparse"
+                        elif isinstance(ns, BlockedProdNodes) and id(ns) not in demoted_blocked_prods:
+                            # Blocked-emission twins of the sparse modes
+                            # (see ``_classify_blocked_chains``).
+                            if id(ns) in coblocked_prods:
+                                mode = "coblocked"
+                            else:
+                                mode = "blocked"
                         else:
                             mode = "plain"
                         key = (ns.block_size, mode)
@@ -1221,6 +1234,27 @@ class TensorCircuit(nn.Module):
                             )
                         elif mode == "sparse":
                             prod_layer = SparseProdLayer(
+                                nodes = nodes,
+                                global_nid_start = layer_num_elements,
+                                layer_sparsity_tol = layer_sparsity_tol,
+                                max_num_partitions = max_num_partitions,
+                                disable_gpu_compilation = disable_gpu_compilation,
+                                force_gpu_compilation = force_gpu_compilation,
+                                input_layer_group = self.input_layer_group,
+                            )
+                        elif mode == "coblocked":
+                            prod_layer = CoBlockedProdLayer(
+                                nodes = nodes,
+                                global_nid_start = layer_num_elements,
+                                layer_sparsity_tol = layer_sparsity_tol,
+                                max_num_partitions = max_num_partitions,
+                                disable_gpu_compilation = disable_gpu_compilation,
+                                force_gpu_compilation = force_gpu_compilation,
+                                input_layer_group = self.input_layer_group,
+                                inner_layer_groups = list(self.inner_layer_groups),
+                            )
+                        elif mode == "blocked":
+                            prod_layer = BlockedProdLayer(
                                 nodes = nodes,
                                 global_nid_start = layer_num_elements,
                                 layer_sparsity_tol = layer_sparsity_tol,
@@ -1330,9 +1364,32 @@ class TensorCircuit(nn.Module):
                                         return True
                         return False
 
+                    # Blocked-sum eligibility: same structural rule as
+                    # ``_sparse_sum_eligible`` (``duplicate`` preserves the
+                    # plain ``SumNodes`` class) with a compiled
+                    # :class:`BlockedProdLayer` child.
+                    def _blocked_sum_eligible(ns):
+                        if getattr(ns, "_force_plain_layer", False):
+                            return False
+                        if not (ns.is_block_dense and len(ns.chs) == 1):
+                            return False
+                        cs = ns.chs[0]
+                        for lg in self.inner_layer_groups:
+                            if not lg.is_prod():
+                                continue
+                            for layer in lg:
+                                if isinstance(layer, BlockedProdLayer):
+                                    if cs in layer.nodes:
+                                        return True
+                        return False
+
                     gsize2sum_nodes = dict()
                     for ns in depth2nodes[depth]["sum"]:
-                        if id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
+                        if id(ns) in blocked_io_sums and _blocked_sum_eligible(ns):
+                            mode = "blocked_io"
+                        elif _blocked_sum_eligible(ns):
+                            mode = "blocked_dense"
+                        elif id(ns) in sparse_io_sums and _sparse_sum_eligible(ns):
                             mode = "sparse_io"
                         elif id(ns) in sparse_io_sums and _sparse_io_bd_eligible(ns):
                             mode = "sparse_io_block_diagonal"
@@ -1391,6 +1448,22 @@ class TensorCircuit(nn.Module):
                             }
                         elif mode == "sparse_dense":
                             layer_cls = SparseInputSumLayer
+                            extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
+                        elif mode == "blocked_io":
+                            out_var_ids = []
+                            out_dists = []
+                            for sum_ns in nodes:
+                                consumer = blocked_io_sums[id(sum_ns)]
+                                out_var_ids.append(consumer.var_id)
+                                out_dists.append(consumer.blocked_input_ns.dist)
+                            layer_cls = BlockedIOSumLayer
+                            extra_kwargs = {
+                                "inner_layer_groups": list(self.inner_layer_groups),
+                                "output_var_ids": out_var_ids,
+                                "output_dists": out_dists,
+                            }
+                        elif mode == "blocked_dense":
+                            layer_cls = BlockedInputSumLayer
                             extra_kwargs = {"inner_layer_groups": list(self.inner_layer_groups)}
                         elif mode == "sparse_input_block_diagonal":
                             layer_cls = SparseInputBlockDiagonalSumLayer
@@ -1519,7 +1592,14 @@ class TensorCircuit(nn.Module):
             if not lg.is_prod():
                 continue
             for layer in lg:
-                if not isinstance(layer, SparseProdLayer):
+                if isinstance(layer, SparseProdLayer):
+                    packed_consumer_cls = (SparseInputSumLayer,
+                                           SparseInputBlockDiagonalSumLayer)
+                elif isinstance(layer, BlockedProdLayer):
+                    # BlockedIOSumLayer subclasses BlockedInputSumLayer; both
+                    # read the packed BlockedNodeValues directly.
+                    packed_consumer_cls = (BlockedInputSumLayer,)
+                else:
                     continue
                 all_sparse_consumers = True
                 for ns in layer.nodes:
@@ -1537,13 +1617,108 @@ class TensorCircuit(nn.Module):
                         all_sparse_consumers = False
                         break
                     for consumer in consumers:
-                        if not isinstance(consumer, (SparseInputSumLayer,
-                                                     SparseInputBlockDiagonalSumLayer)):
+                        if not isinstance(consumer, packed_consumer_cls):
                             all_sparse_consumers = False
                             break
                     if not all_sparse_consumers:
                         break
                 layer._skip_scatter = all_sparse_consumers
+
+    def _classify_blocked_chains(self, depth2nodes, num_layers) -> Dict:
+        """Blocked-emission twin of :meth:`_classify_sparse_chains`.
+
+        * ``demoted``: ids of :class:`BlockedProdNodes` whose
+          :class:`BlockedCategorical` input is also referenced by a
+          non-blocked consumer at the same depth (must compile as plain
+          :class:`ProdLayer` so the input layer still fills ``node_mars``).
+        * ``blocked_io_sums``: ``id(sum_ns) -> consumer BlockedProdNodes`` for
+          block-dense single-child sums over a (non-demoted)
+          :class:`BlockedProdNodes` whose sole consumer is a non-demoted
+          :class:`BlockedProdNodes` with ``num_dense_chs == 1`` — compiled as
+          :class:`BlockedIOSumLayer` (the consumer's token block selects the
+          output rows).
+        * ``coblocked_prods``: ids of :class:`BlockedProdNodes` whose single
+          dense child is in ``blocked_io_sums`` — compiled as
+          :class:`CoBlockedProdLayer`.
+        """
+        from collections import defaultdict
+
+        consumers: Dict[int, list] = defaultdict(list)
+        for d in range(num_layers):
+            for k in ("prod", "sum"):
+                for ns in depth2nodes[d].get(k, []):
+                    for cs in ns.chs:
+                        consumers[id(cs)].append(ns)
+
+        def _is_blocked_input(cs):
+            return isinstance(cs, InputNodes) and isinstance(cs.dist, BlockedCategorical)
+
+        demoted: set = set()
+        for d in range(1, num_layers):
+            prods = depth2nodes[d].get("prod", [])
+            sums = depth2nodes[d].get("sum", [])
+            eligible = {id(ns) for ns in prods if isinstance(ns, BlockedProdNodes)}
+            if not eligible:
+                continue
+            total_refs: Dict[int, int] = defaultdict(int)
+            claim_count: Dict[int, int] = defaultdict(int)
+            for ns in prods:
+                for cs in ns.chs:
+                    if _is_blocked_input(cs):
+                        total_refs[id(cs)] += 1
+                        if id(ns) in eligible:
+                            claim_count[id(cs)] += 1
+            for ns in sums:
+                for cs in ns.chs:
+                    if _is_blocked_input(cs):
+                        total_refs[id(cs)] += 1
+            for ns in prods:
+                if id(ns) not in eligible:
+                    continue
+                for cs in ns.chs:
+                    if _is_blocked_input(cs) and total_refs[id(cs)] > claim_count[id(cs)]:
+                        demoted.add(id(ns))
+                        break
+
+        blocked_io_sums: Dict[int, BlockedProdNodes] = {}
+        for d in range(num_layers):
+            for ns in depth2nodes[d].get("sum", []):
+                if getattr(ns, "_force_plain_layer", False):
+                    continue
+                if len(ns.chs) != 1 or not ns.is_block_dense:
+                    continue
+                child = ns.chs[0]
+                if not isinstance(child, BlockedProdNodes) or id(child) in demoted:
+                    continue
+                cs_list = consumers.get(id(ns), [])
+                if len(cs_list) != 1:
+                    continue
+                consumer = cs_list[0]
+                if not isinstance(consumer, BlockedProdNodes) or id(consumer) in demoted:
+                    continue
+                if consumer.num_dense_chs != 1:
+                    continue
+                # The consumer's emission blocks must tile this sum's parents.
+                if consumer.k * consumer.num_blocks != ns.num_nodes \
+                        or consumer.k % ns.block_size != 0:
+                    continue
+                blocked_io_sums[id(ns)] = consumer
+
+        coblocked_prods: set = set()
+        for d in range(num_layers):
+            for ns in depth2nodes[d].get("prod", []):
+                if not isinstance(ns, BlockedProdNodes) or id(ns) in demoted:
+                    continue
+                if ns.num_dense_chs != 1:
+                    continue
+                if id(ns.chs[ns.dense_ch_idxs[0]]) in blocked_io_sums:
+                    coblocked_prods.add(id(ns))
+
+        return {
+            "demoted": demoted,
+            "blocked_io_sums": blocked_io_sums,
+            "coblocked_prods": coblocked_prods,
+        }
 
     def _classify_sparse_chains(self, depth2nodes, num_layers) -> Dict:
         """DAG-level classifier for the sparse-chain fast path. Produces:

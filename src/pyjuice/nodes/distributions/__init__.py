@@ -7,6 +7,7 @@ from .gaussian import Gaussian
 from .discrete_logistic import DiscreteLogistic
 from .masked_categorical import MaskedCategorical
 from .sparse_categorical import SparseCategorical
+from .blocked_categorical import BlockedCategorical
 from .external import External
 from .external_categorical import ExternProductCategorical
 from .softevi_categorical import SoftEvidenceCategorical
