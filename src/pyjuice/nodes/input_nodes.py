@@ -76,12 +76,18 @@ class InputNodes(CircuitNodes):
 
             assert len(scope) == len(self.scope)
 
-        dist = deepcopy(self.dist)
+        if tie_params and self.dist.need_meta_parameters:
+            # Meta-parameters (e.g. SparseCategorical's CSC / CSR pattern) are
+            # immutable across tied duplicates, and deep-copying them once per
+            # timestep multiplies the pattern's memory by the sequence length.
+            # Share the source dist by reference instead.
+            dist = self.dist
+        else:
+            dist = deepcopy(self.dist)
 
-        # The deepcopied dist already carries any meta-parameter state (e.g.
-        # SparseCategorical's CSC buffers); tell InputNodes.__init__ to skip
-        # the re-run of set_meta_params which would otherwise require the
-        # original meta kwargs.
+        # The (copied or shared) dist already carries any meta-parameter state;
+        # tell InputNodes.__init__ to skip the re-run of set_meta_params which
+        # would otherwise require the original meta kwargs.
         ns = InputNodes(
             self.num_node_blocks, scope = scope, dist = dist,
             block_size = self.block_size,

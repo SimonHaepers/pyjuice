@@ -114,5 +114,9 @@ def deserialize_nodes(nodes_list: Sequence):
         if "source_node" in ns_info:
             ns = id2ns[ns_id]
             ns._source_node = id2ns[ns_info["source_node"]]
+            if ns.is_input() and ns.dist.need_meta_parameters:
+                # Tied input nodes share the source's dist (and hence its
+                # meta-parameters) instead of each holding a pickled copy.
+                ns.dist = ns._source_node.dist
 
     return id2ns[len(nodes_list) - 1]
