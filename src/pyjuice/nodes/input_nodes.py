@@ -158,12 +158,16 @@ class InputNodes(CircuitNodes):
         :type recursive: bool
         """
         if not self.is_tied() and not self.has_params():
+            # ``_params`` may hold the zero placeholder returned by
+            # ``set_meta_params`` (e.g. SparseCategorical); it is not a set of
+            # parameters to keep, so let the dist draw fresh ones.
             self._params = self.dist.init_parameters(
                 num_nodes = self.num_nodes,
                 perturbation = perturbation,
-                params = self.get_params(),
+                params = None,
                 **kwargs
             )
+            self._param_initialized = True
 
             if ret_params:
                 return self._params

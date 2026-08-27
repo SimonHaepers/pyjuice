@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import torch
+import warnings
 import torch.nn as nn
 import time
 import triton
@@ -395,6 +396,17 @@ class TensorCircuit(nn.Module):
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
+
+            if (record_cudagraph or apply_cudagraph) and self._has_sparse_prod:
+                # Sparse-IO layers build data-dependent sparsity patterns on
+                # the host every call; a graph replay would skip that work and
+                # reuse the patterns of the recorded batch. Fall back to eager.
+                if not getattr(self, "_warned_sparse_cudagraph", False):
+                    warnings.warn("CUDA graphs are not supported for circuits with sparse-IO "
+                                  "(SparseCategorical) layers; running eagerly instead.")
+                    self._warned_sparse_cudagraph = True
+                record_cudagraph = False
+                apply_cudagraph = False
 
             signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
