@@ -76,11 +76,21 @@ class InputNodes(CircuitNodes):
 
             assert len(scope) == len(self.scope)
 
-        dist = deepcopy(self.dist)
+        # Tied duplicates share the *same* dist object. Distributions are
+        # immutable after ``set_meta_parameters`` (only ``move_to_device``
+        # touches them, idempotently), and tying means identical params AND
+        # identical meta-parameters, so there is nothing to copy. This matters
+        # for ``SparseCategorical``: its CSC/CSR index arrays (~24 bytes per
+        # nonzero, all moved to the GPU) would otherwise be duplicated once per
+        # HMM time step — 6x the footprint of the tied emission values
+        # themselves, and the dominant GPU allocation of a sparse-IO HMM.
+        # Same principle as ``SumNodes.duplicate(tie_params=True)`` sharing
+        # ``edge_ids``. Untied duplicates keep an independent deepcopy.
+        dist = self.dist if tie_params else deepcopy(self.dist)
 
-        # The deepcopied dist already carries any meta-parameter state (e.g.
-        # SparseCategorical's CSC buffers); tell InputNodes.__init__ to skip
-        # the re-run of set_meta_params which would otherwise require the
+        # The shared/deepcopied dist already carries any meta-parameter state
+        # (e.g. SparseCategorical's CSC buffers); tell InputNodes.__init__ to
+        # skip the re-run of set_meta_params which would otherwise require the
         # original meta kwargs.
         ns = InputNodes(
             self.num_node_blocks, scope = scope, dist = dist,
