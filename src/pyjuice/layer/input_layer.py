@@ -1310,7 +1310,10 @@ class InputLayer(Layer, nn.Module):
     def _pflow_accum_kernel(param_flows_ptr, pfid_start, ch_pfids_ptr, num_coalesced_blocks, num_par_flows, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr):
         pid = tl.program_id(axis = 0)
 
-        offs_pflow = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        # int64: ``num_par_flows`` is a raw source-param count (e.g. H*V for
+        # dense categorical emissions) and can exceed 2^31 — int32 offsets
+        # would wrap negative, pass the mask, and fault.
+        offs_pflow = pid.to(tl.int64) * BLOCK_M + tl.arange(0, BLOCK_M)
         mask_pflow = offs_pflow < num_par_flows
 
         offs_ch = tl.arange(0, BLOCK_N)
