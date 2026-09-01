@@ -9,6 +9,7 @@ from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, inputs,
 
 
 def serialize_nodes(root_ns: CircuitNodes):
+    dist2id = dict()
     nodes_list = list()
     ns2id = dict()
     for ns in root_ns:
@@ -38,7 +39,16 @@ def serialize_nodes(root_ns: CircuitNodes):
 
         if ns.is_input():
             ns_info["scope"] = ns.scope.to_list()
-            ns_info["dist"] = pickle.dumps(ns.dist)
+            # Tied duplicates share one dist object; pickle it once and let
+            # later nodes reference the first occurrence. For meta-parameter
+            # dists (e.g. SparseCategorical's CSC/CSR pattern, ~100s of MB)
+            # per-node copies would multiply the file size by seq_length.
+            first_id = dist2id.get(id(ns.dist))
+            if first_id is None:
+                dist2id[id(ns.dist)] = len(nodes_list)
+                ns_info["dist"] = pickle.dumps(ns.dist)
+            else:
+                ns_info["dist_shared_with"] = first_id
 
         ns2id[ns] = len(nodes_list)
         nodes_list.append(ns_info)
@@ -70,10 +80,17 @@ def deserialize_nodes(nodes_list: Sequence):
 
         if ns_info["type"] == "Input":
             scope = ns_info["scope"]
-            dist = pickle.loads(ns_info["dist"])
+            if "dist" in ns_info:
+                dist = pickle.loads(ns_info["dist"])
+                shared = False
+            else:
+                # Shared-dist reference (see serialize_nodes): reuse the
+                # already-materialised dist object of the first occurrence.
+                dist = id2ns[ns_info["dist_shared_with"]].dist
+                shared = True
 
             ns = inputs(scope, num_node_blocks, dist, block_size = block_size, 
-                        _no_set_meta_params = dist.need_meta_parameters)
+                        _no_set_meta_params = shared or dist.need_meta_parameters)
 
             if "params" in ns_info:
                 if dist.need_meta_parameters:
