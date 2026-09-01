@@ -171,9 +171,9 @@ class SparseCategorical(Distribution):
         params = params.reshape(-1).clone()
         if self._nnz == 0:
             return params
-        row_ids = self._csc_indices
+        row_ids = self._csc_indices.to(params.device)
         H = self._num_nodes
-        row_sums = torch.zeros(H, dtype = params.dtype)
+        row_sums = torch.zeros(H, dtype = params.dtype, device = params.device)
         row_sums.scatter_add_(0, row_ids, params)
         row_sums = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
         return params / row_sums[row_ids]

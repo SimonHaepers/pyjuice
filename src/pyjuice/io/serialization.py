@@ -1,11 +1,27 @@
 from __future__ import annotations
 
 import torch
+import copy
 import pickle
 from functools import partial
 from typing import Sequence
 
 from pyjuice.nodes import CircuitNodes, InputNodes, ProdNodes, SumNodes, inputs, multiply, summate
+
+
+def _dist_on_cpu(dist):
+    """A shallow copy of *dist* whose tensor attributes live on CPU, so a
+    checkpoint written from a GPU-resident circuit does not hard-code a
+    device index (meta-parameter dists such as ``SparseCategorical`` keep
+    their CSC/CSR pattern as tensors)."""
+    cuda_attrs = {k: v for k, v in vars(dist).items()
+                  if isinstance(v, torch.Tensor) and v.device.type != "cpu"}
+    if not cuda_attrs:
+        return dist
+    dist_cpu = copy.copy(dist)
+    for k, v in cuda_attrs.items():
+        setattr(dist_cpu, k, v.cpu())
+    return dist_cpu
 
 
 def serialize_nodes(root_ns: CircuitNodes):
@@ -46,7 +62,7 @@ def serialize_nodes(root_ns: CircuitNodes):
             first_id = dist2id.get(id(ns.dist))
             if first_id is None:
                 dist2id[id(ns.dist)] = len(nodes_list)
-                ns_info["dist"] = pickle.dumps(ns.dist)
+                ns_info["dist"] = pickle.dumps(_dist_on_cpu(ns.dist))
             else:
                 ns_info["dist_shared_with"] = first_id
 
@@ -95,6 +111,11 @@ def deserialize_nodes(nodes_list: Sequence):
             if "params" in ns_info:
                 if dist.need_meta_parameters:
                     ns._params = torch.from_numpy(ns_info["params"])
+                    # Without this, ``has_params()`` stays False and
+                    # ``TensorCircuit._init_parameters`` re-draws random
+                    # parameters at compile time, silently discarding the
+                    # checkpoint's emissions (breaking --resume).
+                    ns._param_initialized = True
                 else:
                     ns.set_params(torch.from_numpy(ns_info["params"]), normalize = False)
 
