@@ -22,6 +22,7 @@ from pyjuice.layer import (
     BlockedProdLayer, CoBlockedProdLayer, BlockedInputSumLayer, BlockedIOSumLayer,
     LayerGroup,
 )
+from pyjuice.layer.sparse_io_sum_layer import build_ws_groups
 from pyjuice.utils.grad_fns import ReverseGrad
 from pyjuice.utils import BitSet
 
@@ -357,6 +358,10 @@ class TensorCircuit(nn.Module):
                 self._run_pattern_cache = dict()
             else:
                 self._run_pattern_cache = None
+            # Weight-stationary sparse-IO groups: params may have changed
+            # since the last pass (EM step), drop the per-pass rounded W copy.
+            for ws_group in self._sparse_io_ws_groups:
+                ws_group.begin_pass()
 
             # ``missing_mask`` reaches the input layers via ``**kwargs`` on the
             # initial ``layer(inputs, ...)`` calls above; for inner layers it
@@ -532,6 +537,8 @@ class TensorCircuit(nn.Module):
             self._run_pattern_cache = dict()
         else:
             self._run_pattern_cache = None
+        for ws_group in self._sparse_io_ws_groups:
+            ws_group.begin_pass()
 
         with device_grad_controller(device = self.device, no_grad = True):
 
@@ -673,6 +680,12 @@ class TensorCircuit(nn.Module):
                 g.replay()
             else:
                 _run_inner_layers()
+
+            # Deferred parameter flows of the weight-stationary sparse-IO
+            # path: one GEMM per tied transition matrix for the whole pass.
+            if compute_param_flows:
+                for ws_group in self._sparse_io_ws_groups:
+                    ws_group.flush(self.params, self.param_flows)
 
             # Compute backward pass for all input layers
             if not _inner_layers_only:
@@ -1551,6 +1564,11 @@ class TensorCircuit(nn.Module):
             isinstance(layer, (SparseProdLayer, SparseIOSumLayer))
             for lg in self.inner_layer_groups for layer in lg
         )
+
+        # Weight-stationary batched path of SparseIOSumLayer: blocks reading
+        # the same tied transition matrix share a rounded-W copy and a
+        # deferred param-flow stash (see ``build_ws_groups``).
+        self._sparse_io_ws_groups = build_ws_groups(self.inner_layer_groups)
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)
