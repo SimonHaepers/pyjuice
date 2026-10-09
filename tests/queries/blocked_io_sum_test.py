@@ -16,6 +16,7 @@ import torch
 
 import pyjuice as juice
 import pyjuice.nodes.distributions as dists
+import pyjuice.layer.sparse_io_sum_layer as sio
 from pyjuice.nodes import inputs, multiply, summate, set_block_size, \
     sparse_multiply, sparse_summate, blocked_multiply, blocked_summate
 from pyjuice.layer import (
@@ -99,7 +100,12 @@ def _layers(pc):
 
 @pytest.mark.parametrize("H,M,bs", [(64, 4, 16), (64, 4, 8), (256, 8, 16), (128, 2, 4)])
 @pytest.mark.parametrize("B", [1, 5, 16])
-def test_blocked_chain_forward_backward_parity(H, M, bs, B):
+def test_blocked_chain_forward_backward_parity(H, M, bs, B, monkeypatch):
+    # pc_s is the exact-math reference, so keep it on the generic gather
+    # kernels: in "auto" mode B >= 16 with 16-aligned blocks would run the
+    # weight-stationary tf32 path (~1e-5 relative on the LL, checked against
+    # the gather path with tf32 tolerances in sparse_io_ws_test.py).
+    monkeypatch.setattr(sio, "_WS_MODE", "never")
     torch.manual_seed(0)
     T, V = 6, 50
     dev = _device()
@@ -154,9 +160,9 @@ def test_blocked_chain_forward_backward_parity(H, M, bs, B):
     assert torch.allclose(epf_b, epf_s, atol=1e-4, rtol=1e-4)
     assert epf_b.abs().sum() > 0
 
-    # Element flows of the first (dense) transition child: the blocked prod's
-    # dense child is the sum feeding the first product; both chains scatter
-    # its flow into node_flows.
+    # Root node flows: with allow_modify_flows (the default) the root sum's
+    # backward rewrites them in place to log(1) - LL = -LL, so this re-checks
+    # the LLs at the default (fp32-exact) tolerance.
     assert torch.allclose(pc_b.node_flows[pc_b._root_node_range[0]:pc_b._root_node_range[1]],
                           pc_s.node_flows[pc_s._root_node_range[0]:pc_s._root_node_range[1]])
 
