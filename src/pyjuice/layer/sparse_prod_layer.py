@@ -193,13 +193,19 @@ class SparseProdLayer(ProdLayer):
                 data_list: Optional[list] = None,
                 pattern_cache: Optional[dict] = None,
                 missing_mask: Optional[torch.Tensor] = None,
+                static_ctx=None,
                 **kwargs) -> None:
+        assert not self.provided("fw_partition_local_ids"), \
+            "SparseProdLayer does not support partial evaluation yet."
+
+        if static_ctx is not None:
+            self._forward_static(node_mars, element_mars, static_ctx)
+            return None
+
         assert data is not None, (
             "SparseProdLayer.forward requires `data` "
             "(per-var observed tokens, shape [num_vars, 1]) as a kwarg."
         )
-        assert not self.provided("fw_partition_local_ids"), \
-            "SparseProdLayer does not support partial evaluation yet."
 
         batch_size = element_mars.size(1)
         assert missing_mask is None or batch_size == 1, (
@@ -368,29 +374,7 @@ class SparseProdLayer(ProdLayer):
         dense_ch_lookup = getattr(self, self._dense_ch_lookups[ns_idx])
 
         if sv.is_batched:
-            BLOCK = _FWD_BATCHED_BLOCK_K
-            BLOCK_B = _FWD_BATCHED_BLOCK_B
-            grid = (triton.cdiv(sv.total_nnz, BLOCK),
-                    triton.cdiv(batch_size, BLOCK_B))
-            _sparse_prod_forward_kernel[grid](
-                params_ptr=sparse_input_layer.params,
-                node_mars_ptr=node_mars,
-                dense_ch_lookup_ptr=dense_ch_lookup,
-                indices_ptr=sv.indices,
-                values_out_ptr=sv.values,
-                col_starts_ptr=sv.col_starts, nnz_ptr=sv.nnz,
-                max_out_ptr=max_out,
-                param_base=sparse_cs._param_range[0],
-                num_rows=sv.num_rows,
-                total_nnz=sv.total_nnz,
-                batch_size=batch_size,
-                v_stride=sv.values.stride(0),
-                NUM_DENSE_CHS=ns.num_dense_chs,
-                BLOCK=BLOCK,
-                BLOCK_B=BLOCK_B,
-                IS_MISSING=False,
-                IS_BATCHED=True,
-            )
+            self._launch_batched_forward(ns_idx, ns, sv, node_mars, batch_size)
         else:
             BLOCK = _FWD_BLOCK_K
             grid = (triton.cdiv(sv.total_nnz, BLOCK), 1)
@@ -415,6 +399,76 @@ class SparseProdLayer(ProdLayer):
             )
 
         return sv
+
+    def _launch_batched_forward(self, ns_idx: int, ns: SparseProdNodes,
+                                sv: SparseNodeValues, node_mars: torch.Tensor,
+                                batch_size: int) -> None:
+        """Batched-layout launch of :func:`_sparse_prod_forward_kernel` (B>1, or
+        a static container at any B). Programs past a sample's column are
+        fully masked, so ``sv.total_nnz`` only has to bound the columns."""
+        if batch_size == 1:
+            BLOCK, BLOCK_B = _FWD_BLOCK_K, 1
+        else:
+            BLOCK, BLOCK_B = _FWD_BATCHED_BLOCK_K, _FWD_BATCHED_BLOCK_B
+        grid = (triton.cdiv(sv.total_nnz, BLOCK), triton.cdiv(batch_size, BLOCK_B))
+        _sparse_prod_forward_kernel[grid](
+            params_ptr=self._sparse_input_layers[ns_idx].params,
+            node_mars_ptr=node_mars,
+            dense_ch_lookup_ptr=getattr(self, self._dense_ch_lookups[ns_idx]),
+            indices_ptr=sv.indices,
+            values_out_ptr=sv.values,
+            col_starts_ptr=sv.col_starts, nnz_ptr=sv.nnz,
+            max_out_ptr=sv.max_val,
+            param_base=ns.sparse_input_ns._param_range[0],
+            num_rows=sv.num_rows,
+            total_nnz=sv.total_nnz,
+            batch_size=batch_size,
+            v_stride=sv.values.stride(0),
+            NUM_DENSE_CHS=ns.num_dense_chs,
+            BLOCK=BLOCK,
+            BLOCK_B=BLOCK_B,
+            IS_MISSING=False,
+            IS_BATCHED=True,
+        )
+
+    def graph_columns(self):
+        return [(ns.sparse_input_ns.dist, ns.var_id) for ns in self.nodes]
+
+    def graph_max_rows(self) -> int:
+        return len(self.nodes)
+
+    def _forward_static(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                        static_ctx) -> None:
+        """CUDA-graph forward (see ``pyjuice.model.sparse_cudagraph``): columns
+        resolved on device by ``static_ctx``, workspaces owned by it, no host
+        reads of the data — capturable at any batch size. Dense consumers get
+        the same ``element_mars`` rows as the eager ``scatter_to_dense``."""
+        B = static_ctx.B
+        max_ws = static_ctx.max_buffer(self)      # reset by static_ctx.begin_pass()
+        for ns_idx, ns in enumerate(self.nodes):
+            self._was_missing[ns_idx] = False
+            dist = ns.sparse_input_ns.dist
+            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * dist._max_nnz_per_col,))
+            sv = static_ctx.pattern(dist, ns.var_id, ns.num_nodes, ws)
+            sv.max_val = max_ws[ns_idx]
+            self._launch_batched_forward(ns_idx, ns, sv, node_mars, B)
+            self._sparse_outputs[ns_idx] = sv
+            if not self._skip_scatter:
+                self._scatter_static(sv, element_mars, ns._output_ind_range[0])
+
+    @staticmethod
+    def _scatter_static(sv: SparseNodeValues, element_mars: torch.Tensor,
+                        out_base: int) -> None:
+        """``scatter_to_dense`` for a static container at any B: ``LOG_EPS`` on
+        the ns's ``num_rows`` rows, then each sample's active rows."""
+        B = sv.batch_size
+        element_mars[out_base:out_base + sv.num_rows].fill_(LOG_EPS)
+        BLOCK = 256
+        grid = (triton.cdiv(sv.total_nnz, BLOCK), B)
+        _static_scatter_kernel[grid](
+            element_mars, sv.values, sv.indices, sv.col_starts, sv.nnz,
+            out_base, B, sv.values.stride(0), BLOCK=BLOCK,
+        )
 
     # ---------------- Backward ---------------- #
 
@@ -729,3 +783,26 @@ def _sparse_prod_forward_kernel(
         tl.store(values_out_ptr + offs_j, out, mask=mask)
         tile_max = tl.max(tl.where(mask, out, float("-inf")), axis=0)
         tl.atomic_max(max_out_ptr, tile_max)
+
+
+@triton.jit(
+    do_not_specialize=["out_base", "batch_size", "v_stride"],
+    do_not_specialize_on_alignment=["values_ptr", "indices_ptr", "col_starts_ptr",
+                                     "nnz_ptr"],
+)
+def _static_scatter_kernel(out_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
+                           out_base, batch_size, v_stride, BLOCK: tl.constexpr):
+    """``out[out_base + indices[col_starts[b] + k], b] = values[b, k]`` for
+    ``k < nnz[b]`` (``out`` is ``[rows, B]`` row-major). Grid
+    ``(cdiv(column-size bound, BLOCK), B)``; blocks past a sample's column
+    return at once."""
+    b = tl.program_id(1)
+    k0 = tl.program_id(0) * BLOCK
+    n = tl.load(nnz_ptr + b)
+    if k0 >= n:
+        return
+    k = k0 + tl.arange(0, BLOCK)
+    mask = k < n
+    row = tl.load(indices_ptr + tl.load(col_starts_ptr + b) + k, mask=mask, other=0)
+    v = tl.load(values_ptr + b * v_stride + k, mask=mask, other=0.0)
+    tl.store(out_ptr + (out_base + row) * batch_size + b, v, mask=mask)

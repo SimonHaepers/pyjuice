@@ -482,8 +482,8 @@ def _sparse_input_sum_forward_kernel(
     (``slot = col_starts[b] + k`` masked ``k < nnz[b]``, values from
     ``values[b * v_stride + k]``, per-sample ``max_val[b]`` clamped to
     ``-1e30`` so an empty column cannot poison the exp), the W tile widens
-    to ``[TILE_M, BLOCK_B, BLOCK_K]``, ``total_nnz`` is the per-batch max
-    (loop bound), stores land at ``node_mars[nid, b]``, and lanes with
+    to ``[TILE_M, BLOCK_B, BLOCK_K]``, ``total_nnz`` is unused (the loop
+    runs to the lanes' own ``nnz``), stores land at ``node_mars[nid, b]``, and lanes with
     ``nnz[b] == 0`` store exact ``-inf`` (log of an empty sum).
     """
     pid_m = tl.program_id(0)
@@ -503,8 +503,11 @@ def _sparse_input_sum_forward_kernel(
         max_b = tl.load(max_val_ptr + offs_b, mask=mask_b, other=0.0)
         max_b = tl.maximum(max_b, -1e30)                          # empty col guard
 
+        # Loop bound from the device sizes (``total_nnz`` only bounds the
+        # batch; the CUDA-graph forward passes the column-size bound).
+        # Masked iterations add exact zeros, so this only skips work.
         acc_sum = tl.zeros([TILE_M, BLOCK_B], dtype=tl.float32)
-        for k0 in tl.range(0, total_nnz, BLOCK_K):
+        for k0 in tl.range(0, tl.max(k_b, axis=0), BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)                   # [BLOCK_K]
             mask_kb = mask_b[:, None] & (offs_k[None, :] < k_b[:, None])
 

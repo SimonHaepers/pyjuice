@@ -210,12 +210,18 @@ class CoSparseProdLayer(SparseProdLayer):
                 data_list: Optional[list] = None,
                 pattern_cache: Optional[dict] = None,
                 missing_mask: Optional[torch.Tensor] = None,
+                static_ctx=None,
                 **kwargs) -> None:
+        assert not self.provided("fw_partition_local_ids"), \
+            "CoSparseProdLayer does not support partial evaluation."
+
+        if static_ctx is not None:
+            self._forward_static(node_mars, static_ctx)
+            return None
+
         assert data is not None, (
             "CoSparseProdLayer.forward requires `data` (per-var observed tokens)."
         )
-        assert not self.provided("fw_partition_local_ids"), \
-            "CoSparseProdLayer does not support partial evaluation."
 
         batch_size = element_mars.size(1)
         assert missing_mask is None or batch_size == 1, (
@@ -369,26 +375,7 @@ class CoSparseProdLayer(SparseProdLayer):
             # addressing as ``_sparse_prod_forward_kernel``. At B>1 the
             # per-sample col_start moves into the kernel.
             if sv.is_batched:
-                BLOCK = _CO_BATCHED_BLOCK_K
-                BLOCK_B = _CO_BATCHED_BLOCK_B
-                grid = (triton.cdiv(sv.total_nnz, BLOCK),
-                        triton.cdiv(batch_size, BLOCK_B))
-                _co_sparse_log_add_kernel[grid](
-                    out_ptr=sv.values,
-                    params_ptr=sparse_input_layer.params,
-                    dense_values_ptr=sv_dense.values,
-                    max_out_ptr=sv.max_val,
-                    col_starts_ptr=sv.col_starts, nnz_ptr=sv.nnz,
-                    param_offset=sparse_cs._param_range[0],
-                    n=sv.total_nnz,
-                    batch_size=batch_size,
-                    in_stride=sv_dense.values.stride(0),
-                    out_stride=sv.values.stride(0),
-                    BLOCK=BLOCK,
-                    BLOCK_B=BLOCK_B,
-                    IS_MISSING=False,
-                    IS_BATCHED=True,
-                )
+                self._launch_batched_log_add(ns_idx, ns, sv, sv_dense, batch_size)
             else:
                 param_base = sparse_cs._param_range[0] + sv.col_start
                 BLOCK = 256
@@ -408,6 +395,54 @@ class CoSparseProdLayer(SparseProdLayer):
                     IS_BATCHED=False,
                 )
         return None
+
+    def _launch_batched_log_add(self, ns_idx: int, ns: SparseProdNodes,
+                                sv: SparseNodeValues, sv_dense: SparseNodeValues,
+                                batch_size: int) -> None:
+        """Batched-layout launch of :func:`_co_sparse_log_add_kernel` (B>1, or a
+        static container at any B); ``sv.total_nnz`` only bounds the columns."""
+        if batch_size == 1:
+            BLOCK, BLOCK_B = 256, 1
+        else:
+            BLOCK, BLOCK_B = _CO_BATCHED_BLOCK_K, _CO_BATCHED_BLOCK_B
+        grid = (triton.cdiv(sv.total_nnz, BLOCK), triton.cdiv(batch_size, BLOCK_B))
+        _co_sparse_log_add_kernel[grid](
+            out_ptr=sv.values,
+            params_ptr=self._sparse_input_layers[ns_idx].params,
+            dense_values_ptr=sv_dense.values,
+            max_out_ptr=sv.max_val,
+            col_starts_ptr=sv.col_starts, nnz_ptr=sv.nnz,
+            param_offset=ns.sparse_input_ns._param_range[0],
+            n=sv.total_nnz,
+            batch_size=batch_size,
+            in_stride=sv_dense.values.stride(0),
+            out_stride=sv.values.stride(0),
+            BLOCK=BLOCK,
+            BLOCK_B=BLOCK_B,
+            IS_MISSING=False,
+            IS_BATCHED=True,
+        )
+
+    def _forward_static(self, node_mars: torch.Tensor, static_ctx) -> None:
+        """CUDA-graph forward (see ``pyjuice.model.sparse_cudagraph``). The
+        upstream sum layer built its output with the same ``static_ctx`` slot,
+        so both inputs share one device-resolved pattern."""
+        B = static_ctx.B
+        max_ws = static_ctx.max_buffer(self)      # reset by static_ctx.begin_pass()
+        for ns_idx, ns in enumerate(self.nodes):
+            self._was_missing[ns_idx] = False
+            dist = ns.sparse_input_ns.dist
+            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * dist._max_nnz_per_col,))
+            sv = static_ctx.pattern(dist, ns.var_id, ns.num_nodes, ws)
+            sv.max_val = max_ws[ns_idx]
+            sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
+            sv_dense = sum_layer._sparse_outputs[sum_ns_idx]
+            assert sv_dense.static and sv_dense.col_starts is sv.col_starts, (
+                "CoSparseProdLayer: the upstream sum output is not the static "
+                "pattern of this prod's (dist, var) column."
+            )
+            self._launch_batched_log_add(ns_idx, ns, sv, sv_dense, B)
+            self._sparse_outputs[ns_idx] = sv
 
     # ---------------- Backward ---------------- #
 

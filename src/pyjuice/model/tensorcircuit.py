@@ -29,6 +29,7 @@ from pyjuice.utils import BitSet
 from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
                      compile_par_update_fn, em_par_update, par_update_to_device, \
                      normalize_parameters, eval_top_down_probs
+from .sparse_cudagraph import SparseGraphState, graph_unsupported_reason
 
 
 def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
@@ -208,6 +209,15 @@ class TensorCircuit(nn.Module):
 
         # CudaGraph options
         self._recorded_cuda_graphs = dict()
+        # Sparse-IO circuits capture their forward separately (see
+        # ``sparse_cudagraph``): one ``SparseGraphState`` per batch size, plus
+        # the state of the last forward if it was a replay (the next backward
+        # rebinds the host-side sparse outputs from it).
+        self._sparse_graphs: Dict[int, SparseGraphState] = dict()
+        self._sparse_graph_fwd: Optional[SparseGraphState] = None
+        # Fixed copies of the batch for the generic forward graphs, keyed like
+        # them (inner layers may read the tokens on device).
+        self._graph_data: Dict[tuple, torch.Tensor] = dict()
 
         # Mode for forward and backward pass
         self.default_propagation_alg = "LL" # Could be "LL", "MPE", or "GeneralLL"
@@ -285,7 +295,24 @@ class TensorCircuit(nn.Module):
             if propagation_alg is None:
                 propagation_alg = self.default_propagation_alg
                 kwargs.update(self.propagation_alg_kwargs)
-            
+
+            # Sparse-IO circuits have their own CUDA-graph forward (see
+            # ``sparse_cudagraph``); the generic capture below would bake in
+            # the sparsity patterns of the recorded batch. A replay writes the
+            # node_mars / element_mars it was captured with, so swap those in
+            # before they are initialised.
+            sparse_graph = None
+            if self._has_sparse_prod:
+                if record_cudagraph or apply_cudagraph:
+                    sparse_graph = self._sparse_graph_for_call(
+                        B, record_cudagraph, input_layer_fn, propagation_alg, kwargs,
+                        _inner_layers_only or _no_buffer_reset, inputs.dtype,
+                    )
+                record_cudagraph = apply_cudagraph = False
+                if sparse_graph is not None and sparse_graph.node_mars is not None:
+                    self.node_mars = sparse_graph.node_mars
+                    self.element_mars = sparse_graph.element_mars
+
             ## Initialize buffers for forward pass ##
 
             if not _no_buffer_reset:
@@ -338,30 +365,36 @@ class TensorCircuit(nn.Module):
             if input_layer_fn is not None and run_data.dim() == 2 and run_data.size(1) == self.num_vars:
                 run_data = run_data.permute(1, 0)
             self._run_data = run_data
-            if self._has_sparse_prod and run_data.device.type != "cpu":
-                self._run_data_cpu = run_data.cpu()
+            self._sparse_graph_fwd = None
+            if sparse_graph is not None:
+                # Graph forward: the columns are resolved on device from the
+                # graph's input buffer — no host mirror, no host-side patterns.
+                self._run_data_cpu = self._run_data_list = self._run_pattern_cache = None
             else:
-                self._run_data_cpu = run_data
-            # Pre-convert to a flat Python list (B=1 sparse path only) so per-
-            # timestep ``data[var_id, 0]`` lookups in build_sparse_pattern
-            # become list indexing instead of PyTorch dispatcher trips.
-            if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
-                self._run_data_list = self._run_data_cpu[:, 0].tolist()
-            else:
-                self._run_data_list = None
-            # Per-query cache for batched (B>1) sparse patterns: several
-            # layers (CoSparseProdLayer + its upstream SparseIOSumLayer)
-            # request the same (dist, var) column bounds within one pass; the
-            # dict dedups the host lookups + H2D copy. B=1 keeps the
-            # data_list path and never consults the cache.
-            if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
-                self._run_pattern_cache = dict()
-            else:
-                self._run_pattern_cache = None
-            # Weight-stationary sparse-IO groups: params may have changed
-            # since the last pass (EM step), drop the per-pass rounded W copy.
-            for ws_group in self._sparse_io_ws_groups:
-                ws_group.begin_pass()
+                if self._has_sparse_prod and run_data.device.type != "cpu":
+                    self._run_data_cpu = run_data.cpu()
+                else:
+                    self._run_data_cpu = run_data
+                # Pre-convert to a flat Python list (B=1 sparse path only) so per-
+                # timestep ``data[var_id, 0]`` lookups in build_sparse_pattern
+                # become list indexing instead of PyTorch dispatcher trips.
+                if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
+                    self._run_data_list = self._run_data_cpu[:, 0].tolist()
+                else:
+                    self._run_data_list = None
+                # Per-query cache for batched (B>1) sparse patterns: several
+                # layers (CoSparseProdLayer + its upstream SparseIOSumLayer)
+                # request the same (dist, var) column bounds within one pass; the
+                # dict dedups the host lookups + H2D copy. B=1 keeps the
+                # data_list path and never consults the cache.
+                if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
+                    self._run_pattern_cache = dict()
+                else:
+                    self._run_pattern_cache = None
+                # Weight-stationary sparse-IO groups: params may have changed
+                # since the last pass (EM step), drop the per-pass rounded W copy.
+                for ws_group in self._sparse_io_ws_groups:
+                    ws_group.begin_pass()
 
             # ``missing_mask`` reaches the input layers via ``**kwargs`` on the
             # initial ``layer(inputs, ...)`` calls above; for inner layers it
@@ -376,7 +409,8 @@ class TensorCircuit(nn.Module):
             missing_mask_for_prod = kwargs.get("missing_mask", None)
 
             # Inner layers
-            def _run_inner_layers():
+            def _run_inner_layers(static_ctx = None):
+                extra = {} if static_ctx is None else {"static_ctx": static_ctx}
                 for layer_id, layer_group in enumerate(self.inner_layer_groups):
                     if layer_group.is_prod():
                         # Prod layer
@@ -385,7 +419,8 @@ class TensorCircuit(nn.Module):
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
                                     pattern_cache = self._run_pattern_cache,
-                                    missing_mask = missing_mask_for_prod)
+                                    missing_mask = missing_mask_for_prod,
+                                    **extra)
 
                     elif layer_group.is_sum():
                         # Sum layer
@@ -397,46 +432,77 @@ class TensorCircuit(nn.Module):
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
                                     pattern_cache = self._run_pattern_cache,
-                                    **kwargs)
+                                    **kwargs, **extra)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            if (record_cudagraph or apply_cudagraph) and self._has_sparse_prod:
-                # Sparse-IO layers build data-dependent sparsity patterns on
-                # the host every call; a graph replay would skip that work and
-                # reuse the patterns of the recorded batch. Fall back to eager.
-                if not getattr(self, "_warned_sparse_cudagraph", False):
-                    warnings.warn("CUDA graphs are not supported for circuits with sparse-IO "
-                                  "(SparseCategorical) layers; running eagerly instead.")
-                    self._warned_sparse_cudagraph = True
-                record_cudagraph = False
-                apply_cudagraph = False
+            if sparse_graph is not None:
+                sparse_graph.load_inputs(run_data)
+                self._run_data = sparse_graph.data
+                if sparse_graph.graph is None:
+                    sparse_graph.node_mars = self.node_mars
+                    sparse_graph.element_mars = self.element_mars
 
-            signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
-            if record_cudagraph and signature not in self._recorded_cuda_graphs:
-                # Warmup
-                s = torch.cuda.Stream()
-                s.wait_stream(torch.cuda.current_stream())
-                with torch.cuda.stream(s):
-                    for _ in range(3):
+                    def _sparse_graph_body():
+                        # Part of the graph: every replay re-rounds the WS
+                        # copy of W (params change between EM steps), resets
+                        # the running maxima and resolves the batch's columns
+                        # before the chain runs.
+                        for ws_group in self._sparse_io_ws_groups:
+                            ws_group.begin_pass()
+                        sparse_graph.begin_pass()
+                        _run_inner_layers(static_ctx = sparse_graph)
+
+                    try:
+                        sparse_graph.capture(_sparse_graph_body)
+                    except BaseException:
+                        self._sparse_graphs.pop(B, None)
+                        raise
+                sparse_graph.graph.replay()
+                self._sparse_graph_fwd = sparse_graph
+            else:
+                signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
+                if (record_cudagraph or apply_cudagraph) and self._graph_reason is not None:
+                    if record_cudagraph and not getattr(self, "_warned_sparse_cudagraph", False):
+                        warnings.warn("CUDA graphs are not supported for this circuit "
+                                      f"({self._graph_reason}); running eagerly instead.")
+                        self._warned_sparse_cudagraph = True
+                    record_cudagraph = apply_cudagraph = False
+                if record_cudagraph or (apply_cudagraph and signature in self._recorded_cuda_graphs):
+                    # The graph bakes in the address of ``data``, which inner
+                    # layers may read on device (the blocked layers do): give
+                    # it a fixed copy of the batch, refreshed on every call.
+                    data_buf = self._graph_data.get(signature)
+                    if data_buf is None:
+                        data_buf = torch.empty(run_data.shape, dtype=run_data.dtype,
+                                               device=self.node_mars.device)
+                        self._graph_data[signature] = data_buf
+                    data_buf.copy_(run_data)
+                    self._run_data = data_buf
+                if record_cudagraph and signature not in self._recorded_cuda_graphs:
+                    # Warmup
+                    s = torch.cuda.Stream()
+                    s.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(s):
+                        for _ in range(3):
+                            _run_inner_layers()
+                    torch.cuda.current_stream().wait_stream(s)
+
+                    # Capture
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g):
                         _run_inner_layers()
-                torch.cuda.current_stream().wait_stream(s)
 
-                # Capture
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
+                    # Save
+                    self._recorded_cuda_graphs[signature] = g
+
+                if apply_cudagraph and signature in self._recorded_cuda_graphs:
+                    g = self._recorded_cuda_graphs[signature]
+                    g.replay()
+                else:
                     _run_inner_layers()
 
-                # Save
-                self._recorded_cuda_graphs[signature] = g
-
-            if apply_cudagraph and signature in self._recorded_cuda_graphs:
-                g = self._recorded_cuda_graphs[signature]
-                g.replay()
-            else:
-                _run_inner_layers()
-                
             lls = self.node_mars[self._root_node_range[0]:self._root_node_range[1],:]
             lls = lls.permute(1, 0)
 
@@ -537,6 +603,13 @@ class TensorCircuit(nn.Module):
             self._run_pattern_cache = dict()
         else:
             self._run_pattern_cache = None
+        # After a CUDA-graph forward the sum layers' sparse outputs only carry
+        # device-side column sizes; rebuild the host-described ones the eager
+        # backward sizes its grids from (the values are what the replay wrote).
+        if self._sparse_graph_fwd is not None:
+            self._sparse_graph_fwd.rebind_outputs(
+                self._run_data_cpu, self._run_data_list, self._run_pattern_cache)
+            self._sparse_graph_fwd = None
         for ws_group in self._sparse_io_ws_groups:
             ws_group.begin_pass()
 
@@ -653,6 +726,16 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
+            if self._has_sparse_prod:
+                # The sparse-IO backward sizes its grids from host-side column
+                # sizes, so a captured backward would replay the recorded
+                # batch's patterns; it always runs eagerly.
+                if record_cudagraph and not getattr(self, "_warned_sparse_bwd_cudagraph", False):
+                    warnings.warn("CUDA graphs are not supported for the backward of circuits "
+                                  "with sparse-IO layers; running it eagerly instead.")
+                    self._warned_sparse_bwd_cudagraph = True
+                record_cudagraph = apply_cudagraph = False
+
             signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, allow_modify_flows, logspace_flows)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup
@@ -719,6 +802,40 @@ class TensorCircuit(nn.Module):
             return cache
         else:
             return None
+
+    def _sparse_graph_for_call(self, B: int, record: bool, input_layer_fn, propagation_alg,
+                               kwargs: dict, custom_buffers: bool,
+                               data_dtype: torch.dtype) -> Optional[SparseGraphState]:
+        """The :class:`SparseGraphState` a sparse-IO forward should replay —
+        created (to be captured by this call) when ``record`` is set and none
+        exists for ``B`` — or ``None`` to run eagerly."""
+        reason = self._graph_reason
+        if reason is None:
+            if input_layer_fn is not None:
+                reason = "custom input_layer_fn"
+            elif kwargs.get("missing_mask", None) is not None:
+                reason = "missing_mask"
+            elif not (isinstance(propagation_alg, str) and propagation_alg == "LL"):
+                reason = f"propagation_alg={propagation_alg!r}"
+            elif custom_buffers:
+                reason = "_inner_layers_only / _no_buffer_reset"
+        if reason is not None:
+            if record and not getattr(self, "_warned_sparse_cudagraph", False):
+                warnings.warn("CUDA graphs are not supported for this sparse-IO forward "
+                              f"({reason}); running eagerly instead.")
+                self._warned_sparse_cudagraph = True
+            return None
+
+        state = self._sparse_graphs.get(B)
+        if state is not None and not state.matches(self):
+            # Parameters were re-allocated (re-init / device move) since the
+            # capture: the graph would read stale memory.
+            del self._sparse_graphs[B]
+            state = None
+        if state is None and record:
+            state = SparseGraphState(self, B, self.params.device, data_dtype)
+            self._sparse_graphs[B] = state
+        return state
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
@@ -1569,6 +1686,10 @@ class TensorCircuit(nn.Module):
         # the same tied transition matrix share a rounded-W copy and a
         # deferred param-flow stash (see ``build_ws_groups``).
         self._sparse_io_ws_groups = build_ws_groups(self.inner_layer_groups)
+
+        # Why this circuit's forward cannot be captured in a CUDA graph (None
+        # if every inner layer can; see ``Layer.graph_unsupported_reason``).
+        self._graph_reason = graph_unsupported_reason(self)
 
         # For parameter flow accumulation
         self.parflow_fusing_kwargs = compile_cum_par_flows_fn(node2tiednodes, MAX_NBLOCKS = 2048, BLOCK_SIZE = 2048)

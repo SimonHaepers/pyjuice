@@ -220,6 +220,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 data_list: Optional[list] = None,
                 pattern_cache: Optional[dict] = None,
                 missing_mask: Optional[torch.Tensor] = None,
+                static_ctx=None,
                 **kwargs) -> None:
         batch_size = node_mars.size(1)
         assert missing_mask is None or batch_size == 1, (
@@ -230,6 +231,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
             "SparseIOSumLayer requires propagation_alg == 'LL'."
         )
         assert params.dim() == 1
+        if static_ctx is not None:
+            self._forward_static(params, static_ctx)
+            return None
         assert data is not None, (
             "SparseIOSumLayer.forward requires `data` (per-var observed "
             "tokens) so it can build the output-sparsity pattern for each ns."
@@ -343,34 +347,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params)
             elif sv_in.is_batched:
                 assert sv_out.is_batched
-                BLOCK_B = _FWD_BATCHED_BLOCK_B
-                grid = (triton.cdiv(K_out, TILE_M),
-                        triton.cdiv(batch_size, BLOCK_B))
-                _sparse_io_sum_forward_kernel[grid](
-                    values_out_ptr=sv_out.values,
-                    mparams_ptr=params,
-                    in_indices_ptr=sv_in.indices,
-                    in_values_ptr=sv_in.values,
-                    max_val_ptr=max_val,
-                    out_indices_ptr=sv_out.indices,
-                    in_col_starts_ptr=sv_in.col_starts,
-                    in_nnz_ptr=sv_in.nnz,
-                    out_col_starts_ptr=sv_out.col_starts,
-                    out_nnz_ptr=sv_out.nnz,
-                    pid_start=pid_start,
-                    K_in=K_in,
-                    K_out=K_out,
-                    batch_size=batch_size,
-                    in_stride=sv_in.values.stride(0),
-                    out_stride=sv_out.values.stride(0),
-                    NB_ch=NB_ch,
-                    BS=BS,
-                    CBS=CBS,
-                    TILE_M=TILE_M,
-                    BLOCK_K=_FWD_BLOCK_K,
-                    BLOCK_B=BLOCK_B,
-                    IS_BATCHED=True,
-                )
+                self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
+                                             batch_size, TILE_M)
             else:
                 grid = (triton.cdiv(K_out, TILE_M), 1)
                 _sparse_io_sum_forward_kernel[grid](
@@ -399,6 +377,131 @@ class SparseIOSumLayer(SparseInputSumLayer):
                     IS_BATCHED=False,
                 )
         return None
+
+    def _launch_batched_forward(self, block: tuple, sv_in: SparseNodeValues,
+                                sv_out: SparseNodeValues, max_val: torch.Tensor,
+                                params: torch.Tensor, batch_size: int,
+                                TILE_M: int) -> None:
+        """Batched-layout launch of :func:`_sparse_io_sum_forward_kernel` (B>1,
+        or static containers at any B). Both ``total_nnz`` only bound the
+        grid: the kernel bounds its loop by the per-sample sizes on device.
+        A static B=1 pair takes the single-sample variant (same code as the
+        eager B=1 path), reading its column offsets / sizes on device."""
+        _, _, pid_start, _, _, NB_ch, BS, CBS = block
+        single = batch_size == 1
+        assert not single or (sv_in.static and sv_out.static)
+        BLOCK_B = 1 if single else _FWD_BATCHED_BLOCK_B
+        grid = (triton.cdiv(sv_out.total_nnz, TILE_M),
+                triton.cdiv(batch_size, BLOCK_B))
+        _sparse_io_sum_forward_kernel[grid](
+            values_out_ptr=sv_out.values,
+            mparams_ptr=params,
+            in_indices_ptr=sv_in.indices,
+            in_values_ptr=sv_in.values,
+            max_val_ptr=max_val,
+            out_indices_ptr=sv_out.indices,
+            in_col_starts_ptr=sv_in.col_starts,
+            in_nnz_ptr=sv_in.nnz,
+            out_col_starts_ptr=sv_out.col_starts,
+            out_nnz_ptr=sv_out.nnz,
+            pid_start=pid_start,
+            K_in=sv_in.total_nnz,
+            K_out=sv_out.total_nnz,
+            batch_size=batch_size,
+            in_stride=sv_in.values.stride(0),
+            out_stride=sv_out.values.stride(0),
+            NB_ch=NB_ch,
+            BS=BS,
+            CBS=CBS,
+            TILE_M=TILE_M,
+            BLOCK_K=_FWD_BLOCK_K,
+            BLOCK_B=BLOCK_B,
+            IS_BATCHED=not single,
+            DEVICE_SIZES=single,
+        )
+
+    def _forward_static(self, params: torch.Tensor, static_ctx) -> None:
+        """CUDA-graph forward (see ``pyjuice.model.sparse_cudagraph``): output
+        columns resolved on device, workspaces owned by ``static_ctx``. There
+        are no empty-column shortcuts — the kernels already write ``-inf`` for
+        a sample with an empty input column and nothing for one with an empty
+        output column."""
+        B = static_ctx.B
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
+            self._dense_blocks, self._sparse_input_refs,
+        )):
+            sv_in = sparse_prod._sparse_outputs[ns_idx]
+            assert sv_in.static and sv_in.max_val is not None, (
+                "SparseIOSumLayer: the upstream prod output is not a static "
+                "(CUDA-graph) container."
+            )
+            out_dist = self._output_sparsity_dists[blk_idx]
+            ws = static_ctx.buffer((id(self), "fwd", blk_idx),
+                                   (B * out_dist._max_nnz_per_col,))
+            sv_out = static_ctx.pattern(
+                out_dist, self._output_sparsity_var_ids[blk_idx],
+                self._output_sparsity_num_rows[blk_idx], ws,
+            )
+            self._sparse_outputs[blk_idx] = sv_out
+
+            if self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx):
+                self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params)
+            else:
+                TILE_M = 32
+                while TILE_M > 1 and TILE_M > sv_out.total_nnz:
+                    TILE_M //= 2
+                self._launch_batched_forward(block, sv_in, sv_out, sv_in.max_val,
+                                             params, B, TILE_M)
+
+    def _ws_use_static(self, blk_idx: int, sparse_prod: SparseProdLayer, ns_idx: int,
+                       params: torch.Tensor, static_ctx) -> bool:
+        """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
+        column sizes: the cost guard reads those of the capture batch, and the
+        answer is memoised so the warm-up passes and the capture launch the
+        same kernels."""
+        key = (id(self), blk_idx)
+        use = static_ctx.ws_decisions.get(key)
+        if use is not None:
+            return use
+        use = False
+        ws = self._ws_slots[blk_idx]
+        if ws is not None and _WS_MODE != "never" and ws[0].eligible:
+            group = ws[0]
+            use = True
+            if _WS_MODE != "always":
+                in_ns = sparse_prod.nodes[ns_idx]
+                pairs = static_ctx.capture_pairs(
+                    static_ctx.slot(in_ns.sparse_input_ns.dist, in_ns.var_id),
+                    static_ctx.slot(self._output_sparsity_dists[blk_idx],
+                                    self._output_sparsity_var_ids[blk_idx]),
+                )
+                use = (static_ctx.B >= _WS_MIN_BATCH
+                       and pairs * _WS_COST_RATIO >= group.H_out * group.H_in)
+            use = use and group.ensure_ready(params, static_ctx.B, need_stash=False)
+        static_ctx.ws_decisions[key] = use
+        return use
+
+    def graph_columns(self):
+        return list(zip(self._output_sparsity_dists, self._output_sparsity_var_ids))
+
+    def graph_rebind_outputs(self, static_ctx, data_cpu: torch.Tensor,
+                             data_list: Optional[list],
+                             pattern_cache: Optional[dict]) -> None:
+        """After a CUDA-graph replay, before an eager backward: rebuild
+        ``self._sparse_outputs`` the way the eager forward would have (host
+        ``total_nnz`` / ``nnz_list``, from which the backward sizes its grids
+        and picks its kernels), with ``values`` aliasing the ``static_ctx``
+        buffers the replay wrote — same memory layout at every B."""
+        B = static_ctx.B
+        for blk_idx in range(len(self._sparse_outputs)):
+            out_dist = self._output_sparsity_dists[blk_idx]
+            ws = static_ctx.buffer((id(self), "fwd", blk_idx),
+                                   (B * out_dist._max_nnz_per_col,))
+            self._sparse_outputs[blk_idx] = out_dist.build_sparse_pattern(
+                data=data_cpu, var_id=self._output_sparsity_var_ids[blk_idx],
+                num_rows=self._output_sparsity_num_rows[blk_idx], device=ws.device,
+                values_out=ws, data_list=data_list, pattern_cache=pattern_cache,
+            )
 
     # ------------------------------------------------------------------ #
     # Backward (element flows only)
@@ -948,9 +1051,13 @@ def _sparse_io_sum_forward_kernel(
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
     BLOCK_B: tl.constexpr, IS_BATCHED: tl.constexpr,
+    DEVICE_SIZES: tl.constexpr = False,
 ):
     """Forward for one SparseIOSumLayer block. Grid =
     ``(cdiv(K_out, TILE_M), cdiv(B, BLOCK_B))`` (axis 1 degenerate at B=1).
+    ``DEVICE_SIZES`` (B=1 variant only): read the column offsets / sizes from
+    the ``*_col_starts`` / ``*_nnz`` pointers — a static B=1 container of the
+    CUDA-graph forward — with ``K_in`` / ``K_out`` as mere bounds.
 
     Per-program (K_out-tile) math at ``IS_BATCHED == 0``:
 
@@ -966,7 +1073,9 @@ def _sparse_io_sum_forward_kernel(
     ``IS_BATCHED == 1``: each batch lane reads its own in/out columns
     (``in_indices[in_col_starts[b] + k]`` masked ``k < in_nnz[b]``,
     ``out_indices[out_col_starts[b] + m]`` masked ``m < out_nnz[b]``),
-    ``K_in`` / ``K_out`` become the per-batch max bounds, per-sample
+    ``K_in`` / ``K_out`` are only upper bounds (the per-batch max, or the
+    column-size bound of a CUDA-graph forward) — the grid covers ``K_out``
+    and the loop runs to the lanes' own ``in_nnz`` — per-sample
     ``max_val[b]`` is clamped to ``-1e30``, and lanes with
     ``in_nnz[b] == 0`` store exact ``-inf``.
     """
@@ -981,6 +1090,11 @@ def _sparse_io_sum_forward_kernel(
         k_in_b = tl.load(in_nnz_ptr + offs_b, mask=mask_b, other=0)
         cs_out_b = tl.load(out_col_starts_ptr + offs_b, mask=mask_b, other=0)
         k_out_b = tl.load(out_nnz_ptr + offs_b, mask=mask_b, other=0)
+        # Tile past every lane's output column (the grid only bounds them):
+        # nothing to write. An early return, not a zero trip count, which
+        # measurably slows the loop below.
+        if pid_m * TILE_M >= tl.max(k_out_b, axis=0):
+            return
 
         mask_mb = mask_b[None, :] & (offs_m[:, None] < k_out_b[None, :])
         h_m = tl.load(
@@ -993,8 +1107,11 @@ def _sparse_io_sum_forward_kernel(
         max_b = tl.load(max_val_ptr + offs_b, mask=mask_b, other=0.0)
         max_b = tl.maximum(max_b, -1e30)                        # empty col guard
 
+        # Loop bound from the device sizes, not the host ``K_in``, which only
+        # bounds the batch (the CUDA-graph forward passes the column-size
+        # bound): masked iterations add exact zeros, so this only skips work.
         acc_sum = tl.zeros([TILE_M, BLOCK_B], dtype=tl.float32)
-        for k0 in tl.range(0, K_in, BLOCK_K):
+        for k0 in tl.range(0, tl.max(k_in_b, axis=0), BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
             mask_kb = mask_b[:, None] & (offs_k[None, :] < k_in_b[:, None])
 
@@ -1032,20 +1149,36 @@ def _sparse_io_sum_forward_kernel(
             result, mask=mask_mb,
         )
     else:
-        mask_m = offs_m < K_out
+        if DEVICE_SIZES:
+            # Static B=1 containers (CUDA-graph forward): the column offsets
+            # and sizes live on device, K_in / K_out only bound the grid.
+            k_in = tl.load(in_nnz_ptr)
+            k_out = tl.load(out_nnz_ptr)
+            if pid_m * TILE_M >= k_out:
+                return
+            in_idx_ptr = in_indices_ptr + tl.load(in_col_starts_ptr)
+            out_idx_ptr = out_indices_ptr + tl.load(out_col_starts_ptr)
+        else:
+            k_in = K_in
+            k_out = K_out
+            in_idx_ptr = in_indices_ptr
+            out_idx_ptr = out_indices_ptr
+        mask_m = offs_m < k_out
 
-        h_m = tl.load(out_indices_ptr + offs_m, mask=mask_m, other=0)
+        h_m = tl.load(out_idx_ptr + offs_m, mask=mask_m, other=0)
         pblock_m = h_m // BS                                    # [TILE_M]
         within_m = h_m % BS                                     # [TILE_M]
 
         max_val = tl.load(max_val_ptr)                          # scalar
+        if DEVICE_SIZES:
+            max_val = tl.maximum(max_val, -1e30)    # empty-column semantics of the batched path
 
         acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
-        for k0 in tl.range(0, K_in, BLOCK_K):
+        for k0 in tl.range(0, k_in, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
-            mask_k = offs_k < K_in
+            mask_k = offs_k < k_in
 
-            child_ids = tl.load(in_indices_ptr + offs_k, mask=mask_k, other=0)
+            child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
             log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
                                other=-float("inf"))
 
@@ -1067,6 +1200,8 @@ def _sparse_io_sum_forward_kernel(
             acc_sum += tl.sum(W * v_k[None, :], axis=1)
 
         result = tl.log(acc_sum + 1e-24) + max_val
+        if DEVICE_SIZES:
+            result = tl.where(k_in == 0, -float("inf"), result)
         tl.store(values_out_ptr + offs_m, result, mask=mask_m)
 
 

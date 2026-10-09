@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import torch
-from typing import Union, Sequence
+from typing import Union, Sequence, Optional, Tuple
 
 from pyjuice.nodes import CircuitNodes
 
@@ -95,3 +95,35 @@ class Layer():
             return {"alpha": kwargs["alpha"]}
         else:
             raise ValueError(f"Unknown propagation algorithm {propagation_alg}.")
+
+    # ------------------------------------------------------------------ #
+    # CUDA-graph forward protocol (see ``pyjuice.model.sparse_cudagraph``)
+    # ------------------------------------------------------------------ #
+    #
+    # A captured forward replays the same kernels for every batch of one
+    # size, so no layer may read the batch, or anything derived from it, on
+    # the host. Layers that never do (the dense, block-diagonal and blocked
+    # layers) need nothing here. Layers whose work depends on the observed
+    # tokens accept a ``static_ctx`` forward kwarg instead and declare below
+    # what the graph state has to prepare for them; any layer can join a
+    # captured circuit that way, whatever the circuit's structure.
+
+    def graph_unsupported_reason(self) -> Optional[str]:
+        """``None`` if this layer's forward can run inside a CUDA graph,
+        otherwise why not (the circuit then runs eagerly)."""
+        return None
+
+    def graph_columns(self) -> Sequence[Tuple[object, int]]:
+        """``(dist, var_id)`` pairs whose observed-token column (per-sample CSC
+        offset and size) this layer reads; resolved on device every replay."""
+        return ()
+
+    def graph_max_rows(self) -> int:
+        """Rows of per-sample running maxima (``[rows, B]``, reset to ``-inf``
+        at the start of every replay) this layer accumulates into."""
+        return 0
+
+    def graph_rebind_outputs(self, static_ctx, data_cpu, data_list, pattern_cache) -> None:
+        """After a replay, before an eager backward: rebuild whatever
+        host-side state that backward reads from this layer's forward."""
+        return None

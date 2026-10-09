@@ -130,6 +130,12 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             1,
         )
 
+    def graph_unsupported_reason(self) -> Optional[str]:
+        # Builds its sparsity patterns from the host copy of the data; it
+        # needs a ``static_ctx`` forward (see ``SparseIOSumLayer``) to be
+        # captured.
+        return f"{type(self).__name__} has no CUDA-graph forward yet"
+
     def __repr__(self) -> str:
         return (
             f"SparseOutputBlockDiagonalSumLayer("

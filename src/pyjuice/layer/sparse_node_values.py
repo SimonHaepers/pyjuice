@@ -61,6 +61,12 @@ class SparseNodeValues:
                                    per-sample column lengths.
       nnz_list   list | None    — B>1 only: host copy of ``nnz`` for empty
                                    checks, grid sizing and tests.
+      static     bool           — device-described pattern of a CUDA-graph
+                                   forward (any B, incl. 1): the batched
+                                   layout, with ``col_starts`` / ``nnz``
+                                   filled on device each replay,
+                                   ``total_nnz`` the static bound
+                                   ``_max_nnz_per_col`` and no ``nnz_list``.
     """
 
     col_start: int
@@ -73,6 +79,7 @@ class SparseNodeValues:
     col_starts: Optional[torch.Tensor] = None
     nnz: Optional[torch.Tensor] = None
     nnz_list: Optional[List[int]] = None
+    static: bool = False
 
     @property
     def device(self) -> torch.device:
@@ -80,7 +87,7 @@ class SparseNodeValues:
 
     @property
     def is_batched(self) -> bool:
-        return self.batch_size > 1
+        return self.batch_size > 1 or self.static
 
     def like_pattern(self, values: torch.Tensor,
                      max_val: Optional[torch.Tensor] = None) -> "SparseNodeValues":
@@ -93,7 +100,7 @@ class SparseNodeValues:
             indices=self.indices, values=values, num_rows=self.num_rows,
             max_val=max_val,
             batch_size=self.batch_size, col_starts=self.col_starts,
-            nnz=self.nnz, nnz_list=self.nnz_list,
+            nnz=self.nnz, nnz_list=self.nnz_list, static=self.static,
         )
 
     def scatter_to_dense(self, out: torch.Tensor, out_base: int,
