@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 from typing import List, Optional, Sequence
 
 import torch
@@ -276,6 +278,8 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 missing_mask: Optional[torch.Tensor] = None,
                 static_ctx=None,
                 **kwargs) -> None:
+        self._bd_forward_precision = "ieee" if force_use_fp32 else "tf32x3"
+        self._bd_forward_bf16 = force_use_bf16 and not force_use_fp32
         batch_size = node_mars.size(1)
         assert propagation_alg == "LL", (
             "SparseOutputBlockDiagonalSumLayer requires propagation_alg == 'LL'."
@@ -386,7 +390,7 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 "batch_size > 1 but build_sparse_pattern produced a "
                 "non-batched sv_out — inconsistent chain state."
             )
-            self._launch_forward(element_mars, params, block, sv_out, out_offs, max_k_out,
+            self._launch_forward(node_mars, element_mars, params, block, sv_out, out_offs, max_k_out,
                                  out_rows, out_slots, batch_size)
 
         return None
@@ -402,13 +406,14 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         B = static_ctx.B
         for blk_idx, block in enumerate(self._bd_blocks):
             out_dist = self._output_sparsity_dists[blk_idx]
-            ws = static_ctx.buffer((id(self), "fwd", blk_idx), (B * out_dist._max_nnz_per_col,))
+            ws = static_ctx.buffer((id(self), "fwd", blk_idx), (B * static_ctx.capacity(out_dist),))
             sv_out = static_ctx.pattern(
                 out_dist, self._output_sparsity_var_ids[blk_idx],
                 self._output_sparsity_num_rows[blk_idx], ws,
             )
             self._sparse_outputs[blk_idx] = sv_out
-            if _bd_dense_batched(B):
+            if static_ctx.query_masks or _bd_dense_batched(B):
+                self._cached_out_offsets[blk_idx] = _DENSE_BATCHED
                 self._dense_block_forward(node_mars, element_mars, params, blk_idx, block, sv_out)
                 continue
             out_offs = self._lookup_out_block_offsets(
@@ -416,7 +421,8 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 device=node_mars.device, batch_size=B, batched=True,
             )
             out_rows, out_slots = self._out_rows_and_slots(blk_idx, sv_out, False, node_mars.device)
-            self._launch_forward(element_mars, params, block, sv_out, out_offs,
+            self._cached_out_offsets[blk_idx] = (out_offs, self._MAX_K_OUT_ACTIVE, out_rows, out_slots)
+            self._launch_forward(node_mars, element_mars, params, block, sv_out, out_offs,
                                  self._MAX_K_OUT_ACTIVE, out_rows, out_slots, B)
 
     def _dense_block_forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
@@ -428,7 +434,7 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         _sv_dense_rows(node_mars, block[0], sv_out, sv_out.values, False,
                        self._row_map_on(blk_idx, node_mars.device))
 
-    def _launch_forward(self, element_mars: torch.Tensor, params: torch.Tensor,
+    def _launch_forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor, params: torch.Tensor,
                         block: tuple, sv_out: SparseNodeValues, out_offs: torch.Tensor,
                         max_k_out: int, out_rows: torch.Tensor,
                         out_slots: Optional[torch.Tensor], batch_size: int) -> None:
@@ -436,10 +442,12 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         layout whenever *sv_out* is batched — B>1 or a static container —
         else the B=1 column view."""
         _, cid_start, pid_start, _, NB, BS, CBS = block
+        row_map = self._input_row_map(block)
         batched = sv_out.is_batched
         _fw_bd_sparse_out_kernel[(NB, batch_size)](
             out_values_ptr=sv_out.values,
-            element_mars_ptr=element_mars,
+            element_mars_ptr=node_mars if row_map is not None else element_mars,
+            input_map=params if row_map is None else row_map, MAP_INPUT=row_map is not None,
             mparams_ptr=params,
             out_indices_ptr=out_rows,
             out_slots_ptr=out_rows if out_slots is None else out_slots,
@@ -488,6 +496,7 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 
         for blk_idx, block in enumerate(self._bd_blocks):
             nid_start, cid_start, pid_start, pfid_start, NB, BS, CBS = block
+            row_map = self._input_row_map(block)
 
             sv_flow_out = self._sparse_flows[blk_idx]
             sv_out = self._sparse_outputs[blk_idx]
@@ -496,7 +505,10 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             if K_out == 0:
                 # No active output (any sample): zero flow into every child
                 # slot — the dense child's backward reads all of them.
-                element_flows[cid_start:cid_start + NB * CBS, :].fill_(0.0)
+                if row_map is None:
+                    element_flows[cid_start:cid_start + NB * CBS, :].fill_(0.0)
+                else:
+                    node_flows.index_fill_(0, row_map, 0.0)
                 self._sparse_flows[blk_idx] = None
                 self._cached_out_offsets[blk_idx] = None
                 continue
@@ -512,15 +524,14 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 "SparseOutputBlockDiagonalSumLayer.backward expected cached "
                 "block offsets from forward; call forward before backward."
             )
-            self._cached_out_offsets[blk_idx] = None
             if cached is _DENSE_BATCHED:
                 # Parent side back to dense rows: marginals -inf and flows 0 off
                 # the support, so those rows contribute exact zeros.
-                row_map = self._row_map_on(blk_idx, node_mars.device)
+                out_row_map = self._row_map_on(blk_idx, node_mars.device)
                 _sv_to_dense_rows(node_mars, nid_start, NB * BS, float("-inf"),
-                                  sv_out, sv_out.values, row_map)
+                                  sv_out, sv_out.values, out_row_map)
                 _sv_to_dense_rows(node_flows, nid_start, NB * BS, 0.0,
-                                  sv_out, sv_flow_out.values, row_map)
+                                  sv_out, sv_flow_out.values, out_row_map)
                 self._dense_backward_block(
                     node_flows, element_flows, node_mars, element_mars, params,
                     param_flows if compute_pflows else None, block, batch_size,
@@ -533,8 +544,9 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             if sv_out.is_batched:
                 grid = (NB, batch_size)
                 _bk_bd_sparse_out_kernel[grid](
-                    element_flows_ptr=element_flows,
-                    element_mars_ptr=element_mars,
+                    element_flows_ptr=node_flows if row_map is not None else element_flows,
+                    element_mars_ptr=node_mars if row_map is not None else element_mars,
+                    input_map=params if row_map is None else row_map, MAP_INPUT=row_map is not None,
                     sv_flow_out_ptr=sv_flow_out.values,
                     sv_out_values_ptr=sv_out.values,
                     mparams_ptr=params,
@@ -563,8 +575,9 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             else:
                 grid = (NB, 1)
                 _bk_bd_sparse_out_kernel[grid](
-                    element_flows_ptr=element_flows,
-                    element_mars_ptr=element_mars,
+                    element_flows_ptr=node_flows if row_map is not None else element_flows,
+                    element_mars_ptr=node_mars if row_map is not None else element_mars,
+                    input_map=params if row_map is None else row_map, MAP_INPUT=row_map is not None,
                     sv_flow_out_ptr=sv_flow_out.values,
                     sv_out_values_ptr=sv_out.values,
                     mparams_ptr=params,
@@ -599,14 +612,7 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 # ======================================================================= #
 
 
-@triton.jit(
-    do_not_specialize=["cid_start", "pid_start", "batch_size", "BS", "CBS",
-                       "v_stride", "offs_stride"],
-    do_not_specialize_on_alignment=[
-        "out_values_ptr", "out_indices_ptr", "out_slots_ptr",
-        "out_block_offsets_ptr", "out_col_starts_ptr",
-    ],
-)
+@runtime_triton_jit
 def _fw_bd_sparse_out_kernel(
     out_values_ptr,
     element_mars_ptr, mparams_ptr,
@@ -614,7 +620,7 @@ def _fw_bd_sparse_out_kernel(
     cid_start, pid_start,
     batch_size,
     v_stride, offs_stride,
-    BS, CBS,
+    BS, CBS, input_map, MAP_INPUT: tl.constexpr,
     CBS_PADDED: tl.constexpr,
     MAX_K_OUT: tl.constexpr,
     IS_BATCHED: tl.constexpr,
@@ -673,8 +679,10 @@ def _fw_bd_sparse_out_kernel(
 
     # Dense child marginals for this block (int64: cid * B crosses 2^31 at
     # large H·T·B).
-    emars_ptr = (cid_start + pid_nb * CBS + offs_c).to(tl.int64) * batch_size \
-        + pid_b
+    child_rows = (cid_start + pid_nb * CBS + offs_c).to(tl.int64)
+    if MAP_INPUT:
+        child_rows = tl.load(input_map + pid_nb * CBS + offs_c, mask=mask_c, other=0).to(tl.int64)
+    emars_ptr = child_rows * batch_size + pid_b
     emars = tl.load(element_mars_ptr + emars_ptr, mask=mask_c,
                     other=-float("inf"))                                         # [CBS_PADDED]
 
@@ -699,7 +707,7 @@ def _fw_bd_sparse_out_kernel(
     result = tl.where(
         emars_max == -float("inf"),
         -float("inf"),
-        tl.log(acc + 1e-24) + emars_max,
+        tl.log(acc) + emars_max,
     )
     if HAS_SLOT_MAP:
         slot = tl.load(out_slots_ptr + idx_base + offs_m, mask=mask_m, other=0)
@@ -708,15 +716,7 @@ def _fw_bd_sparse_out_kernel(
     tl.store(out_values_ptr + val_col + slot, result, mask=mask_m)
 
 
-@triton.jit(
-    do_not_specialize=["cid_start", "pid_start", "pfid_start", "batch_size",
-                       "BS", "CBS", "v_stride", "f_stride", "offs_stride"],
-    do_not_specialize_on_alignment=[
-        "sv_flow_out_ptr", "sv_out_values_ptr", "out_indices_ptr",
-        "out_slots_ptr", "out_block_offsets_ptr", "out_col_starts_ptr",
-        "pflows_ptr",
-    ],
-)
+@runtime_triton_jit
 def _bk_bd_sparse_out_kernel(
     element_flows_ptr, element_mars_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,
@@ -726,7 +726,7 @@ def _bk_bd_sparse_out_kernel(
     cid_start, pid_start, pfid_start,
     batch_size,
     v_stride, f_stride, offs_stride,
-    BS, CBS,
+    BS, CBS, input_map, MAP_INPUT: tl.constexpr,
     CBS_PADDED: tl.constexpr,
     MAX_K_OUT: tl.constexpr,
     IS_BATCHED: tl.constexpr,
@@ -794,8 +794,10 @@ def _bk_bd_sparse_out_kernel(
     nmars = tl.load(sv_out_values_ptr + val_col + slot, mask=mask_m,
                     other=-float("inf"))
 
-    emars_ptr = (cid_start + pid_nb * CBS + offs_c).to(tl.int64) * batch_size \
-        + pid_b
+    child_rows = (cid_start + pid_nb * CBS + offs_c).to(tl.int64)
+    if MAP_INPUT:
+        child_rows = tl.load(input_map + pid_nb * CBS + offs_c, mask=mask_c, other=0).to(tl.int64)
+    emars_ptr = child_rows * batch_size + pid_b
     emars = tl.load(element_mars_ptr + emars_ptr, mask=mask_c,
                     other=-float("inf"))                                         # [CBS_PADDED]
 

@@ -66,7 +66,8 @@ class SparseNodeValues:
                                    layout, with ``col_starts`` / ``nnz``
                                    filled on device each replay,
                                    ``total_nnz`` the static bound
-                                   ``_max_nnz_per_col`` and no ``nnz_list``.
+                                   ``_max_nnz_per_col`` (or all rows for a
+                                   masked-query profile) and no ``nnz_list``.
     """
 
     col_start: int
@@ -124,6 +125,11 @@ class SparseNodeValues:
         """Return a new :class:`SparseNodeValues` sharing this object's
         pattern (``col_start``, ``indices``) whose
         ``values[j] = src[src_base + indices[j], 0]``. B=1 dense bridge."""
+        if self.is_batched:
+            from .sparse_io_block_diagonal_sum_layer import _sv_dense_rows
+            values = torch.empty_like(self.values)
+            _sv_dense_rows(src, src_base, self, values, False)
+            return self.like_pattern(values)
         assert not self.is_batched, (
             "gather_from_dense is a B=1 dense bridge; the batched chain is "
             "packed-only (_skip_scatter)."

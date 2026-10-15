@@ -29,7 +29,8 @@ class ProdLayer(Layer, nn.Module):
 
     def __init__(self, nodes: Sequence[ProdNodes], global_nid_start: Optional[int] = None, 
                  layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None, 
-                 disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False) -> None:
+                 disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False,
+                 _compile_dense: bool = True) -> None:
         Layer.__init__(self, nodes)
         nn.Module.__init__(self)
 
@@ -58,6 +59,18 @@ class ProdLayer(Layer, nn.Module):
         self.num_nodes = layer_num_nblocks * self.block_size
         self.num_edges = layer_num_edges
         self._layer_nid_range = (global_nid_start, global_nid_start + self.num_nodes)
+
+        self._dense_compiled = _compile_dense
+        if not _compile_dense:
+            # Packed subclasses supply their own forward/backward kernels.
+            # Their omitted children have no dense IDs; compiling the generic
+            # tables would treat them as dummy nodes or create invalid reads.
+            self.num_fw_partitions = self.num_bk_partitions = 0
+            self.partitioned_nids = FastParamList([])
+            self.partitioned_cids = FastParamList([])
+            self.partitioned_u_cids = FastParamList([])
+            self.partitioned_parids = FastParamList([])
+            return
 
         # Find a good strategy to partition the nodes into partitions according to their number of children 
         # to minimize total computation cost
@@ -169,6 +182,11 @@ class ProdLayer(Layer, nn.Module):
         `element_mars`: [max_num_els, B]
         """
 
+        if getattr(self, "_fused_permutation", False):
+            return None
+
+        assert self._dense_compiled, "This product was compiled for packed execution only."
+
         if not _for_backward and self.provided("fw_partition_local_ids"):
             # Partial evaluation (for forward pass)
             for partition_id in range(self.num_fw_partitions):
@@ -215,6 +233,11 @@ class ProdLayer(Layer, nn.Module):
         `element_flows`: [max_num_els, B]
         """
         
+        if getattr(self, "_fused_permutation", False):
+            return None
+
+        assert self._dense_compiled, "This product was compiled for packed execution only."
+
         if self.provided("bk_partition_local_ids"):
             # Partial evaluation
             for partition_id in range(self.num_bk_partitions):

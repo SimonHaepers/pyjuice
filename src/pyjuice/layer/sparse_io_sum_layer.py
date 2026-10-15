@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 import os
 import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -51,7 +53,7 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 # cores. Cost is one pass over W per step, independent of the support size.
 #
 # Parameter flows of tied transitions (the homogeneous HMM chain) are deferred:
-# each step stashes its densified factors and the pass ends with ONE GEMM,
+# each step stashes its densified factors and bounded chunks feed GEMMs,
 # ``pflow += W * sum_t G_t^T X_t``, instead of B * K_in * K_out atomics per step.
 #
 # This is ON BY DEFAULT from ``_WS_MIN_BATCH`` samples up (EM training); B=1
@@ -338,10 +340,6 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 max_val = sv_in.values.max()
 
             TILE_M = 32
-            while TILE_M > 1 and TILE_M > K_out:
-                TILE_M //= 2
-            if TILE_M < 1:
-                TILE_M = 1
 
             if sv_in.is_batched and self._ws_use(blk_idx, block, sv_in, sv_out, params):
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params)
@@ -437,7 +435,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             )
             out_dist = self._output_sparsity_dists[blk_idx]
             ws = static_ctx.buffer((id(self), "fwd", blk_idx),
-                                   (B * out_dist._max_nnz_per_col,))
+                                   (B * static_ctx.capacity(out_dist),))
             sv_out = static_ctx.pattern(
                 out_dist, self._output_sparsity_var_ids[blk_idx],
                 self._output_sparsity_num_rows[blk_idx], ws,
@@ -448,17 +446,15 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params)
             else:
                 TILE_M = 32
-                while TILE_M > 1 and TILE_M > sv_out.total_nnz:
-                    TILE_M //= 2
                 self._launch_batched_forward(block, sv_in, sv_out, sv_in.max_val,
                                              params, B, TILE_M)
 
     def _ws_use_static(self, blk_idx: int, sparse_prod: SparseProdLayer, ns_idx: int,
                        params: torch.Tensor, static_ctx) -> bool:
         """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
-        column sizes: the cost guard reads those of the capture batch, and the
-        answer is memoised so the warm-up passes and the capture launch the
-        same kernels."""
+        column sizes: the cost guard uses the distribution's average support
+        (all rows for masked queries). The answer is memoised for consistent
+        warmup and capture dispatch."""
         key = (id(self), blk_idx)
         use = static_ctx.ws_decisions.get(key)
         if use is not None:
@@ -470,11 +466,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
             use = True
             if _WS_MODE != "always":
                 in_ns = sparse_prod.nodes[ns_idx]
-                pairs = static_ctx.capture_pairs(
-                    static_ctx.slot(in_ns.sparse_input_ns.dist, in_ns.var_id),
-                    static_ctx.slot(self._output_sparsity_dists[blk_idx],
-                                    self._output_sparsity_var_ids[blk_idx]),
-                )
+                in_dist = in_ns.sparse_input_ns.dist
+                out_dist = self._output_sparsity_dists[blk_idx]
+                # Distribution-level average, independent of the capture tokens.
+                avg_in = in_dist._num_nodes if static_ctx.query_masks else in_dist._nnz / in_dist.num_cats
+                avg_out = out_dist._num_nodes if static_ctx.query_masks else out_dist._nnz / out_dist.num_cats
+                pairs = static_ctx.B * avg_in * avg_out
                 use = (static_ctx.B >= _WS_MIN_BATCH
                        and pairs * _WS_COST_RATIO >= group.H_out * group.H_in)
             use = use and group.ensure_ready(params, static_ctx.B, need_stash=False)
@@ -560,7 +557,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws_flow = self._bwd_flow_workspaces[blk_idx]
             in_dist = sparse_prod.nodes[ns_idx].sparse_input_ns.dist
             if sv_in.is_batched:
-                needed = batch_size * in_dist._max_nnz_per_col
+                needed = sv_in.values.numel()
             else:
                 in_max_nnz = max(in_dist._max_nnz_per_col, in_dist._num_nodes)
                 needed = max(K_in, in_max_nnz)
@@ -571,11 +568,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 )
                 self._bwd_flow_workspaces[blk_idx] = ws_flow
             if sv_in.is_batched:
-                K_stride = in_dist._max_nnz_per_col
+                K_stride = sv_in.values.stride(0)
                 flow_values = ws_flow.narrow(
                     0, 0, batch_size * K_stride).view(batch_size, K_stride)
             else:
                 flow_values = ws_flow.narrow(0, 0, K_in)
+            if kwargs.get("static_ctx") is not None:
+                flow_values = kwargs["static_ctx"].buffer((id(self), "bwd", blk_idx), tuple(sv_in.values.shape))
             sv_flow_in = sv_in.like_pattern(flow_values)
             sparse_prod._sparse_flows[ns_idx] = sv_flow_in
 
@@ -687,7 +686,15 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if _WS_MODE != "always":
             if sv_in.batch_size < _WS_MIN_BATCH:
                 return False
-            pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
+            if sv_in.static or sv_out.static:
+                prod, ns_idx = self._sparse_input_refs[blk_idx]
+                in_dist = prod.nodes[ns_idx].sparse_input_ns.dist
+                out_dist = self._output_sparsity_dists[blk_idx]
+                avg_in = in_dist._nnz / in_dist.num_cats
+                avg_out = out_dist._nnz / out_dist.num_cats
+                pairs = sv_in.batch_size * avg_in * avg_out
+            else:
+                pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
             if pairs * _WS_COST_RATIO < group.H_out * group.H_in:
                 return False
         return group.ensure_ready(params, sv_in.batch_size, need_stash)
@@ -735,8 +742,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                            negate_pflows: bool) -> None:
         """Element flows through :func:`_ws_bwd_flow_kernel`; the parameter
         flows are only *stashed* here (densified ``G`` / ``X`` factors in
-        this block's slot) and accumulated by :meth:`_WSGroup.flush` once
-        every tied step of the pass has run.
+        this block's slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
 
         With ``gs[b, h] = nflow[b, h] * exp(max_b - nmars[b, h])`` and
         ``x[b, c] = exp(in[b, c] - max_b)`` (zero off-support):
@@ -759,7 +765,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         gd = _ws_scratch("g", (B, H_out), device)
         gd.zero_()
         if param_flows is not None:
-            gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows)
+            gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
         else:
             gt, xt, col0 = gd, None, 0
         _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
@@ -795,6 +801,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
 # =====================================================================
 # Weight-stationary path: shared state
 # =====================================================================
+
+_WS_STASH_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_STASH_MIB", "256")) * 2**20
+"""Factor-buffer budget per tied matrix; at least one batch slot is retained.
+Set to 0 to retain all slots (reference behavior). Chunking changes only the
+order of parameter-flow accumulation, not the batch or the EM update.
+"""
 
 _WS_VEC = 256
 """Element tile of the densify / gather kernels."""
@@ -844,9 +856,9 @@ class _WSGroup:
     ``pfid_start`` / shape — all 127 steps of a homogeneous HMM chain:
 
     * the per-pass tf32-rounded copy of W (``_WS_PRECISION == "tf32"``);
-    * the stash of densified backward factors, one ``B``-column slot per
-      member block: ``Gt[H_out, slots*B]`` and ``Xt[H_in, slots*B]``, whose
-      product :meth:`flush` turns into the parameter flows at pass end.
+    * the stash of densified backward factors, up to the configured number of
+      ``B``-column slots: ``Gt[H_out, slots*B]`` / ``Xt[H_in, slots*B]``.
+      Full chunks flush during traversal; the remainder flushes at pass end.
 
     ``TensorCircuit`` calls :meth:`begin_pass` at the start of every
     forward / backward and :meth:`flush` after the inner backward.
@@ -866,16 +878,16 @@ class _WSGroup:
         self._gt: Optional[torch.Tensor] = None
         self._xt: Optional[torch.Tensor] = None
         self._B = 0
-        self._dirty: set = set()      # slots whose stash columns may be non-zero
-        self._written: set = set()    # slots written in the current pass
+        self._capacity = 0
+        self._used = 0
         self._negate: Optional[bool] = None
 
     def begin_pass(self) -> None:
         """Params may have changed since the last pass (EM step): rebuild the
-        rounded copy on next use. Slots written by a pass that never reached
-        :meth:`flush` stay dirty and are zeroed by the next flush."""
+        rounded copy on next use. Unflushed factors of an abandoned pass are
+        discarded. Reserved slots are zeroed before reuse."""
         self._w_valid = False
-        self._written.clear()
+        self._used = 0
         self._negate = None
 
     def weights(self, params: torch.Tensor) -> Tuple[torch.Tensor, int]:
@@ -901,7 +913,7 @@ class _WSGroup:
     def ensure_ready(self, params: torch.Tensor, B: int, need_stash: bool) -> bool:
         """Allocate this group's WS buffers up front — the per-pass rounded W
         copy (``H^2`` floats) and, when ``need_stash``, the deferred param-flow
-        stash (``(H_out + H_in) * num_slots * B`` floats). Returns ``False``
+        stash (``(H_out + H_in) * chunk_slots * B`` floats). Returns ``False``
         after disabling the group if they do not fit, so that enabling WS by
         default can never turn a run that used to fit into an OOM crash; the
         blocks then stay on the gather kernels for the rest of the session.
@@ -916,7 +928,7 @@ class _WSGroup:
             self._gt = self._xt = None
             _WS_SCRATCH.pop(("w_rn", params.device), None)
             extra = (self.H_out * self.H_in
-                     + (self.H_out + self.H_in) * self.num_slots * B) * 4 / 2 ** 30
+                     + (self.H_out + self.H_in) * self._stash_slots(B) * B) * 4 / 2 ** 30
             warnings.warn(
                 "Not enough GPU memory for the weight-stationary sparse-IO "
                 f"path (needs up to ~{extra:.1f} GiB beyond the circuit: one "
@@ -931,44 +943,52 @@ class _WSGroup:
             return False
         return True
 
+    def _stash_slots(self, B: int) -> int:
+        per_slot = (self.H_out + self.H_in) * B * 4
+        return (self.num_slots if _WS_STASH_BYTES <= 0 else
+                min(self.num_slots, max(1, _WS_STASH_BYTES // per_slot)))
+
     def _ensure_stash(self, B: int, device: torch.device) -> None:
-        N = self.num_slots * B
-        if self._gt is None or self._B != B or self._gt.device != device:
-            self._gt = self._xt = None       # free the old pair before retrying
-            self._gt = torch.zeros(self.H_out, N, dtype=torch.float32, device=device)
-            self._xt = torch.zeros(self.H_in, N, dtype=torch.float32, device=device)
-            self._B = B
-            self._dirty.clear()
+        capacity = self._stash_slots(B)
+        if (self._gt is None or self._B != B or self._gt.device != device
+                or self._capacity != capacity):
+            self._gt = self._xt = None
+            self._gt = torch.empty(self.H_out, capacity * B, dtype=torch.float32, device=device)
+            self._xt = torch.empty(self.H_in, capacity * B, dtype=torch.float32, device=device)
+            self._B, self._capacity = B, capacity
+            self._used = 0
 
     def stash_slot(self, slot: int, B: int, device: torch.device,
-                   negate: bool) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """``(Gt, Xt, first column)`` of ``slot``, zeroed and marked written."""
+                   negate: bool, params: torch.Tensor,
+                   param_flows: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Reserve a zeroed physical slot, flushing a full chunk first.
+
+        Slots are assigned in traversal order. A gather-path member does not
+        consume one; partial chunks and abandoned passes never read stale data.
+        """
+        assert 0 <= slot < self.num_slots
         self._ensure_stash(B, device)
+        if self._used == self._capacity:
+            self.flush(params, param_flows)
         assert self._negate is None or self._negate == negate, (
-            "negate_pflows changed within one backward pass."
+            "negate_pflows changed within one backward chunk."
         )
         self._negate = negate
-        col0 = slot * B
-        if slot in self._dirty:
-            self._gt[:, col0:col0 + B].zero_()
-            self._xt[:, col0:col0 + B].zero_()
-        self._dirty.add(slot)
-        self._written.add(slot)
+        col0 = self._used * B
+        self._gt[:, col0:col0 + B].zero_()
+        self._xt[:, col0:col0 + B].zero_()
+        self._used += 1
         return self._gt, self._xt, col0
 
     def flush(self, params: torch.Tensor, param_flows: torch.Tensor) -> None:
-        """``pflow[h, c] += W[h, c] * sum_n Gt[h, n] Xt[c, n]`` over every
-        slot of the pass: one cuBLAS GEMM (in row panels to bound the dense
-        temporary) plus an epilogue that reads W and read-modify-writes the
-        param flows once per pass."""
-        if not self._written:
-            return
-        B = self._B
-        for s in self._dirty - self._written:      # stale slots of an aborted pass
-            self._gt[:, s * B:(s + 1) * B].zero_()
-            self._xt[:, s * B:(s + 1) * B].zero_()
-        self._dirty &= self._written
+        """Accumulate this chunk's Gt @ Xt.T into parameter flows.
 
+        Row panels also bound the GEMM output temporary. The last chunk can
+        be smaller than capacity; cuBLAS receives its true reduction extent.
+        """
+        if not self._used:
+            return
+        columns = self._used * self._B
         device = params.device
         TMe = min(64, self.BS)
         TKe = min(64, self.CBS)
@@ -982,7 +1002,7 @@ class _WSGroup:
             for r0 in range(0, self.H_out, rows):
                 r = min(rows, self.H_out - r0)
                 out = panel[:r]
-                torch.mm(self._gt[r0:r0 + r], self._xt.t(), out=out)
+                torch.mm(self._gt[r0:r0 + r, :columns], self._xt[:, :columns].t(), out=out)
                 _ws_pflow_epilogue_kernel[(r // TMe, self.H_in // TKe)](
                     param_flows, params, out, r0, self.pid_start, self.pfid_start,
                     self.H_in, NB_ch=self.NB_ch, BS=self.BS, CBS=self.CBS,
@@ -990,7 +1010,7 @@ class _WSGroup:
                 )
         finally:
             torch.backends.cuda.matmul.allow_tf32 = prev
-        self._written.clear()
+        self._used = 0
         self._negate = None
 
 
@@ -1026,16 +1046,7 @@ def build_ws_groups(inner_layer_groups) -> List[_WSGroup]:
 # Keep the logsumexp math in sync with the sibling kernels.
 
 
-@triton.jit(
-    do_not_specialize=["pid_start", "K_in", "K_out", "batch_size",
-                       "in_stride", "out_stride"],
-    do_not_specialize_on_alignment=[
-        "in_indices_ptr", "in_values_ptr", "max_val_ptr",
-        "out_indices_ptr", "values_out_ptr",
-        "in_col_starts_ptr", "in_nnz_ptr",
-        "out_col_starts_ptr", "out_nnz_ptr",
-    ],
-)
+@runtime_triton_jit
 def _sparse_io_sum_forward_kernel(
     values_out_ptr,
     mparams_ptr,
@@ -1141,7 +1152,7 @@ def _sparse_io_sum_forward_kernel(
 
             acc_sum += tl.sum(W * v_k[None, :, :], axis=2)      # [TILE_M, BLOCK_B]
 
-        result = tl.log(acc_sum + 1e-24) + max_b[None, :]
+        result = tl.log(acc_sum) + max_b[None, :]
         result = tl.where(k_in_b[None, :] == 0, -float("inf"), result)
 
         tl.store(
@@ -1170,8 +1181,7 @@ def _sparse_io_sum_forward_kernel(
         within_m = h_m % BS                                     # [TILE_M]
 
         max_val = tl.load(max_val_ptr)                          # scalar
-        if DEVICE_SIZES:
-            max_val = tl.maximum(max_val, -1e30)    # empty-column semantics of the batched path
+        max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
 
         acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
         for k0 in tl.range(0, k_in, BLOCK_K):
@@ -1199,24 +1209,13 @@ def _sparse_io_sum_forward_kernel(
 
             acc_sum += tl.sum(W * v_k[None, :], axis=1)
 
-        result = tl.log(acc_sum + 1e-24) + max_val
+        result = tl.log(acc_sum) + max_val
         if DEVICE_SIZES:
             result = tl.where(k_in == 0, -float("inf"), result)
         tl.store(values_out_ptr + offs_m, result, mask=mask_m)
 
 
-@triton.jit(
-    do_not_specialize=["pid_start", "pfid_start", "K_out", "batch_size",
-                       "in_stride", "flow_out_stride", "out_stride",
-                       "flow_in_stride"],
-    do_not_specialize_on_alignment=[
-        "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
-        "in_indices_ptr", "in_values_ptr", "out_indices_ptr",
-        "pflows_ptr",
-        "in_col_starts_ptr", "in_nnz_ptr",
-        "out_col_starts_ptr", "out_nnz_ptr",
-    ],
-)
+@runtime_triton_jit
 def _sparse_io_sum_backward_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,
@@ -1322,7 +1321,7 @@ def _sparse_io_sum_backward_kernel(
                             other=0.0).to(tl.float32)
 
                 chunk_full = nflows * W * tl.exp(log_val[None, :] - nmars)
-                chunk = tl.where(mask_jb, chunk_full, 0.0)
+                chunk = tl.where(mask_jb & (nmars > -float("inf")) & (log_val[None, :] > -float("inf")) & (nflows != 0.0), chunk_full, 0.0)
                 acc += chunk
 
                 if COMPUTE_PFLOWS == 1:
@@ -1365,7 +1364,7 @@ def _sparse_io_sum_backward_kernel(
             W = tl.load(mparams_ptr + W_ptr, mask=mask_j, other=0.0).to(tl.float32)
 
             chunk_full = nflows * W * tl.exp(log_val - nmars)
-            chunk = tl.where(mask_j, chunk_full, 0.0)
+            chunk = tl.where(mask_j & (nmars > -float("inf")) & (log_val > -float("inf")) & (nflows != 0.0), chunk_full, 0.0)
             acc += chunk
 
             if COMPUTE_PFLOWS == 1:
@@ -1390,7 +1389,7 @@ def _sparse_io_sum_backward_kernel(
 # =====================================================================
 
 
-@triton.jit
+@runtime_triton_jit
 def _ws_round_tf32(x):
     """Round non-negative finite fp32 to the nearest tf32 value (10-bit
     mantissa). Tensor cores drop the 13 low mantissa bits of fp32 operands;
@@ -1402,7 +1401,7 @@ def _ws_round_tf32(x):
     return xi.to(tl.float32, bitcast=True)
 
 
-@triton.jit(do_not_specialize=["src_start", "n"])
+@runtime_triton_jit
 def _ws_round_copy_kernel(dst_ptr, src_ptr, src_start, n, BLOCK: tl.constexpr):
     """``dst[i] = round_tf32(src[src_start + i])`` — the per-pass W copy."""
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -1411,7 +1410,7 @@ def _ws_round_copy_kernel(dst_ptr, src_ptr, src_start, n, BLOCK: tl.constexpr):
     tl.store(dst_ptr + offs, _ws_round_tf32(x), mask=mask)
 
 
-@triton.jit(do_not_specialize=["v_stride", "dst_stride_b", "dst_stride_r", "dst_off"])
+@runtime_triton_jit
 def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
                          v_stride, dst_stride_b, dst_stride_r, dst_off,
                          BLOCK: tl.constexpr, ROUND: tl.constexpr):
@@ -1432,7 +1431,7 @@ def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
              mask=mask)
 
 
-@triton.jit(do_not_specialize=["out_stride"])
+@runtime_triton_jit
 def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
                       BLOCK: tl.constexpr):
     """``out[b, k] = src[b, indices[col_starts[b] + k]]`` for ``k < nnz[b]``."""
@@ -1444,7 +1443,7 @@ def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
     tl.store(out_ptr + b * out_stride + k, v, mask=mask)
 
 
-@triton.jit(do_not_specialize=["w_start", "B"])
+@runtime_triton_jit
 def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_out,
                    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                    TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
@@ -1483,13 +1482,13 @@ def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_
 
     mx = tl.maximum(tl.load(max_ptr + offs_b, mask=mask_b, other=0.0), -1e30)
     kin = tl.load(kin_ptr + offs_b, mask=mask_b, other=0)
-    res = tl.log(acc + 1e-24) + mx[:, None]
+    res = tl.log(acc) + mx[:, None]
     res = tl.where(kin[:, None] == 0, -float("inf"), res)
     tl.store(yd_ptr + offs_b[:, None] * H_out + (h0 + offs_m)[None, :], res,
              mask=mask_b[:, None])
 
 
-@triton.jit(do_not_specialize=["flow_stride", "mars_stride", "gt_ld", "gt_off"])
+@runtime_triton_jit
 def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr, kin_ptr,
                          cs_ptr, nnz_ptr, flow_stride, mars_stride, H_out, gt_ld, gt_off,
                          BLOCK: tl.constexpr, ROUND: tl.constexpr, WRITE_T: tl.constexpr):
@@ -1516,7 +1515,7 @@ def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr,
         tl.store(gt_ptr + gt_off + h * gt_ld + b, g, mask=mask)
 
 
-@triton.jit(do_not_specialize=["w_start", "B"])
+@runtime_triton_jit
 def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, w_start, B, H_in, H_out,
                         NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                         TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr,
@@ -1549,7 +1548,7 @@ def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, w_start, B, H_in, H_out,
              mask=mask_b[:, None])
 
 
-@triton.jit(do_not_specialize=["v_stride", "out_stride"])
+@runtime_triton_jit
 def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
                            v_stride, out_stride, H_in, BLOCK: tl.constexpr):
     """``flow_in[b, k] = exp(in[b, k] - max_b) * fd[b, indices[cs[b] + k]]``."""
@@ -1563,7 +1562,7 @@ def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, n
     tl.store(out_ptr + b * out_stride + k, tl.exp(v - mx) * f, mask=mask)
 
 
-@triton.jit(do_not_specialize=["r0", "pid_start", "pfid_start"])
+@runtime_triton_jit
 def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H_in,
                               NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                               TM: tl.constexpr, TK: tl.constexpr, NEGATE: tl.constexpr):

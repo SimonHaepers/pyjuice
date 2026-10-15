@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 import torch
 import triton
 import triton.language as tl
@@ -22,7 +24,7 @@ from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll
 
 ## Categorical layer ##
 
-@triton.jit
+@runtime_triton_jit
 def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
                                     batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -126,7 +128,7 @@ def _external_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.
     layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask, **kwargs)
 
 
-@triton.jit
+@runtime_triton_jit
 def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, s_mids_ptr, metadata_ptr, 
                                           local_ids, sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
                                           batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -238,7 +240,7 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
     return None
 
 
-@triton.jit
+@runtime_triton_jit
 def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                  node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
                                  num_cats: tl.constexpr, partial_eval: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -371,7 +373,7 @@ def _external_categorical_backward(layer, inputs: torch.Tensor, node_flows: torc
 
     return cat_probs
 
-@triton.jit
+@runtime_triton_jit
 def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                        msids_ptr, metadata_ptr, params_ptr, sid, eid, num_target_nodes, 
                                        batch_size: tl.constexpr, num_cats: tl.constexpr, partial_eval: tl.constexpr, 
@@ -508,13 +510,7 @@ def _sparse_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Te
     return None
 
 
-@triton.jit(
-    do_not_specialize=["vid_out", "node_offset", "param_base",
-                        "batch_size", "num_cats"],
-    do_not_specialize_on_alignment=["cat_probs_ptr", "node_flows_ptr",
-                                     "params_ptr", "csc_indptr_ptr",
-                                     "csc_indices_ptr"],
-)
+@runtime_triton_jit
 def _sparse_categorical_cond_backward_kernel(
     cat_probs_ptr, node_flows_ptr, params_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -555,72 +551,39 @@ def _sparse_categorical_cond_backward_kernel(
     tl.atomic_add(cat_probs_ptr + cat_offs, contrib_sum, mask = mask_b)
 
 
-@triton.jit(
-    do_not_specialize=["vid_out", "param_base", "num_cats"],
-    do_not_specialize_on_alignment=["cat_probs_ptr", "sv_indices_ptr",
-                                     "sv_values_ptr", "params_ptr",
-                                     "csr_indptr_ptr", "csr_cols_ptr",
-                                     "csr_to_csc_ptr"],
-)
+@runtime_triton_jit
 def _sparse_categorical_cond_backward_sparse_kernel(
     cat_probs_ptr, sv_indices_ptr, sv_values_ptr, params_ptr,
-    csr_indptr_ptr, csr_cols_ptr, csr_to_csc_ptr,
-    vid_out, param_base, num_cats,
-    BLOCK_R: tl.constexpr,
+    csr_indptr_ptr, csr_cols_ptr, csr_to_csc_ptr, col_starts_ptr, nnz_ptr,
+    vid_out, param_base, num_cats, batch_size, value_stride,
+    IS_BATCHED: tl.constexpr, BLOCK_R: tl.constexpr,
 ):
-    """Sparse-native, B=1 specialization of
-    :func:`_sparse_categorical_cond_backward_kernel`.
+    """Project packed node flows through CSR rows, with bounded row tiles.
 
-    Iterates over the active rows that actually carry non-zero flow (the
-    observed CSC column's active rows — the count is set by the launch
-    grid's first dim, not a kernel arg, so the same compiled binary serves
-    every input token regardless of ``total_nnz``), then for each row walks
-    its CSR slots — for each ``(row, col)`` membership do
-    ``atomic_add(cat_probs[col], flow * params[csc_slot])``. ``node_flows``
-    is never touched; flow comes straight from the
-    :class:`SparseNodeValues` packed values array.
-
-    ``sv_indices_ptr`` is a sliced view of ``dist._csc_indices`` whose
-    16-byte alignment depends on ``col_start`` parity, and the grid's first
-    dim varies with the observed token. The two ``do_not_specialize`` /
-    ``do_not_specialize_on_alignment`` lists above keep that data-dependent
-    state out of Triton's specialization key, so this kernel is JIT-compiled
-    exactly once across token sequences.
-
-    Grid: ``(K_active, ceil(max_nnz_per_row / BLOCK_R))``. Per program covers
-    one (active row, row-slot tile). The batch axis is collapsed because the
-    sparse path is only entered with ``batch_size == 1``; ``cat_probs`` is
-    indexed as ``[vid_out, col]`` (the trailing B=1 axis is a no-op stride).
+    Grid (active-row bound, row-slot tiles, B); device counts mask each
+    sample. Runtime column starts also support all-row missing patterns.
     """
-    pid_j = tl.program_id(0)
-    pid_r = tl.program_id(1)
-
-    # Active row + flow for this program. ``sv.values`` is [K_active], no
-    # batch axis (B=1 layout).
-    row = tl.load(sv_indices_ptr + pid_j)
-    flow_scalar = tl.load(sv_values_ptr + pid_j)
-
-    # Walk this row's CSR slot range. Cast to int32 — register pressure on
-    # the [BLOCK_R] index tiles is the main cost driver here.
-    row_start = tl.load(csr_indptr_ptr + row).to(tl.int32)
-    row_end = tl.load(csr_indptr_ptr + row + 1).to(tl.int32)
-    row_nnz = row_end - row_start
-
-    offs_r = pid_r * BLOCK_R + tl.arange(0, BLOCK_R)
-    slot_mask = offs_r < row_nnz
-    csr_slot = row_start + offs_r
-
-    cols = tl.load(csr_cols_ptr + csr_slot, mask = slot_mask, other = 0).to(tl.int32)
-    csc_slots = tl.load(csr_to_csc_ptr + csr_slot, mask = slot_mask, other = 0)
-    params_v = tl.load(params_ptr + param_base + csc_slots,
-                       mask = slot_mask, other = 0.0)
-
-    contrib = flow_scalar * params_v   # [BLOCK_R]
-
-    # cat_probs is laid out as [num_target_vars, num_cats] (the B=1 axis
-    # collapses). Multiple programs may hit the same col, so atomic_add.
-    addr = vid_out * num_cats + cols
-    tl.atomic_add(cat_probs_ptr + addr, contrib, mask = slot_mask)
+    j = tl.program_id(0)
+    b = tl.program_id(2)
+    if IS_BATCHED:
+        active = j < tl.load(nnz_ptr + b)
+        cs = tl.load(col_starts_ptr + b)
+        row = tl.load(sv_indices_ptr + cs + j, mask=active, other=0)
+        flow = tl.load(sv_values_ptr + b.to(tl.int64) * value_stride + j,
+                       mask=active, other=0.0)
+    else:
+        active = True
+        row = tl.load(sv_indices_ptr + j)
+        flow = tl.load(sv_values_ptr + j)
+    start = tl.load(csr_indptr_ptr + row, mask=active, other=0)
+    end = tl.load(csr_indptr_ptr + row + 1, mask=active, other=0)
+    r = tl.program_id(1) * BLOCK_R + tl.arange(0, BLOCK_R)
+    mask = active & (start + r < end) & (flow != 0.0)
+    cols = tl.load(csr_cols_ptr + start + r, mask=mask, other=0)
+    slots = tl.load(csr_to_csc_ptr + start + r, mask=mask, other=0)
+    weights = tl.load(params_ptr + param_base + slots, mask=mask, other=0.0)
+    addr = (vid_out * num_cats + cols).to(tl.int64) * batch_size + b
+    tl.atomic_add(cat_probs_ptr + addr, flow * weights, mask=mask)
 
 
 def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.Tensor,
@@ -640,7 +603,7 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
     if params is None:
         params = layer.params
 
-    num_vars = int(layer.vids.max().item()) + 1
+    num_vars = max(ns.scope.to_list()[0] for ns in layer.nodes) + 1
     num_cats = int(layer.nodes[0].dist.num_cats)
     batch_size = node_flows.size(1)
 
@@ -689,18 +652,15 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
             sv_flow = owner_layer._sparse_flows[owner_ns_idx]
 
         if sv_flow is not None and sv_flow.total_nnz > 0:
-            assert batch_size == 1, (
-                "SparseCategorical sparse-flow conditional backward path "
-                "is only valid for batch_size == 1 (sv.values is [K_active])."
-            )
             assert dist._csr_indptr is not None, (
                 "SparseCategorical: CSR side info not built (set_meta_parameters "
                 "should have populated _csr_indptr). Re-run set_meta_parameters."
             )
-            BLOCK_R = max(triton.next_power_of_2(dist._max_nnz_per_row), 4)
+            BLOCK_R = min(128, max(triton.next_power_of_2(dist._max_nnz_per_row), 4))
             grid = (
                 sv_flow.total_nnz,
                 triton.cdiv(dist._max_nnz_per_row, BLOCK_R),
+                batch_size,
             )
             _sparse_categorical_cond_backward_sparse_kernel[grid](
                 cat_probs_ptr = cat_probs,
@@ -713,11 +673,23 @@ def _sparse_categorical_backward(layer, inputs: torch.Tensor, node_flows: torch.
                 vid_out = vid_out,
                 param_base = param_base,
                 num_cats = num_cats,
+                col_starts_ptr = sv_flow.col_starts if sv_flow.is_batched else sv_flow.values,
+                nnz_ptr = sv_flow.nnz if sv_flow.is_batched else sv_flow.values,
+                batch_size = batch_size,
+                value_stride = sv_flow.values.stride(0) if sv_flow.is_batched else 0,
+                IS_BATCHED = sv_flow.is_batched,
                 BLOCK_R = BLOCK_R,
             )
             continue
 
-        BLOCK_K = max(triton.next_power_of_2(dist._max_nnz_per_col), 4)
+        if not getattr(ns, "_dense_storage", True):
+            # Empty support contributes zero; an absent backward result is an
+            # API error, never a reason to read a nonexistent dense slice.
+            if sv_flow is None:
+                raise RuntimeError("Packed conditional query requires backward flows.")
+            continue
+
+        BLOCK_K = min(128, max(triton.next_power_of_2(dist._max_nnz_per_col), 4))
         BLOCK_B = min(64, max(1, triton.next_power_of_2(batch_size)))
 
         grid = (
@@ -821,8 +793,13 @@ def conditional(pc: TensorCircuit, data: torch.Tensor, missing_mask: Optional[to
 
     kwargs["target_vars"] = target_vars
 
-    query(pc, inputs = data, run_backward = True, 
-          fw_input_fn = _conditional_fw_input_fn if fw_input_fn is None else fw_input_fn, 
+    hard_sparse = (fw_input_fn is None and data.dim() == 2
+                   and all(layer.dist_signature == "SparseCategorical" for layer in pc.input_layer_group))
+    if hard_sparse:
+        kwargs.setdefault("device_sparse", True)
+    forward_fn = None if hard_sparse else (_conditional_fw_input_fn if fw_input_fn is None else fw_input_fn)
+    query(pc, inputs = data, run_backward = True,
+          fw_input_fn = forward_fn,
           bk_input_fn = _wrapped_bk_input_fn if bk_input_fn is None else bk_input_fn, 
           missing_mask = missing_mask, **kwargs)
 

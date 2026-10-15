@@ -299,6 +299,10 @@ class InputLayer(Layer, nn.Module):
     def forward(self, data: torch.Tensor, node_mars: torch.Tensor, params: Optional[Dict] = None,
                 missing_mask: Optional[torch.Tensor] = None, _batch_first: bool = True, 
                 _apply_missing_mask_only: bool = False, **kwargs):
+        if getattr(self, "_packed_only", False):
+            # Packed product kernels apply per-sample missing masks and own
+            # emission parameter flows; these logical nodes have no dense rows.
+            return
         self._used_external_params = (params is not None)
 
         if params is None:
@@ -445,6 +449,9 @@ class InputLayer(Layer, nn.Module):
         ``param_flows is None`` internally and produce their element flows.
         """
 
+        if getattr(self, "_packed_only", False):
+            return
+
         if params is None:
             params = self.params
         else:
@@ -484,7 +491,7 @@ class InputLayer(Layer, nn.Module):
 
             if self._has_custom_backward:
                 self.nodes[0].dist.custom_backward(
-                    self, params, self.param_flows, node_flows, node_mars,
+                    self, params, self.param_flows if compute_param_flows else None, node_flows, node_mars,
                     data, batch_size, logspace_flows = logspace_flows,
                 )
             else:
@@ -617,6 +624,10 @@ class InputLayer(Layer, nn.Module):
         missing_mask:  [num_vars, B] or [num_vars] or None
         node_flows:    [num_nodes, B]
         """
+
+        if getattr(self, "_packed_only", False):
+            raise NotImplementedError("Dense input sampling requires "
+                                      "compact_sparse_buffers=False.")
 
         if params is None:
             params = self.params
@@ -775,6 +786,10 @@ class InputLayer(Layer, nn.Module):
         Evaluate the partition function.
         node_mars: [num_nodes]
         """
+
+        if getattr(self, "_packed_only", False):
+            raise NotImplementedError("Dense partition evaluation requires "
+                                      "compact_sparse_buffers=False.")
 
         if params is None:
             params = self.params

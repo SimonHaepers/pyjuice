@@ -155,6 +155,17 @@ class TensorCircuit(nn.Module):
     :param max_tied_ns_per_parflow_block: how many groups of tied parameters are allowed to share the same flow/gradient accumulator (higher values -> consumes less GPU memory; lower values -> potentially avoid stalls caused by atomic operations)
     :type max_tied_ns_per_parflow_block: int
 
+    :param fuse_permutations: Fold eligible single-consumer permutations into
+        adjacent block-diagonal kernels in forward and backward. Set False
+        for an unfused reference execution.
+    :type fuse_permutations: bool
+
+    :param compact_sparse_buffers: Omit dense storage for compiler-proven packed
+        inputs/sums, and share the temporary rows of sparse-output BD layers.
+        Mixed input layers retain their dense layout. Set False for custom
+        callbacks or diagnostics that directly index every logical node.
+    :type compact_sparse_buffers: bool
+
     :param verbose: Whether to display the progress of the compilation
     :type verbose: bool
     """
@@ -166,7 +177,8 @@ class TensorCircuit(nn.Module):
                  device: Optional[Union[int,torch.device]] = None,
                  use_dense_sum_layer: bool = False,
                  param_dtype: torch.dtype = torch.float32,
-                 verbose: bool = True) -> None:
+                 verbose: bool = True, fuse_permutations: bool = True,
+                 compact_sparse_buffers: bool = True) -> None:
 
         super(TensorCircuit, self).__init__()
 
@@ -185,6 +197,7 @@ class TensorCircuit(nn.Module):
 
         self.use_dense_sum_layer = use_dense_sum_layer
         self.param_dtype = param_dtype
+        self.compact_sparse_buffers = compact_sparse_buffers
 
         self._init_layers(
             layer_sparsity_tol = layer_sparsity_tol,
@@ -197,6 +210,10 @@ class TensorCircuit(nn.Module):
             _user_requested_device = device is not None,
         )
         
+        self.fuse_permutations = fuse_permutations
+        if fuse_permutations:
+            self._init_permutation_fusion()
+
         # Hyperparameters for backward pass
         self._optim_hyperparams = {
             "compute_param_flows": True,
@@ -210,10 +227,9 @@ class TensorCircuit(nn.Module):
         # CudaGraph options
         self._recorded_cuda_graphs = dict()
         # Sparse-IO circuits capture their forward separately (see
-        # ``sparse_cudagraph``): one ``SparseGraphState`` per batch size, plus
-        # the state of the last forward if it was a replay (the next backward
-        # rebinds the host-side sparse outputs from it).
-        self._sparse_graphs: Dict[int, SparseGraphState] = dict()
+        # ``sparse_cudagraph``): state per batch size / execution profile.
+        # Backward keeps the last forward's device-described patterns.
+        self._sparse_graphs: Dict[object, SparseGraphState] = dict()
         self._sparse_graph_fwd: Optional[SparseGraphState] = None
         # Fixed copies of the batch for the generic forward graphs, keyed like
         # them (inner layers may read the tokens on device).
@@ -302,11 +318,15 @@ class TensorCircuit(nn.Module):
             # node_mars / element_mars it was captured with, so swap those in
             # before they are initialised.
             sparse_graph = None
+            sparse_capture = record_cudagraph
+            sparse_replay = record_cudagraph or apply_cudagraph
+            device_sparse = kwargs.pop("device_sparse", False) or kwargs.get("missing_mask") is not None
             if self._has_sparse_prod:
-                if record_cudagraph or apply_cudagraph:
+                if record_cudagraph or apply_cudagraph or device_sparse:
                     sparse_graph = self._sparse_graph_for_call(
                         B, record_cudagraph, input_layer_fn, propagation_alg, kwargs,
                         _inner_layers_only or _no_buffer_reset, inputs.dtype,
+                        create=device_sparse, precision=(force_use_bf16, force_use_fp32),
                     )
                 record_cudagraph = apply_cudagraph = False
                 if sparse_graph is not None and sparse_graph.node_mars is not None:
@@ -407,7 +427,7 @@ class TensorCircuit(nn.Module):
             # entirely and write straight to ``element_mars``, so the mask has
             # to be re-applied here. Plain :class:`ProdLayer` ignores it. Inner
             # layers only read it on the host (see ``_host_missing_mask``).
-            missing_mask_for_prod = self._host_missing_mask(kwargs.get("missing_mask", None))
+            missing_mask_for_prod = None if sparse_graph is not None else self._host_missing_mask(kwargs.get("missing_mask", None))
             inner_kwargs = kwargs if "missing_mask" not in kwargs else \
                 {**kwargs, "missing_mask": missing_mask_for_prod}
 
@@ -441,31 +461,34 @@ class TensorCircuit(nn.Module):
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
             if sparse_graph is not None:
-                sparse_graph.load_inputs(run_data)
+                sparse_graph.load_inputs(run_data, kwargs.get("missing_mask"))
                 self._run_data = sparse_graph.data
-                if sparse_graph.graph is None:
-                    sparse_graph.node_mars = self.node_mars
-                    sparse_graph.element_mars = self.element_mars
+                sparse_graph.node_mars = self.node_mars
+                sparse_graph.element_mars = self.element_mars
 
-                    def _sparse_graph_body():
-                        # Part of the graph: every replay re-rounds the WS
-                        # copy of W (params change between EM steps), resets
-                        # the running maxima and resolves the batch's columns
-                        # before the chain runs.
-                        for ws_group in self._sparse_io_ws_groups:
-                            ws_group.begin_pass()
-                        sparse_graph.begin_pass()
-                        _run_inner_layers(static_ctx = sparse_graph)
+                def _sparse_graph_body():
+                    for ws_group in self._sparse_io_ws_groups:
+                        ws_group.begin_pass()
+                    sparse_graph.begin_pass()
+                    _run_inner_layers(static_ctx=sparse_graph)
 
+                if sparse_capture and sparse_graph.graph is None:
                     try:
                         sparse_graph.capture(_sparse_graph_body)
                     except BaseException:
-                        self._sparse_graphs.pop(B, None)
+                        self._sparse_graphs.pop(sparse_graph.key, None)
                         raise
-                sparse_graph.graph.replay()
+                if sparse_replay and sparse_graph.graph is not None:
+                    sparse_graph.graph.replay()
+                    sparse_graph.restore_bindings(sparse_graph.forward_bindings)
+                else:
+                    _sparse_graph_body()
+                    sparse_graph.forward_bindings = sparse_graph.snapshot_bindings()
                 self._sparse_graph_fwd = sparse_graph
             else:
-                signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B)
+                signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B,
+                             force_use_bf16, force_use_fp32, self._graph_options_key(propagation_alg),
+                             self._graph_options_key(kwargs))
                 if (record_cudagraph or apply_cudagraph) and self._graph_reason is not None:
                     if record_cudagraph and not getattr(self, "_warned_sparse_cudagraph", False):
                         warnings.warn("CUDA graphs are not supported for this circuit "
@@ -593,26 +616,25 @@ class TensorCircuit(nn.Module):
         if input_layer_fn is not None and run_data.dim() == 2 and run_data.size(1) == self.num_vars:
             run_data = run_data.permute(1, 0)
         self._run_data = run_data
-        if self._has_sparse_prod and run_data.device.type != "cpu":
-            self._run_data_cpu = run_data.cpu()
+        static_ctx = self._sparse_graph_fwd
+        if static_ctx is not None:
+            self._run_data = static_ctx.data
+            self._run_data_cpu = self._run_data_list = self._run_pattern_cache = None
+            static_ctx.restore_bindings(static_ctx.forward_bindings)
         else:
-            self._run_data_cpu = run_data
-        if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
-            self._run_data_list = self._run_data_cpu[:, 0].tolist()
-        else:
-            self._run_data_list = None
-        # See forward: per-query dedup cache for batched sparse patterns.
-        if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
-            self._run_pattern_cache = dict()
-        else:
-            self._run_pattern_cache = None
-        # After a CUDA-graph forward the sum layers' sparse outputs only carry
-        # device-side column sizes; rebuild the host-described ones the eager
-        # backward sizes its grids from (the values are what the replay wrote).
-        if self._sparse_graph_fwd is not None:
-            self._sparse_graph_fwd.rebind_outputs(
-                self._run_data_cpu, self._run_data_list, self._run_pattern_cache)
-            self._sparse_graph_fwd = None
+            if self._has_sparse_prod and run_data.device.type != "cpu":
+                self._run_data_cpu = run_data.cpu()
+            else:
+                self._run_data_cpu = run_data
+            if self._has_sparse_prod and self._run_data_cpu.size(1) == 1:
+                self._run_data_list = self._run_data_cpu[:, 0].tolist()
+            else:
+                self._run_data_list = None
+            # See forward: per-query dedup cache for batched sparse patterns.
+            if self._has_sparse_prod and self._run_data_cpu.size(1) > 1:
+                self._run_pattern_cache = dict()
+            else:
+                self._run_pattern_cache = None
         for ws_group in self._sparse_io_ws_groups:
             ws_group.begin_pass()
 
@@ -622,9 +644,16 @@ class TensorCircuit(nn.Module):
 
             ## Initialize buffers for backward pass ##
 
+            if static_ctx is not None and static_ctx.node_flows is not None:
+                self.node_flows = static_ctx.node_flows
+                self.element_flows = static_ctx.element_flows
             if not _disable_buffer_init:
                 self._init_buffer(name = "node_flows", shape = (self.num_nodes, B), set_value = 0.0 if not logspace_flows else -float("inf"))
                 self._init_buffer(name = "element_flows", shape = (self.num_elements, B), set_value = 0.0 if not logspace_flows else -float("inf"))
+
+            if static_ctx is not None:
+                static_ctx.node_flows = self.node_flows
+                static_ctx.element_flows = self.element_flows
 
             # Set root node flows
             def _set_root_node_flows():
@@ -666,10 +695,12 @@ class TensorCircuit(nn.Module):
             # marginalised positions. Both the prod-layer re-forward (at
             # line "_for_backward=True" below) and the sum-layer backward
             # need to see it so they take the all-rows-at-missing branch.
-            missing_mask_for_prod = self._host_missing_mask(kwargs.get("missing_mask", None))
+            missing_mask_for_prod = None if static_ctx is not None else self._host_missing_mask(kwargs.get("missing_mask", None))
 
             # Inner layers
             def _run_inner_layers():
+                if static_ctx is not None:
+                    static_ctx.restore_bindings(static_ctx.forward_bindings)
 
                 # Backward pass for inner layers
                 for layer_id in range(len(self.inner_layer_groups) - 1, -1, -1):
@@ -679,6 +710,7 @@ class TensorCircuit(nn.Module):
                         # Prod layer
                         layer_group.backward(self.node_flows, self.element_flows,
                                              logspace_flows = logspace_flows,
+                                             compute_param_flows = compute_param_flows,
                                              data = self._run_data,
                                              data_cpu = self._run_data_cpu,
                                              data_list = self._run_data_list)
@@ -690,6 +722,7 @@ class TensorCircuit(nn.Module):
                         self.inner_layer_groups[layer_id-1].forward(
                             self.node_mars, self.element_mars,
                             _for_backward = True,
+                            static_ctx = static_ctx,
                             data = self._run_data,
                             data_cpu = self._run_data_cpu,
                             data_list = self._run_data_list,
@@ -713,7 +746,7 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows,
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, **kwargs)
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, static_ctx = static_ctx, **kwargs)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -729,41 +762,60 @@ class TensorCircuit(nn.Module):
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
 
-            if self._has_sparse_prod:
-                # The sparse-IO backward sizes its grids from host-side column
-                # sizes, so a captured backward would replay the recorded
-                # batch's patterns; it always runs eagerly.
+            if self._has_sparse_prod and (static_ctx is None or compute_param_flows):
+                # Training accumulation retains the eager launch path.
+                # Device-described node-flow backward is capturable.
                 if record_cudagraph and not getattr(self, "_warned_sparse_bwd_cudagraph", False):
-                    warnings.warn("CUDA graphs are not supported for the backward of circuits "
-                                  "with sparse-IO layers; running it eagerly instead.")
+                    warnings.warn("Sparse backward capture requires device-described patterns "
+                                  "and compute_param_flows=False; running eagerly instead.")
                     self._warned_sparse_bwd_cudagraph = True
                 record_cudagraph = apply_cudagraph = False
 
-            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars), id(self.element_mars), id(self.params), id(self.param_flows), B, allow_modify_flows, logspace_flows)
+            # Python callbacks must execute on every call; graph replay bypasses them.
+            if sum_layer_pre_backward_callback is not None or sum_layer_post_backward_callback is not None:
+                record_cudagraph = apply_cudagraph = False
+            signature = (1, id(self.node_flows), id(self.element_flows), id(self.node_mars),
+                         id(self.element_mars), id(self.params), id(getattr(self, "param_flows", None)),
+                         B, allow_modify_flows, logspace_flows, compute_param_flows,
+                         negate_pflows, force_use_fp32, self._graph_options_key(propagation_alg),
+                         self._graph_options_key({k: v for k, v in kwargs.items()
+                             if static_ctx is None or k not in ("missing_mask", "device_sparse", "target_vars")}),
+                         id(static_ctx))
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
-                # Warmup
+                # Warmup is real execution. Restore accumulated statistics
+                # and the caller's flow seed so capture does not count extra batches.
+                saved_nf = self.node_flows.clone()
+                saved_ef = self.element_flows.clone()
+                saved_pf = self.param_flows.clone() if compute_param_flows else None
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(s):
                     for _ in range(3):
-                        self.node_flows[:,:] = 0.0
-                        _set_root_node_flows()
+                        self.node_flows.copy_(saved_nf)
+                        self.element_flows.copy_(saved_ef)
                         _run_inner_layers()
                 torch.cuda.current_stream().wait_stream(s)
+                if saved_pf is not None:
+                    self.param_flows.copy_(saved_pf)
+                self.node_flows.copy_(saved_nf)
+                self.element_flows.copy_(saved_ef)
 
                 # Capture
-                self.node_flows[:,:] = 0.0
-                _set_root_node_flows()
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
                     _run_inner_layers()
 
                 # Save
                 self._recorded_cuda_graphs[signature] = g
+                if static_ctx is not None:
+                    static_ctx.backward_bindings[signature] = static_ctx.snapshot_bindings()
+                    static_ctx.retain_ws_buffers()
 
             if apply_cudagraph and signature in self._recorded_cuda_graphs:
                 g = self._recorded_cuda_graphs[signature]
                 g.replay()
+                if static_ctx is not None:
+                    static_ctx.restore_bindings(static_ctx.backward_bindings[signature])
             else:
                 _run_inner_layers()
 
@@ -806,18 +858,74 @@ class TensorCircuit(nn.Module):
         else:
             return None
 
+    def _init_permutation_fusion(self):
+        """Fold bijective one-child products into their sole BD consumer.
+
+        Requiring a sole consumer on both sides gives each backward output
+        one writer. Shared branches and non-bijective maps retain ProdLayer.
+        This is a topology optimization, independent of the HMM builder.
+        """
+        consumers = {}
+        for ns in self.root_ns:
+            for child in getattr(ns, "chs", []):
+                consumers.setdefault(child, []).append(ns)
+        owner = {ns: layer for group in self.inner_layer_groups for layer in group for ns in layer.nodes}
+        for group in self.inner_layer_groups:
+            for prod in group:
+                if type(prod) is not ProdLayer:
+                    continue
+                candidates = []
+                for ns in prod.nodes:
+                    parents = consumers.get(ns, [])
+                    if len(ns.chs) != 1 or not ns.is_sparse() or len(parents) != 1:
+                        break
+                    src = ns.chs[0]
+                    dst = parents[0]
+                    layer = owner.get(dst)
+                    if (len(consumers.get(src, [])) != 1
+                            or type(layer) not in (BlockDiagonalSumLayer, SparseOutputBlockDiagonalSumLayer)
+                            or src.num_nodes != ns.num_nodes):
+                        break
+                    rows = ns.edge_ids[:, 0].cpu().long()
+                    if not torch.equal(rows.sort().values, torch.arange(src.num_nodes)):
+                        break
+                    candidates.append((layer, layer.nodes.index(dst), rows + src._output_ind_range[0]))
+                else:
+                    for layer, idx, rows in candidates:
+                        layer.register_buffer(f"_bd_input_map_{idx}", rows.to(self.params.device).contiguous())
+                    prod._fused_permutation = bool(candidates)
+
+    @staticmethod
+    def _graph_options_key(value):
+        """Hash semantic launch options, including mutable tensor versions."""
+        if isinstance(value, torch.Tensor):
+            try:
+                version = value._version
+            except RuntimeError:  # tensors created under torch.inference_mode
+                version = None
+            return ("tensor", value.data_ptr(), tuple(value.shape), tuple(value.stride()),
+                    value.dtype, version)
+        if isinstance(value, dict):
+            return tuple((k, TensorCircuit._graph_options_key(v)) for k, v in sorted(value.items()))
+        if isinstance(value, (list, tuple)):
+            return tuple(TensorCircuit._graph_options_key(v) for v in value)
+        try:
+            hash(value)
+        except TypeError:
+            return (type(value).__qualname__, id(value))
+        return value
+
     def _sparse_graph_for_call(self, B: int, record: bool, input_layer_fn, propagation_alg,
                                kwargs: dict, custom_buffers: bool,
-                               data_dtype: torch.dtype) -> Optional[SparseGraphState]:
+                               data_dtype: torch.dtype, create: bool = False,
+                               precision: tuple = (False, False)) -> Optional[SparseGraphState]:
         """The :class:`SparseGraphState` a sparse-IO forward should replay —
-        created (to be captured by this call) when ``record`` is set and none
-        exists for ``B`` — or ``None`` to run eagerly."""
+        created when capture or device-described eager execution is requested.
+        Returns None for unsupported topologies or custom input functions."""
         reason = self._graph_reason
         if reason is None:
             if input_layer_fn is not None:
                 reason = "custom input_layer_fn"
-            elif kwargs.get("missing_mask", None) is not None:
-                reason = "missing_mask"
             elif not (isinstance(propagation_alg, str) and propagation_alg == "LL"):
                 reason = f"propagation_alg={propagation_alg!r}"
             elif custom_buffers:
@@ -829,15 +937,19 @@ class TensorCircuit(nn.Module):
                 self._warned_sparse_cudagraph = True
             return None
 
-        state = self._sparse_graphs.get(B)
+        query_masks = kwargs.get("missing_mask") is not None
+        # Preserve the B key for the default observed-token profile.
+        key = B if not query_masks and precision == (False, False) and data_dtype == torch.long else (B, query_masks, precision, data_dtype)
+        state = self._sparse_graphs.get(key)
         if state is not None and not state.matches(self):
             # Parameters were re-allocated (re-init / device move) since the
             # capture: the graph would read stale memory.
-            del self._sparse_graphs[B]
+            del self._sparse_graphs[key]
             state = None
-        if state is None and record:
-            state = SparseGraphState(self, B, self.params.device, data_dtype)
-            self._sparse_graphs[B] = state
+        if state is None and (record or create):
+            state = SparseGraphState(self, B, self.params.device, data_dtype, query_masks=query_masks)
+            state.key = key
+            self._sparse_graphs[key] = state
         return state
 
     def forward_ll(self, *args, **kwargs):
@@ -977,7 +1089,7 @@ class TensorCircuit(nn.Module):
         """
         Print the statistics of the PC.
         """
-        print(f"> Number of nodes: {self.num_nodes}")
+        print(f"> Number of nodes: {self.num_logical_nodes} ({self.num_nodes} dense buffer rows)")
         print(f"> Number of edges: {self.num_edges}")
         print(f"> Number of sum parameters: {self.num_sum_params}")
 
@@ -1001,6 +1113,10 @@ class TensorCircuit(nn.Module):
         assert hasattr(self, "node_mars") and self.node_mars is not None
         assert hasattr(self, "element_mars") and self.element_mars is not None
 
+        if not getattr(ns, "_dense_storage", True):
+            raise ValueError("This node uses packed sparse storage. Read its layer's "
+                             "SparseNodeValues, or compile with compact_sparse_buffers=False "
+                             "for the original dense buffer layout.")
         nsid, neid = ns._output_ind_range
 
         if ns.is_sum() or ns.is_input():
@@ -1034,6 +1150,10 @@ class TensorCircuit(nn.Module):
         assert hasattr(self, "node_flows") and self.node_flows is not None
         assert hasattr(self, "element_flows") and self.element_flows is not None
 
+        if not getattr(ns, "_dense_storage", True):
+            raise ValueError("This node uses packed sparse storage. Read its layer's "
+                             "SparseNodeValues, or compile with compact_sparse_buffers=False "
+                             "for the original dense buffer layout.")
         nsid, neid = ns._output_ind_range
 
         if ns.is_sum() or ns.is_input():
@@ -1267,6 +1387,53 @@ class TensorCircuit(nn.Module):
         blocked_io_sums = blocked_chain_info["blocked_io_sums"]
         coblocked_prods = blocked_chain_info["coblocked_prods"]
 
+        # Prove that omitted inputs have only packed consumers across the
+        # entire DAG, including consumers at other depths. Mixed InputLayers
+        # stay dense so their existing contiguous metadata remains valid.
+        all_prods = [ns for d in depth2nodes.values() for ns in d.get("prod", [])]
+        consumers = {}
+        for d in depth2nodes.values():
+            for kind in ("prod", "sum"):
+                for ns in d.get(kind, []):
+                    for child in ns.chs:
+                        consumers.setdefault(id(child), []).append(ns)
+        packed_prods = set(cosparse_prods)
+        for d in depth2nodes.values():
+            groups = {}
+            for ns in d.get("prod", []):
+                if (isinstance(ns, SparseProdNodes) and id(ns) not in demoted_sparse_prods
+                        and id(ns) not in cosparse_prods):
+                    groups.setdefault(ns.block_size, []).append(ns)
+            for nodes in groups.values():
+                # Match _mark_sparse_prod_scatter_skip at layer granularity.
+                # Its dense backward fallback also scatters into input rows.
+                def packed_reader(ns):
+                    readers = consumers.get(id(ns), [])
+                    return (len(readers) == 1 and readers[0].is_sum()
+                            and not getattr(readers[0], "_force_plain_layer", False)
+                            and len(readers[0].chs) == 1
+                            and (readers[0].is_block_dense
+                                 or _is_block_diagonal_pattern(readers[0])))
+                if all(packed_reader(ns) for ns in nodes):
+                    packed_prods.update(id(ns) for ns in nodes)
+        packed_inputs = set()
+        for ns in all_prods:
+            if id(ns) in packed_prods:
+                inp = ns.sparse_input_ns
+                if all(id(c) in packed_prods and c.sparse_input_ns is inp
+                       for c in consumers[id(inp)]):
+                    packed_inputs.add(id(inp))
+        # Sparse-output BD densifies one layer at a time in forward/backward;
+        # its persistent state is packed, so all such layers share this arena.
+        scratch_rows = max((sum(ns.num_nodes for ns in d.get("sum", [])
+                                if id(ns) in sparse_out_sums)
+                            for d in depth2nodes.values()), default=0)
+        if not self.compact_sparse_buffers:
+            scratch_rows = 0
+        self._sparse_dense_scratch_rows = scratch_rows
+        for ns in self.root_ns:
+            ns._dense_storage = True
+
         self.input_layer_group = None
         self.inner_layer_groups = []
 
@@ -1275,7 +1442,8 @@ class TensorCircuit(nn.Module):
         self.num_dummy_params = max_node_block_size * max_ele_block_size
 
         # Nodes include `max_ele_block_size` dummy nodes and all input/sum nodes in the PC
-        num_nodes = self.num_dummy_nodes
+        num_nodes = self.num_dummy_nodes + scratch_rows
+        logical_num_nodes = self.num_dummy_nodes
 
         # Total number of edges
         num_edges = 0
@@ -1332,7 +1500,18 @@ class TensorCircuit(nn.Module):
                         input_layers.append(input_layer)
                         
                         input_layer_id += 1
-                        num_nodes += input_layer.num_nodes
+                        logical_num_nodes += input_layer.num_nodes
+                        packed_only = (self.compact_sparse_buffers
+                                       and all(id(ns) in packed_inputs for ns in nodes)
+                                       and not input_layer.post_fw_fns and not input_layer.post_bp_fns)
+                        input_layer._packed_only = packed_only
+                        if packed_only:
+                            input_layer._output_ind_range = (0, 0)
+                            for ns in input_layer.nodes:
+                                ns._output_ind_range = (0, 0)
+                                ns._dense_storage = False
+                        else:
+                            num_nodes += input_layer.num_nodes
 
                     self.input_layer_group = LayerGroup(input_layers)
 
@@ -1384,6 +1563,8 @@ class TensorCircuit(nn.Module):
                                 disable_gpu_compilation = disable_gpu_compilation,
                                 force_gpu_compilation = force_gpu_compilation,
                                 input_layer_group = self.input_layer_group,
+                                _compile_dense = not (self.compact_sparse_buffers
+                                                      and all(id(ns) in packed_prods for ns in nodes)),
                                 inner_layer_groups = list(self.inner_layer_groups),
                             )
                         elif mode == "sparse":
@@ -1395,6 +1576,8 @@ class TensorCircuit(nn.Module):
                                 disable_gpu_compilation = disable_gpu_compilation,
                                 force_gpu_compilation = force_gpu_compilation,
                                 input_layer_group = self.input_layer_group,
+                                _compile_dense = not (self.compact_sparse_buffers
+                                                      and all(id(ns) in packed_prods for ns in nodes)),
                             )
                         elif mode == "coblocked":
                             prod_layer = CoBlockedProdLayer(
@@ -1651,9 +1834,15 @@ class TensorCircuit(nn.Module):
                         else:
                             layer_cls = SumLayer
                             extra_kwargs = {}
+                        packed_sum = self.compact_sparse_buffers and layer_cls in (
+                            SparseIOSumLayer, SparseIOBlockDiagonalSumLayer)
+                        scratch_sum = (self.compact_sparse_buffers
+                                       and layer_cls is SparseOutputBlockDiagonalSumLayer)
+                        output_start = (0 if packed_sum else self.num_dummy_nodes
+                                        if scratch_sum else num_nodes)
                         sum_layer = layer_cls(
                             nodes = nodes,
-                            global_nid_start = num_nodes,
+                            global_nid_start = output_start,
                             global_pid_start = num_parameters,
                             global_pfid_start = num_param_flows,
                             node2tiednodes = node2tiednodes,
@@ -1665,7 +1854,14 @@ class TensorCircuit(nn.Module):
                             **extra_kwargs,
                         )
 
-                        num_nodes += sum_layer.num_nodes
+                        logical_num_nodes += sum_layer.num_nodes
+                        if packed_sum or scratch_sum:
+                            for ns in sum_layer.nodes:
+                                ns._dense_storage = False
+                                if packed_sum:
+                                    ns._output_ind_range = (0, 0)
+                        else:
+                            num_nodes += sum_layer.num_nodes
                         num_edges += sum_layer.num_edges
                         num_parameters += sum_layer.num_parameters
                         num_param_flows += sum_layer.num_param_flows
@@ -1679,6 +1875,7 @@ class TensorCircuit(nn.Module):
                     layer_id += 1
 
         self.num_nodes = num_nodes
+        self.num_logical_nodes = logical_num_nodes
         self.num_edges = num_edges
         self.num_elements = num_elements
         self.num_sum_params = num_parameters
@@ -1687,6 +1884,13 @@ class TensorCircuit(nn.Module):
         # Post-pass: mark any SparseProdLayer whose every consumer is a
         # SparseInputSumLayer so its forward can skip scatter-to-dense.
         self._mark_sparse_prod_scatter_skip()
+        for layer in self.input_layer_group:
+            if getattr(layer, "_packed_only", False):
+                for ns in layer.nodes:
+                    owner, _ = ns._sparse_flow_owner
+                    assert isinstance(owner, CoSparseProdLayer) or owner._skip_scatter, (
+                        "Dense storage planner disagrees with sparse backward dispatch."
+                    )
 
         # Cache whether this circuit contains any layer that reads `data_cpu`
         # via ``SparseCategorical.build_sparse_pattern``. Both
@@ -1762,7 +1966,8 @@ class TensorCircuit(nn.Module):
             for layer in lg:
                 if isinstance(layer, SparseProdLayer):
                     packed_consumer_cls = (SparseInputSumLayer,
-                                           SparseInputBlockDiagonalSumLayer)
+                                           SparseInputBlockDiagonalSumLayer,
+                                           SparseIOBlockDiagonalSumLayer)
                 elif isinstance(layer, BlockedProdLayer):
                     # BlockedIOSumLayer subclasses BlockedInputSumLayer; both
                     # read the packed BlockedNodeValues directly.
@@ -2201,7 +2406,7 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             max_tied_ns_per_parflow_block: int = 8,
             device: Optional[Union[int,torch.device]] = None,
             use_dense_sum_layer: bool = False,
-            verbose: bool = True) -> nn.Module:
+            verbose: bool = True, compact_sparse_buffers: bool = True) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -2229,6 +2434,12 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     :param use_dense_sum_layer: compile dense sum layers to :class:`DenseSumLayer` (GEMV kernel) instead of the general :class:`SumLayer`
     :type use_dense_sum_layer: bool
 
+    :param compact_sparse_buffers: Omit dense storage for compiler-proven packed
+        inputs/sums, and share the temporary rows of sparse-output BD layers.
+        Mixed input layers retain their dense layout. Set False for custom
+        callbacks or diagnostics that directly index every logical node.
+    :type compact_sparse_buffers: bool
+
     :param verbose: Whether to display the progress of the compilation
     :type verbose: bool
 
@@ -2236,4 +2447,5 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     """
     return TensorCircuit(ns, layer_sparsity_tol = layer_sparsity_tol, max_num_partitions = max_num_partitions,
                          disable_gpu_compilation = disable_gpu_compilation, force_gpu_compilation = force_gpu_compilation,
-                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, use_dense_sum_layer = use_dense_sum_layer, verbose = verbose)
+                         max_tied_ns_per_parflow_block = max_tied_ns_per_parflow_block, device = device, use_dense_sum_layer = use_dense_sum_layer, verbose = verbose,
+                         compact_sparse_buffers = compact_sparse_buffers)

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -19,15 +21,12 @@ _CO_BATCHED_BLOCK_B = 8
 only trades program count against register pressure."""
 
 
-@triton.jit(
-    do_not_specialize=["param_offset", "n", "batch_size", "in_stride",
-                       "out_stride"],
-)
+@runtime_triton_jit
 def _co_sparse_log_add_kernel(
     out_ptr, params_ptr, dense_values_ptr, max_out_ptr,
     col_starts_ptr, nnz_ptr,
     param_offset, n,
-    batch_size, in_stride, out_stride,
+    batch_size, in_stride, out_stride, nnz_total,
     BLOCK: tl.constexpr,
     BLOCK_B: tl.constexpr,
     IS_MISSING: tl.constexpr,
@@ -71,7 +70,7 @@ def _co_sparse_log_add_kernel(
         )
         p = tl.load(
             params_ptr + param_offset + cs_b[:, None] + offs[None, :],
-            mask=mask, other=1.0,
+            mask=mask & (cs_b[:, None] < nnz_total), other=1.0,
         )
         out = tl.log(p) + d
         tl.store(
@@ -125,6 +124,7 @@ class CoSparseProdLayer(SparseProdLayer):
             max_num_partitions=max_num_partitions,
             disable_gpu_compilation=disable_gpu_compilation,
             force_gpu_compilation=force_gpu_compilation,
+            _compile_dense=kwargs.pop("_compile_dense", True),
             input_layer_group=input_layer_group,
         )
 
@@ -317,6 +317,7 @@ class CoSparseProdLayer(SparseProdLayer):
                     BLOCK_B=1,
                     IS_MISSING=True,
                     IS_BATCHED=False,
+                    nnz_total=ns.sparse_input_ns.dist._nnz,
                 )
                 continue
 
@@ -393,6 +394,7 @@ class CoSparseProdLayer(SparseProdLayer):
                     BLOCK_B=1,
                     IS_MISSING=False,
                     IS_BATCHED=False,
+                    nnz_total=ns.sparse_input_ns.dist._nnz,
                 )
         return None
 
@@ -421,6 +423,7 @@ class CoSparseProdLayer(SparseProdLayer):
             BLOCK_B=BLOCK_B,
             IS_MISSING=False,
             IS_BATCHED=True,
+            nnz_total=ns.sparse_input_ns.dist._nnz,
         )
 
     def _forward_static(self, node_mars: torch.Tensor, static_ctx) -> None:
@@ -432,7 +435,7 @@ class CoSparseProdLayer(SparseProdLayer):
         for ns_idx, ns in enumerate(self.nodes):
             self._was_missing[ns_idx] = False
             dist = ns.sparse_input_ns.dist
-            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * dist._max_nnz_per_col,))
+            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * static_ctx.capacity(dist),))
             sv = static_ctx.pattern(dist, ns.var_id, ns.num_nodes, ws)
             sv.max_val = max_ws[ns_idx]
             sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
@@ -448,7 +451,7 @@ class CoSparseProdLayer(SparseProdLayer):
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  logspace_flows: bool = False,
-                 data: Optional[torch.Tensor] = None, **kwargs) -> None:
+                 data: Optional[torch.Tensor] = None, compute_param_flows: bool = True, **kwargs) -> None:
         # Log-space product forward: ``out = log_emit + sv_dense``, so
         # ∂out/∂log_emit = ∂out/∂sv_dense = 1. The incoming sv_flow becomes
         # the outgoing flow on both inputs unchanged.
@@ -470,7 +473,7 @@ class CoSparseProdLayer(SparseProdLayer):
             sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]
             sum_layer._sparse_flows[sum_ns_idx] = sv_flow
 
-            if self._was_missing[ns_idx]:
+            if self._was_missing[ns_idx] or not compute_param_flows:
                 # Marginalised position: emission contribution was forced to
                 # ``log(1) = 0`` in the forward, so it has zero gradient.
                 # Skip the param-flow accumulation that would otherwise

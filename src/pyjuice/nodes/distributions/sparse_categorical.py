@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 import torch
 import triton
 import triton.language as tl
@@ -521,6 +523,7 @@ class SparseCategorical(Distribution):
                 nnz_ptr = sparse_flow.nnz,
                 pflow_base = csc_pflows_base,
                 total_nnz = total_nnz,
+                nnz_total = self._nnz,
                 batch_size = B,
                 v_stride = sparse_flow.values.stride(0),
                 logspace_flows = 1 if logspace_flows else 0,
@@ -538,6 +541,7 @@ class SparseCategorical(Distribution):
                 nnz_ptr = sparse_flow.values,
                 pflow_base = csc_pflows_base + sparse_flow.col_start,
                 total_nnz = total_nnz,
+                nnz_total = self._nnz,
                 batch_size = 1,
                 v_stride = 0,
                 logspace_flows = 1 if logspace_flows else 0,
@@ -635,7 +639,7 @@ class SparseCategorical(Distribution):
 # =====================================================================
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_forward_kernel(
     data_ptr, node_mars_ptr, params_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -666,7 +670,7 @@ def _sparse_cat_forward_kernel(
     tl.store(node_mars_ptr + mars_offs, log_val, mask = slot_mask)
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_backward_kernel(
     data_ptr, node_flows_ptr, param_flows_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -699,14 +703,12 @@ def _sparse_cat_backward_kernel(
     tl.atomic_add(param_flows_ptr + pflow_base + slot_idx, flow, mask = slot_mask)
 
 
-@triton.jit(
-    do_not_specialize = ["pflow_base", "total_nnz", "batch_size", "v_stride"],
-)
+@runtime_triton_jit
 def _sparse_cat_backward_sparse_kernel(
     values_ptr,
     param_flows_ptr,
     col_starts_ptr, nnz_ptr,
-    pflow_base, total_nnz,
+    pflow_base, total_nnz, nnz_total,
     batch_size, v_stride,
     logspace_flows: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -732,7 +734,7 @@ def _sparse_cat_backward_sparse_kernel(
         mask_b = offs_b < batch_size
         cs_b = tl.load(col_starts_ptr + offs_b, mask = mask_b, other = 0)
         k_b = tl.load(nnz_ptr + offs_b, mask = mask_b, other = 0)
-        mask = mask_b[:, None] & (offs[None, :] < k_b[:, None])
+        mask = mask_b[:, None] & (offs[None, :] < k_b[:, None]) & (cs_b[:, None] < nnz_total)
 
         flow = tl.load(values_ptr + offs_b[:, None] * v_stride + offs[None, :],
                        mask = mask, other = 0.0)
@@ -753,7 +755,7 @@ def _sparse_cat_backward_sparse_kernel(
         tl.atomic_add(param_flows_ptr + pflow_base + offs, flow, mask = mask)
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_em_row_sum_kernel(
     params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, pflow_base, nnz,
@@ -780,7 +782,7 @@ def _sparse_cat_em_row_sum_kernel(
     tl.atomic_add(row_sums_ptr + row_id, contribution, mask = mask)
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_em_update_kernel(
     params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, pflow_base, nnz,
@@ -801,6 +803,7 @@ def _sparse_cat_em_update_kernel(
     # alone in that case.
     denom = tl.where(row_sum > 0, row_sum, 1.0)
     new_param = (1.0 - step_size) * param + step_size * (flow + pseudocount) / denom
+    new_param = tl.where(row_sum > 0, new_param, param)
 
     if keep_zero_params:
         new_param = tl.where(param < 1e-12, 0.0, new_param)
@@ -808,7 +811,7 @@ def _sparse_cat_em_update_kernel(
     tl.store(params_ptr + param_base + offs, new_param, mask = mask)
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_partition_accum_kernel(
     params_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, nnz,
@@ -823,7 +826,7 @@ def _sparse_cat_partition_accum_kernel(
     tl.atomic_add(row_sums_ptr + row_id, val, mask = mask)
 
 
-@triton.jit
+@runtime_triton_jit
 def _sparse_cat_partition_write_kernel(
     node_mars_ptr, row_sums_ptr,
     node_offset, H,

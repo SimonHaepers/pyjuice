@@ -24,12 +24,19 @@ take part unchanged; a layer that still needs the host patterns opts out via
 ``Layer.graph_unsupported_reason`` and the circuit runs eagerly. See the
 protocol on :class:`pyjuice.layer.Layer`.
 
-One :class:`SparseGraphState` per batch size, created and captured by
-``TensorCircuit.forward(..., record_cudagraph=True)`` and replayed by later
-calls with the same B. An eager backward after a replay first calls every
-layer's ``graph_rebind_outputs`` to rebuild the host-side state it reads.
+One :class:`SparseGraphState` per batch size and execution profile. Observed
+profiles reserve the largest CSC column; masked-query profiles reserve all
+latent rows and append an all-row column to each distribution's indices.
+Tokens and masks are runtime device data. ``device_sparse=True`` uses this
+state without capture; ``record_cudagraph=True`` captures the inner forward.
+Node-flow backward reuses the same patterns and supports separate capture.
+Parameter-flow backward remains eagerly launched. Workspaces and graph
+bindings are retained per profile, so switching batches does not rebuild
+host-side patterns.
 """
 from __future__ import annotations
+
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -59,9 +66,9 @@ def graph_unsupported_reason(pc) -> Optional[str]:
     return None
 
 
-@triton.jit(do_not_specialize=["B", "num_cats"])
+@runtime_triton_jit
 def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_ptr,
-                           B, num_cats, BLOCK_B: tl.constexpr):
+                           B, num_cats, missing_ptr, nnz_total, num_rows, BLOCK_B: tl.constexpr):
     """``col_starts[slot, b] = indptr[tok]``, ``nnz[slot, b] = indptr[tok + 1] -
     indptr[tok]`` with ``tok = data[var, b]``, for the ``(var, slot)`` pairs of
     one dist. Grid ``(num pairs, cdiv(B, BLOCK_B))``. An out-of-range token
@@ -76,7 +83,9 @@ def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_
     tok = tl.where(ok, tok, 0)
     c0 = tl.load(indptr_ptr + tok, mask=mask, other=0)
     c1 = tl.load(indptr_ptr + tok + 1, mask=mask, other=0)
-    n = tl.where(ok, c1 - c0, 0)
+    missing = tl.load(missing_ptr + var * B + offs_b, mask=mask, other=False)
+    n = tl.where(missing, num_rows, tl.where(ok, c1 - c0, 0))
+    c0 = tl.where(missing, nnz_total, c0)
     tl.store(cs_ptr + slot * B + offs_b, c0.to(tl.int32), mask=mask)
     tl.store(nnz_ptr + slot * B + offs_b, n.to(tl.int32), mask=mask)
 
@@ -86,8 +95,9 @@ class SparseGraphState:
     the input buffer, the per-``(dist, var)`` column table, every workspace
     the captured layers write, and the graph itself."""
 
-    def __init__(self, pc, B: int, device: torch.device, data_dtype: torch.dtype = torch.long):
+    def __init__(self, pc, B: int, device: torch.device, data_dtype: torch.dtype = torch.long, query_masks: bool = False):
         self.B = B
+        self.query_masks = query_masks
         self.device = device
 
         # One slot per (dist, var) column some layer declared it reads, and
@@ -110,6 +120,13 @@ class SparseGraphState:
                 per_dist.setdefault(id(dist), (dist, []))[1].append(
                     (var, self._slot_of[key]))
 
+        self._indices = {id(dist): torch.cat((dist._csc_indices,
+                          torch.arange(dist._num_nodes, device=device, dtype=dist._csc_indices.dtype)))
+                         if query_masks else dist._csc_indices
+                         for dist, _ in per_dist.values()}
+        self.forward_bindings = None
+        self.backward_bindings = {}
+        self.missing = torch.zeros(pc.num_vars, B, dtype=torch.bool, device=device)
         n_slots = max(len(self._slot_of), 1)
         self.col_starts = torch.zeros(n_slots, B, dtype=torch.int32, device=device)
         self.nnz = torch.zeros(n_slots, B, dtype=torch.int32, device=device)
@@ -139,11 +156,12 @@ class SparseGraphState:
         self.data = torch.zeros(pc.num_vars, B, dtype=data_dtype, device=device)
         self._buffers: Dict[tuple, torch.Tensor] = {}
         self.ws_decisions: Dict[tuple, bool] = {}
-        self.capture_nnz: Optional[torch.Tensor] = None
 
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.node_mars: Optional[torch.Tensor] = None
         self.element_mars: Optional[torch.Tensor] = None
+        self.node_flows: Optional[torch.Tensor] = None
+        self.element_flows: Optional[torch.Tensor] = None
         self._param_ptrs = self._param_signature(pc)
         self._keepalive: List[torch.Tensor] = []
         self._pinned: List[Optional[torch.Tensor]] = [None, None]
@@ -175,22 +193,31 @@ class SparseGraphState:
 
     def pattern(self, dist, var_id: int, num_rows: int,
                 values_ws: torch.Tensor) -> SparseNodeValues:
-        """Static container for the observed ``(dist, var)`` columns, values in
-        ``values_ws`` (``>= B * dist._max_nnz_per_col`` floats)."""
+        """Device-described observed or all-row columns in a fixed workspace."""
         s = self.slot(dist, var_id)
-        K = dist._max_nnz_per_col
+        K = self.capacity(dist)
         return SparseNodeValues(
-            col_start=0, total_nnz=K, indices=dist._csc_indices,
+            col_start=0, total_nnz=K, indices=self._indices[id(dist)],
             values=values_ws[:self.B * K].view(self.B, K), num_rows=num_rows,
             batch_size=self.B, col_starts=self._cs_rows[s], nnz=self._nnz_rows[s],
             static=True,
         )
 
-    def capture_pairs(self, slot_in: int, slot_out: int) -> int:
-        """``sum_b nnz_in[b] * nnz_out[b]`` of the capture batch: the active
-        ``(sample, in, out)`` pairs of one step, for the WS cost guard."""
-        n = self.capture_nnz
-        return int((n[slot_in].long() * n[slot_out].long()).sum())
+    def capacity(self, dist) -> int:
+        return dist._num_nodes if self.query_masks else dist._max_nnz_per_col
+
+    def snapshot_bindings(self):
+        # Graph replay updates tensors but does not repeat Python assignments.
+        # Restore the containers/caches belonging to this execution profile.
+        names = ("_sparse_outputs", "_sparse_flows", "_cached_in_offsets",
+                 "_cached_out_offsets", "_was_missing")
+        return [(layer, name, list(getattr(layer, name)))
+                for layer in self._layers for name in names if hasattr(layer, name)]
+
+    @staticmethod
+    def restore_bindings(bindings):
+        for layer, name, values in bindings:
+            setattr(layer, name, list(values))
 
     def begin_pass(self) -> None:
         """First nodes of the graph: reset the running maxima and resolve the
@@ -203,7 +230,8 @@ class SparseGraphState:
             grid = (var_ids.numel(), triton.cdiv(self.B, _PATTERN_BLOCK_B))
             _static_pattern_kernel[grid](
                 self.col_starts, self.nnz, self.data, dist._csc_indptr, var_ids, slots,
-                self.B, dist.num_cats, BLOCK_B=_PATTERN_BLOCK_B,
+                self.B, dist.num_cats, self.missing, dist._nnz, dist._num_nodes,
+                BLOCK_B=_PATTERN_BLOCK_B,
             )
 
     # ------------------------------------------------------------------ #
@@ -223,8 +251,21 @@ class SparseGraphState:
         (In-place EM updates keep them; re-initialising or moving does not.)"""
         return self._param_ptrs == self._param_signature(pc)
 
-    def load_inputs(self, run_data: torch.Tensor) -> None:
+    def load_inputs(self, run_data: torch.Tensor, missing_mask=None) -> None:
         """Copy the ``[num_vars, B]`` batch into the graph's input buffer."""
+        if missing_mask is None:
+            self.missing.zero_()
+        else:
+            if not self.query_masks:
+                raise ValueError("A masked query requires a query workspace")
+            mask = missing_mask.to(device=self.device, dtype=torch.bool)
+            if mask.dim() == 1:
+                mask = mask[:, None].expand_as(self.missing)
+            elif mask.shape == (self.B, self.data.size(0)):
+                mask = mask.T
+            else:
+                raise ValueError("missing_mask must have shape [num_vars] or [B, num_vars]")
+            self.missing.copy_(mask)
         assert tuple(run_data.shape) == tuple(self.data.shape), (
             f"batch of shape {tuple(run_data.shape)} for a graph captured with "
             f"{tuple(self.data.shape)}")
@@ -248,10 +289,9 @@ class SparseGraphState:
 
     def capture(self, body: Callable[[], None]) -> None:
         """Warm up and capture ``body`` (the inner-layer pass). The inputs must
-        already be loaded: the capture batch's column sizes fix the WS-vs-gather
-        dispatch of every sum block for the life of this graph."""
+        already be loaded. WS dispatch uses model-level support statistics,
+        independent of the particular capture tokens."""
         self.compute_patterns()
-        self.capture_nnz = self.nnz.cpu()
 
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
@@ -264,10 +304,17 @@ class SparseGraphState:
         with torch.cuda.graph(graph):
             body()
         self.graph = graph
+        self.forward_bindings = self.snapshot_bindings()
         # The WS kernels use process-wide grow-only scratch (`_ws_scratch`). A
         # later, larger eager pass may replace those buffers; keep the ones
         # the graph baked in alive so the replay never writes freed memory.
-        self._keepalive = [t for (_, dev), t in _WS_SCRATCH.items() if dev == self.device]
+        self.retain_ws_buffers()
+
+    def retain_ws_buffers(self):
+        """Keep scratch addresses captured by either direction alive."""
+        retained = {id(t) for t in self._keepalive}
+        self._keepalive.extend(t for (_, dev), t in _WS_SCRATCH.items()
+                               if dev == self.device and id(t) not in retained)
 
     def rebind_outputs(self, data_cpu: torch.Tensor, data_list: Optional[list],
                        pattern_cache: Optional[dict]) -> None:

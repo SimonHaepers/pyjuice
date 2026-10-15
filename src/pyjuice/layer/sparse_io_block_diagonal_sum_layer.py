@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 import hashlib
 import weakref
 from typing import List, Optional, Sequence, Tuple
@@ -9,7 +11,6 @@ import triton
 import triton.language as tl
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils.kernel_launcher import triton_jit
 from .block_diagonal_sum_layer import BlockDiagonalSumLayer
 from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
@@ -183,7 +184,7 @@ def _bd_dense_batched(batch_size: int) -> bool:
     return mode == "always" or batch_size >= _sparse_io._WS_MIN_BATCH
 
 
-@triton.jit(do_not_specialize=["row_start", "batch_size", "v_stride"])
+@runtime_triton_jit
 def _sv_dense_rows_kernel(dense_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
                           row_map_ptr, row_start, batch_size, v_stride,
                           TO_DENSE: tl.constexpr, HAS_ROW_MAP: tl.constexpr,
@@ -746,14 +747,7 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 # ======================================================================= #
 
 
-@triton.jit(
-    do_not_specialize=["pid_start"],
-    do_not_specialize_on_alignment=[
-        "in_indices_ptr", "in_values_ptr", "max_val_ptr",
-        "in_block_offsets_ptr", "out_indices_ptr",
-        "out_block_offsets_ptr", "out_values_ptr",
-    ],
-)
+@runtime_triton_jit
 def _fw_bd_sparse_io_kernel(
     out_values_ptr,
     mparams_ptr,
@@ -811,7 +805,8 @@ def _fw_bd_sparse_io_kernel(
     out_idx = tl.load(out_indices_ptr + out_s + offs_m, mask=mask_m, other=0)
     pslot = out_idx - pid_nb * BS                                                # [MAX_K_OUT]
 
-    max_val = tl.load(max_val_ptr)
+    max_val = tl.max(in_val, axis=0)
+    max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
     in_val_lin = tl.where(mask_k, tl.exp(in_val - max_val), 0.0)
 
     # Weight gather: W[m, k] = mparams[block_base + cslot[k]*BS + pslot[m]].
@@ -837,20 +832,12 @@ def _fw_bd_sparse_io_kernel(
     result = tl.where(
         K_in_j == 0,
         -float("inf"),
-        tl.log(acc + 1e-32) + max_val,
+        tl.log(acc) + max_val,
     )
     tl.store(out_values_ptr + out_s + offs_m, result, mask=mask_m)
 
 
-@triton.jit(
-    do_not_specialize=["pid_start", "pfid_start"],
-    do_not_specialize_on_alignment=[
-        "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
-        "in_indices_ptr", "in_values_ptr", "in_block_offsets_ptr",
-        "out_indices_ptr", "out_block_offsets_ptr",
-        "pflows_ptr",
-    ],
-)
+@runtime_triton_jit
 def _bk_bd_sparse_io_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,

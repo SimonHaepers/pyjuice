@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 from typing import List, Optional, Sequence
 
 import torch
@@ -69,6 +71,7 @@ class SparseProdLayer(ProdLayer):
             max_num_partitions=max_num_partitions,
             disable_gpu_compilation=disable_gpu_compilation,
             force_gpu_compilation=force_gpu_compilation,
+            _compile_dense=kwargs.pop("_compile_dense", True),
         )
 
         assert input_layer_group is not None, \
@@ -342,6 +345,7 @@ class SparseProdLayer(ProdLayer):
                 BLOCK_B=1,
                 IS_MISSING=True,
                 IS_BATCHED=False,
+                nnz_total=ns.sparse_input_ns.dist._nnz,
             )
             return sv
 
@@ -390,6 +394,7 @@ class SparseProdLayer(ProdLayer):
                 BLOCK_B=1,
                 IS_MISSING=False,
                 IS_BATCHED=False,
+                nnz_total=ns.sparse_input_ns.dist._nnz,
             )
 
         return sv
@@ -423,6 +428,7 @@ class SparseProdLayer(ProdLayer):
             BLOCK_B=BLOCK_B,
             IS_MISSING=False,
             IS_BATCHED=True,
+            nnz_total=ns.sparse_input_ns.dist._nnz,
         )
 
     def graph_columns(self):
@@ -442,7 +448,7 @@ class SparseProdLayer(ProdLayer):
         for ns_idx, ns in enumerate(self.nodes):
             self._was_missing[ns_idx] = False
             dist = ns.sparse_input_ns.dist
-            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * dist._max_nnz_per_col,))
+            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * static_ctx.capacity(dist),))
             sv = static_ctx.pattern(dist, ns.var_id, ns.num_nodes, ws)
             sv.max_val = max_ws[ns_idx]
             self._launch_batched_forward(ns_idx, ns, sv, node_mars, B)
@@ -468,7 +474,7 @@ class SparseProdLayer(ProdLayer):
 
     def backward(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
                  logspace_flows: bool = False,
-                 data: Optional[torch.Tensor] = None, **kwargs) -> None:
+                 data: Optional[torch.Tensor] = None, compute_param_flows: bool = True, **kwargs) -> None:
         if self._skip_scatter:
             # Sparse fast path: downstream SparseInputSumLayer wrote sv_flow
             # straight into ``self._sparse_flows``. Route active-row flows to
@@ -491,7 +497,7 @@ class SparseProdLayer(ProdLayer):
 
                 self._scatter_flow_to_children(ns_idx, ns, sv_flow, node_flows)
 
-                if self._was_missing[ns_idx]:
+                if self._was_missing[ns_idx] or not compute_param_flows:
                     # Position was marginalised in the forward pass: the
                     # emission ``log P(x|h)`` was treated as ``log(1) = 0``
                     # for every row (no specific token observed), so its
@@ -527,7 +533,7 @@ class SparseProdLayer(ProdLayer):
                 "SparseProdLayer.backward called before forward "
                 "(no cached sparse output)."
             )
-            if self._was_missing[ns_idx]:
+            if self._was_missing[ns_idx] or not compute_param_flows:
                 # See note above: marginalised positions contribute no
                 # gradient to the emission params.
                 continue
@@ -616,12 +622,7 @@ class SparseProdLayer(ProdLayer):
 # =====================================================================
 
 
-@triton.jit(
-    do_not_specialize=["num_rows", "total_nnz", "batch_size", "v_stride"],
-    do_not_specialize_on_alignment=["indices_ptr", "values_ptr",
-                                     "dense_ch_lookup_ptr", "col_starts_ptr",
-                                     "nnz_ptr"],
-)
+@runtime_triton_jit
 def _sparse_prod_scatter_flow_kernel(
     node_flows_ptr, dense_ch_lookup_ptr,
     indices_ptr, values_ptr,
@@ -667,13 +668,7 @@ def _sparse_prod_scatter_flow_kernel(
             tl.store(node_flows_ptr + nid * batch_size, v, mask=mask)
 
 
-@triton.jit(
-    do_not_specialize=["param_base", "num_rows", "total_nnz", "batch_size",
-                       "v_stride"],
-    do_not_specialize_on_alignment=["indices_ptr", "values_out_ptr",
-                                     "dense_ch_lookup_ptr", "col_starts_ptr",
-                                     "nnz_ptr", "max_out_ptr"],
-)
+@runtime_triton_jit
 def _sparse_prod_forward_kernel(
     params_ptr, node_mars_ptr, dense_ch_lookup_ptr,
     indices_ptr,
@@ -683,7 +678,7 @@ def _sparse_prod_forward_kernel(
     num_rows,
     total_nnz,
     batch_size,
-    v_stride,
+    v_stride, nnz_total,
     NUM_DENSE_CHS: tl.constexpr,
     BLOCK: tl.constexpr,
     BLOCK_B: tl.constexpr,
@@ -732,7 +727,8 @@ def _sparse_prod_forward_kernel(
 
         slot = cs_b[:, None] + offs_j[None, :]
         row = tl.load(indices_ptr + slot, mask=mask, other=0)
-        val = tl.load(params_ptr + param_base + slot, mask=mask, other=1.0)
+        val = tl.load(params_ptr + param_base + slot,
+                      mask=mask & (cs_b[:, None] < nnz_total), other=1.0)
         log_emit = tl.log(val)
 
         dense_sum = tl.zeros([BLOCK_B, BLOCK], dtype=tl.float32)
@@ -779,11 +775,7 @@ def _sparse_prod_forward_kernel(
         tl.atomic_max(max_out_ptr, tile_max)
 
 
-@triton.jit(
-    do_not_specialize=["out_base", "batch_size", "v_stride"],
-    do_not_specialize_on_alignment=["values_ptr", "indices_ptr", "col_starts_ptr",
-                                     "nnz_ptr"],
-)
+@runtime_triton_jit
 def _static_scatter_kernel(out_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
                            out_base, batch_size, v_stride, BLOCK: tl.constexpr):
     """``out[out_base + indices[col_starts[b] + k], b] = values[b, k]`` for

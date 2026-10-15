@@ -37,7 +37,8 @@ def _make_csc_pattern(H, V, density = 0.5, seed = 42):
     return mask_hv, dense_probs, csc_indptr, csc_indices, csc_values
 
 
-def _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device):
+def _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device,
+                     compact_sparse_buffers=True):
     """Build a minimal PC: SparseCategorical input on var 0 → summate root."""
     with juice.set_block_size(block_size = H):
         sparse_dist = dists.SparseCategorical(num_cats = V)
@@ -50,7 +51,7 @@ def _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device):
         root = summate(ni, num_node_blocks = 1, block_size = 1)
     root.init_parameters(perturbation = 0.0)
 
-    pc = juice.TensorCircuit(root)
+    pc = juice.TensorCircuit(root, compact_sparse_buffers=compact_sparse_buffers)
     pc.to(device)
     return pc, ni, root
 
@@ -171,7 +172,10 @@ def test_sparse_categorical_partition_fn():
     H, V = 8, 16
     _, _, csc_indptr, csc_indices, csc_values = _make_csc_pattern(H, V, seed = 13)
 
-    pc, ni, _ = _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device)
+    # This low-level diagnostic explicitly writes every latent's partition
+    # into the dense buffer. Compact inference omits those dense input rows.
+    pc, ni, _ = _build_sparse_pc(H, V, csc_indptr, csc_indices, csc_values, device,
+                                compact_sparse_buffers=False)
 
     # Trigger allocation of pc.node_mars via a dummy forward.
     data = torch.zeros(1, 1, dtype = torch.long, device = device)
@@ -182,6 +186,7 @@ def test_sparse_categorical_partition_fn():
     il.eval_partition_fn(node_mars)
     sid, eid = ni._output_ind_range
     per_latent_log_Z = node_mars[sid:eid].detach().cpu()
+    assert per_latent_log_Z.numel() == H
 
     assert torch.allclose(per_latent_log_Z, torch.zeros_like(per_latent_log_Z), atol = 1e-4), \
         f"expected per-latent partition ~0, max abs = {per_latent_log_Z.abs().max().item():.3e}"

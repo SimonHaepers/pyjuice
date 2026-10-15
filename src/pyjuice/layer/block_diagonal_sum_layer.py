@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 import torch
 import torch.nn as nn
 import triton
@@ -12,7 +14,6 @@ else:
     tlmath = tl.math
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils.kernel_launcher import triton_jit
 from pyjuice.utils.parameter_list import FastParamList
 from .layer import Layer
 from .sum_layer import SumLayer
@@ -241,6 +242,8 @@ class BlockDiagonalSumLayer(SumLayer):
             "BlockDiagonalSumLayer currently supports only LL propagation."
         )
 
+        self._bd_forward_precision = "ieee" if force_use_fp32 else "tf32x3"
+        self._bd_forward_bf16 = force_use_bf16 and not force_use_fp32
         batch_size = node_mars.size(1)
 
         for block in self._bd_blocks:
@@ -248,30 +251,34 @@ class BlockDiagonalSumLayer(SumLayer):
 
         return None
 
+    def _input_row_map(self, block):
+        # Registered buffers follow .to(device), including after compilation.
+        return getattr(self, f"_bd_input_map_{self._bd_blocks.index(block)}", None)
+
     def _dense_forward_block(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
                              params: torch.Tensor, block: tuple, batch_size: int) -> None:
         """Forward of one block over every parent / child row (also the dense
         batched path of the sparse BD subclasses, on densified rows)."""
         nid_start, cid_start, pid_start, _pfid_start, NB, bs, cbs = block
+        row_map = self._input_row_map(block)
 
         CBS_PADDED = triton.next_power_of_2(cbs)
-        BS_PADDED = triton.next_power_of_2(bs)
+        use_dot = batch_size >= 16 and min(bs, cbs) >= 16
+        BS_PADDED = min(triton.next_power_of_2(bs), 32) if use_dot else triton.next_power_of_2(bs)
         BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
         if BLOCK_B < 1:
             BLOCK_B = 1
 
-        # Grid: one program per (parent_block, batch_tile). The
-        # forward kernel handles all ``bs`` parent rows in the block
-        # within a single program because per-block compute is small
-        # (BS_PADDED * CBS_PADDED weights) and reusing the linearised
-        # ``emars_lin`` across all parents in the block is the main
-        # arithmetic win over the general path.
-        grid = (NB, triton.cdiv(batch_size, BLOCK_B))
+        # Tensor-core path uses 2-D matrix tiles instead of a BS*CBS*B
+        # broadcast. The small-batch reduction retains its lower launch cost.
+        grid = (NB, triton.cdiv(batch_size, BLOCK_B), triton.cdiv(bs, BS_PADDED))
 
         self._fw_bd_kernel[grid](
             node_mars = node_mars,
-            element_mars = element_mars,
+            element_mars = node_mars if row_map is not None else element_mars,
             mparams = params,
+            input_map = params if row_map is None else row_map,
+            MAP_INPUT = row_map is not None,
             batch_size = batch_size,
             nid_start = nid_start,
             cid_start = cid_start,
@@ -281,6 +288,9 @@ class BlockDiagonalSumLayer(SumLayer):
             BS_PADDED = BS_PADDED,
             CBS_PADDED = CBS_PADDED,
             BLOCK_B = BLOCK_B,
+            USE_TL_DOT = use_dot,
+            PRECISION = getattr(self, "_bd_forward_precision", "tf32x3"),
+            USE_BF16 = getattr(self, "_bd_forward_bf16", False),
         )
 
     # ------------------------------------------------------------------ #
@@ -360,6 +370,7 @@ class BlockDiagonalSumLayer(SumLayer):
         child row; the ``allow_modify_flows`` pre-pass must already have run.
         Also the dense batched path of the sparse BD subclasses."""
         nid_start, cid_start, pid_start, pfid_start, NB, bs, cbs = block
+        row_map = self._input_row_map(block)
 
         # Same tile policy as the dense backward: 2-D [TILE_N, BLOCK_B]
         # output tiles with a serial TILE_K loop over the parent rows.
@@ -375,10 +386,12 @@ class BlockDiagonalSumLayer(SumLayer):
 
         self._bk_bd_kernel[grid](
             node_flows = node_flows,
-            element_flows = element_flows,
+            element_flows = node_flows if row_map is not None else element_flows,
             node_mars = node_mars,
-            element_mars = element_mars,
+            element_mars = node_mars if row_map is not None else element_mars,
             mparams = params,
+            input_map = params if row_map is None else row_map,
+            MAP_INPUT = row_map is not None,
             batch_size = batch_size,
             nid_start = nid_start,
             cid_start = cid_start,
@@ -393,6 +406,7 @@ class BlockDiagonalSumLayer(SumLayer):
             ACCUMULATE_CH_FLOWS = 1 if accumulate_ch_flows else 0,
             LOGSPACE_FLOWS = 1 if logspace_flows else 0,
             USE_TL_DOT = use_tl_dot,
+            PRECISION = "ieee" if force_use_fp32 else "tf32x3",
         )
 
         if param_flows is not None:
@@ -412,8 +426,10 @@ class BlockDiagonalSumLayer(SumLayer):
             self._bk_bd_par_kernel[par_grid](
                 node_flows = node_flows,
                 node_mars = node_mars,
-                element_mars = element_mars,
+                element_mars = node_mars if row_map is not None else element_mars,
                 mparams = params,
+                input_map = params if row_map is None else row_map,
+                MAP_INPUT = row_map is not None,
                 param_flows = param_flows,
                 batch_size = batch_size,
                 nid_start = nid_start,
@@ -430,6 +446,7 @@ class BlockDiagonalSumLayer(SumLayer):
                 LOGSPACE_FLOWS = 1 if logspace_flows else 0,
                 NEGATE_PFLOWS = 1 if negate_pflows else 0,
                 USE_TL_DOT = use_tl_dot_p,
+                PRECISION = "ieee" if force_use_fp32 else "tf32x3",
             )
 
     # ------------------------------------------------------------------ #
@@ -437,14 +454,16 @@ class BlockDiagonalSumLayer(SumLayer):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    @triton_jit
-    def _fw_bd_kernel(node_mars, element_mars, mparams,
+    @runtime_triton_jit
+    def _fw_bd_kernel(node_mars, element_mars, mparams, input_map, MAP_INPUT: tl.constexpr,
                       batch_size,
                       nid_start, cid_start, pid_start,
                       BS, CBS,
                       BS_PADDED: tl.constexpr,
                       CBS_PADDED: tl.constexpr,
-                      BLOCK_B: tl.constexpr):
+                      BLOCK_B: tl.constexpr,
+                      USE_TL_DOT: tl.constexpr, PRECISION: tl.constexpr,
+                      USE_BF16: tl.constexpr):
         """
         Forward for one BlockDiagonalSumLayer block, one program per
         ``(parent_block, batch_tile)``.
@@ -464,13 +483,13 @@ class BlockDiagonalSumLayer(SumLayer):
              exp(emars - max_b)`` (zero for ``c >= CBS`` padding slots).
           3. Load the ``[BS_PADDED, CBS_PADDED]`` weight tile.
           4. ``acc[s, b] = sum_c weight[s, c] * emars_lin[c, b]``.
-          5. ``nmars[s, b] = log(acc + 1e-24) + max_b`` (with -inf
+          5. ``nmars[s, b] = log(acc) + max_b`` (with -inf
              passthrough for fully-masked batches).
 
-        ``BS`` and ``CBS`` are runtime ints so a single binary serves every
-        (tied or untied) block regardless of summate-specific shape;
-        register pressure is bounded by ``BS_PADDED * CBS_PADDED *
-        BLOCK_B``, both padded to powers of two.
+        ``BS`` and ``CBS`` are runtime integers. Large batches use 2-D dot
+        operands with at most 32 parent rows per program. Small batches use
+        a broadcast reduction. ``MAP_INPUT`` reads a compiler-proven
+        permutation directly from node_mars, avoiding its product buffer.
         """
 
         pid_nb = tl.program_id(0)       # parent block id
@@ -483,7 +502,7 @@ class BlockDiagonalSumLayer(SumLayer):
         offs_c = tl.arange(0, CBS_PADDED)
         mask_c = offs_c < CBS
 
-        offs_s = tl.arange(0, BS_PADDED)
+        offs_s = tl.program_id(2) * BS_PADDED + tl.arange(0, BS_PADDED)
         mask_s = offs_s < BS
 
         # Load all CBS child marginals for this parent block. Children for
@@ -492,10 +511,10 @@ class BlockDiagonalSumLayer(SumLayer):
         # int64 cast on the row index: ``node_id * batch_size`` exceeds 2^31
         # once the mars/flows buffers pass 2^31 elements (e.g. ~385k nodes at
         # B=8192), and Triton computes scalar-offset arithmetic in int32.
-        emars_ptr = (
-            (cid_start + pid_nb * CBS + offs_c).to(tl.int64)[:, None] * batch_size
-            + offs_batch[None, :]
-        )
+        child_rows = (cid_start + pid_nb * CBS + offs_c).to(tl.int64)
+        if MAP_INPUT:
+            child_rows = tl.load(input_map + pid_nb * CBS + offs_c, mask=mask_c, other=0).to(tl.int64)
+        emars_ptr = child_rows[:, None] * batch_size + offs_batch[None, :]
         emars = tl.load(
             element_mars + emars_ptr,
             mask = mask_c[:, None] & mask_batch[None, :],
@@ -530,7 +549,13 @@ class BlockDiagonalSumLayer(SumLayer):
         weight = weight.to(tl.float32)
 
         # acc[s, b] = sum_c weight[s, c] * emars_lin[c, b]
-        acc = tl.sum(weight[:, :, None] * emars_lin[None, :, :], axis = 1)      # [BS_PADDED, BLOCK_B]
+        if USE_TL_DOT:
+            if USE_BF16:
+                acc = tl.dot(weight.to(tl.bfloat16), emars_lin.to(tl.bfloat16))
+            else:
+                acc = tl.dot(weight, emars_lin, input_precision=PRECISION)
+        else:
+            acc = tl.sum(weight[:, :, None] * emars_lin[None, :, :], axis = 1)      # [BS_PADDED, BLOCK_B]
 
         # Reassemble log-space output. ``emars_max == -inf`` => every child
         # is -inf => output stays -inf (acc would be 0 anyway, but the
@@ -539,7 +564,7 @@ class BlockDiagonalSumLayer(SumLayer):
         nmars = tl.where(
             emars_max[None, :] == -float("inf"),
             -float("inf"),
-            tl.log(acc + 1e-24) + emars_max[None, :],
+            tl.log(acc) + emars_max[None, :],
         )
 
         out_ptr = (
@@ -553,12 +578,12 @@ class BlockDiagonalSumLayer(SumLayer):
         )
 
     @staticmethod
-    @triton_jit
+    @runtime_triton_jit
     def _bk_bd_kernel(node_flows, element_flows, node_mars, element_mars,
                       mparams,
                       batch_size,
                       nid_start, cid_start, pid_start,
-                      BS, CBS,
+                      BS, CBS, input_map, MAP_INPUT: tl.constexpr,
                       BLOCK_B: tl.constexpr,
                       TILE_N: tl.constexpr,
                       TILE_K: tl.constexpr,
@@ -566,7 +591,8 @@ class BlockDiagonalSumLayer(SumLayer):
                       ALLOW_MODIFY_FLOWS: tl.constexpr,
                       ACCUMULATE_CH_FLOWS: tl.constexpr,
                       LOGSPACE_FLOWS: tl.constexpr,
-                      USE_TL_DOT: tl.constexpr):
+                      USE_TL_DOT: tl.constexpr,
+                      PRECISION: tl.constexpr):
         """
         Element-flow backward, one program per ``(batch_tile,
         child_tile)`` where ``pid_n`` decomposes into ``(parent_block,
@@ -613,6 +639,8 @@ class BlockDiagonalSumLayer(SumLayer):
         offs_child = tl.max_contiguous(tl.multiple_of(offs_child, TILE_N), TILE_N)
         # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
         off_cid = (cid_start + pblock_id * CBS + offs_child).to(tl.int64)
+        if MAP_INPUT:
+            off_cid = tl.load(input_map + pblock_id * CBS + offs_child).to(tl.int64)
 
         offs_batch = tl.arange(0, BLOCK_B) + pid_b * BLOCK_B
         offs_batch = tl.max_contiguous(tl.multiple_of(offs_batch, BLOCK_B), BLOCK_B)
@@ -671,7 +699,7 @@ class BlockDiagonalSumLayer(SumLayer):
                     log_n_fdm = tl.where(
                         nmars == -float("inf"),
                         -float("inf"),
-                        tl.log(nflows + 1e-32) - nmars,
+                        tl.log(nflows) - nmars,
                     )                                                  # [TILE_K, BLOCK_B]
 
             # Per-tile stabilisation (exact rescaling — merged back via
@@ -684,7 +712,7 @@ class BlockDiagonalSumLayer(SumLayer):
             )                                                          # [TILE_K, BLOCK_B]
 
             if USE_TL_DOT == 1:
-                partial = tl.dot(epars, n_fdm_sub)                     # [TILE_N, BLOCK_B]
+                partial = tl.dot(epars, n_fdm_sub, input_precision=PRECISION)                     # [TILE_N, BLOCK_B]
             else:
                 partial = tl.sum(
                     epars[:, :, None] * n_fdm_sub[None, :, :], axis = 1,
@@ -699,7 +727,7 @@ class BlockDiagonalSumLayer(SumLayer):
                     acc,
                     tl.where(
                         partial_max > acc,
-                        tl.log(partial + tl.exp(acc - partial_max) + 1e-32) + partial_max,
+                        tl.log(partial + tl.exp(acc - partial_max)) + partial_max,
                         tl.log(tl.exp(partial_max - acc) * partial + 1.0) + acc,
                     ),
                 )
@@ -737,12 +765,12 @@ class BlockDiagonalSumLayer(SumLayer):
         tl.store(element_flows + out_ptr, acc, mask = mask_batch[None, :])
 
     @staticmethod
-    @triton_jit
+    @runtime_triton_jit
     def _bk_bd_par_kernel(node_flows, node_mars, element_mars, mparams,
                           param_flows,
                           batch_size,
                           nid_start, cid_start, pid_start, pfid_start,
-                          BS, CBS,
+                          BS, CBS, input_map, MAP_INPUT: tl.constexpr,
                           TILE_M: tl.constexpr,
                           TILE_N: tl.constexpr,
                           TILE_B: tl.constexpr,
@@ -750,7 +778,8 @@ class BlockDiagonalSumLayer(SumLayer):
                           ALLOW_MODIFY_FLOWS: tl.constexpr,
                           LOGSPACE_FLOWS: tl.constexpr,
                           NEGATE_PFLOWS: tl.constexpr,
-                          USE_TL_DOT: tl.constexpr):
+                          USE_TL_DOT: tl.constexpr,
+                      PRECISION: tl.constexpr):
         """
         Param-flow kernel for one BlockDiagonalSumLayer block — the BD
         specialisation of ``DenseSumLayer._bk_triton_dense_par_kernel``:
@@ -791,7 +820,9 @@ class BlockDiagonalSumLayer(SumLayer):
 
         # int64: ``* batch_size`` offsets can exceed 2^31 (see forward kernel).
         off_nid = (nid_start + pblock_id * BS + offs_par).to(tl.int64)  # [TILE_M]
-        off_cid = (cid_start + pblock_id * CBS + offs_ch).to(tl.int64)  # [TILE_N]
+        off_cid = (cid_start + pblock_id * CBS + offs_ch).to(tl.int64)
+        if MAP_INPUT:
+            off_cid = tl.load(input_map + pblock_id * CBS + offs_ch).to(tl.int64)  # [TILE_N]
 
         # Flat (pid, pfid) offsets share the BD layout: diagonal block
         # ``pblock`` at ``pblock * BS * CBS``, entry (c, s) at ``c*BS + s``
@@ -863,7 +894,7 @@ class BlockDiagonalSumLayer(SumLayer):
             )  # [TILE_B, TILE_N]
 
             if USE_TL_DOT == 1:
-                partial_flows = tl.dot(n_fdm_sub, scaled_emars)
+                partial_flows = tl.dot(n_fdm_sub, scaled_emars, input_precision=PRECISION)
             else:
                 partial_flows = tl.sum(
                     n_fdm_sub[:, :, None] * scaled_emars[None, :, :],

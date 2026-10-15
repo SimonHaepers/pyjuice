@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -318,7 +320,8 @@ class SparseInputSumLayer(DenseSumLayer):
 
                 # Mirror sv's pattern so SparseProdLayer.backward (sparse path)
                 # can find the flow. The prod layer will pop this slot.
-                sv_flow = sv.like_pattern(torch.empty_like(sv.values))
+                sv_flow = sv.like_pattern(kwargs["static_ctx"].buffer((id(self), "bwd", blk_idx), tuple(sv.values.shape))
+                                          if kwargs.get("static_ctx") is not None else torch.empty_like(sv.values))
                 sparse_prod._sparse_flows[ns_idx] = sv_flow
 
                 if total_nnz == 0:
@@ -439,11 +442,7 @@ class SparseInputSumLayer(DenseSumLayer):
 # =====================================================================
 
 
-@triton.jit(
-    do_not_specialize=["nid_start", "pid_start", "total_nnz", "v_stride"],
-    do_not_specialize_on_alignment=["indices_ptr", "values_ptr", "max_val_ptr",
-                                     "col_starts_ptr", "nnz_ptr"],
-)
+@runtime_triton_jit
 def _sparse_input_sum_forward_kernel(
     node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, max_val_ptr,
@@ -536,7 +535,7 @@ def _sparse_input_sum_forward_kernel(
 
             acc_sum += tl.sum(W * v_k[None, :, :], axis=2)        # [TILE_M, BLOCK_B]
 
-        result = tl.log(acc_sum + 1e-24) + max_b[None, :]
+        result = tl.log(acc_sum) + max_b[None, :]
         result = tl.where(k_b[None, :] == 0, -float("inf"), result)
 
         # int64 cast: num_nodes * B crosses 2^31 at (H=32k, B=1024)-scale
@@ -549,6 +548,7 @@ def _sparse_input_sum_forward_kernel(
         )
     else:
         max_val = tl.load(max_val_ptr)                            # scalar
+        max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
 
         acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
         for k0 in tl.range(0, total_nnz, BLOCK_K):
@@ -575,16 +575,13 @@ def _sparse_input_sum_forward_kernel(
 
             acc_sum += tl.sum(W * v_k[None, :], axis=1)           # [TILE_M]
 
-        result = tl.log(acc_sum + 1e-24) + max_val
+        result = tl.log(acc_sum) + max_val
 
         # B=1: node_mars[off_nid, 0] = node_mars_ptr[off_nid * batch_size + 0]
         tl.store(node_mars_ptr + off_nid * batch_size, result)
 
 
-@triton.jit(
-    do_not_specialize=["nid_start", "cid_start", "pid_start"],
-    do_not_specialize_on_alignment=["indices_ptr", "values_ptr"],
-)
+@runtime_triton_jit
 def _sparse_input_sum_backward_kernel(
     node_flows_ptr, node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, element_flows_ptr,
@@ -629,7 +626,8 @@ def _sparse_input_sum_backward_kernel(
     if allow_modify_flows:
         contribution = tl.exp(nflows + log_val) * W
     else:
-        contribution = nflows * W * tl.exp(log_val - nmars)
+        contribution = tl.where((nmars > -float("inf")) & (log_val > -float("inf")) & (nflows != 0.0),
+                                nflows * W * tl.exp(log_val - nmars), 0.0)
 
     partial_flow = tl.sum(contribution)
 
@@ -639,14 +637,7 @@ def _sparse_input_sum_backward_kernel(
     )
 
 
-@triton.jit(
-    do_not_specialize=["nid_start", "pid_start", "pfid_start", "v_stride",
-                       "f_stride"],
-    do_not_specialize_on_alignment=[
-        "indices_ptr", "values_ptr", "flow_out_ptr", "pflows_ptr",
-        "col_starts_ptr", "nnz_ptr",
-    ],
-)
+@runtime_triton_jit
 def _sparse_input_sum_backward_sv_kernel(
     node_flows_ptr, node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, flow_out_ptr,
@@ -733,7 +724,8 @@ def _sparse_input_sum_backward_sv_kernel(
                     else:
                         nmars = tl.load(node_mars_ptr + p_addr,
                                         mask=tile_mask, other=0.0)
-                        chunk = nflows * W * tl.exp(log_val[None, :] - nmars)
+                        chunk = tl.where((nmars > -float("inf")) & (log_val[None, :] > -float("inf")) & (nflows != 0.0),
+                                         nflows * W * tl.exp(log_val[None, :] - nmars), 0.0)
 
                     chunk = tl.where(tile_mask, chunk, 0.0)
                     acc += chunk
@@ -785,7 +777,8 @@ def _sparse_input_sum_backward_sv_kernel(
                         node_mars_ptr + p_addr,
                         mask=mask_p, other=0.0,
                     )
-                    chunk = nflows * W * tl.exp(log_val - nmars)
+                    chunk = tl.where((nmars > -float("inf")) & (log_val > -float("inf")) & (nflows != 0.0),
+                                     nflows * W * tl.exp(log_val - nmars), 0.0)
 
                 chunk = tl.where(mask_p, chunk, 0.0)
                 acc += chunk

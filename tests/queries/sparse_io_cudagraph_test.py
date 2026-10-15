@@ -236,19 +236,23 @@ def test_empty_columns(B):
     torch.testing.assert_close(_replay(pc, x2), _eager(pc, x2), rtol=0.0, atol=1e-4)
 
 
-def test_missing_mask_falls_back_to_eager():
-    """Marginalised positions change the patterns' shape on the host: no
-    graph, a one-time warning, and the eager result."""
+def test_missing_mask_replays_device_patterns():
+    """Mask values may change within a fixed query workspace and graph."""
     H, V, T, bs = 64, 20, 6, 16
     pc = _build(H, V, T, bs, 0.3, seed=6)
-    x = torch.randint(0, V, (1, T), device=DEV)
-    mm = torch.zeros(1, T, dtype=torch.bool, device=DEV)
+    x = torch.randint(0, V, (3, T), device=DEV)
+    mm = torch.zeros(3, T, dtype=torch.bool, device=DEV)
     mm[0, 2] = True
     ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
-    with pytest.warns(UserWarning, match="missing_mask"):
-        got = pc(x, missing_mask=mm, record_cudagraph=True).detach().clone()
-    assert not pc._sparse_graphs and pc._sparse_graph_fwd is None
-    torch.testing.assert_close(got, ref, rtol=0.0, atol=0.0)
+    got = pc(x, missing_mask=mm, record_cudagraph=True).detach().clone()
+    state = pc._sparse_graph_fwd
+    assert state.query_masks and state.graph is not None
+    torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
+    mm[:, 1] = True
+    got = pc(x, missing_mask=mm).detach().clone()
+    assert pc._sparse_graph_fwd is state
+    ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
+    torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
 
 
 @pytest.mark.parametrize("B", [1, 5])

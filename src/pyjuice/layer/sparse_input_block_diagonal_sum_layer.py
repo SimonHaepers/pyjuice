@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pyjuice.utils.kernel_launcher import runtime_triton_jit
+
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -291,6 +293,8 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 missing_mask: Optional[torch.Tensor] = None,
                 static_ctx=None,
                 **kwargs) -> None:
+        self._bd_forward_precision = "ieee" if force_use_fp32 else "tf32x3"
+        self._bd_forward_bf16 = force_use_bf16 and not force_use_fp32
         batch_size = node_mars.size(1)
         assert propagation_alg == "LL", (
             "SparseInputBlockDiagonalSumLayer requires propagation_alg == 'LL'."
@@ -401,13 +405,15 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 "SparseInputBlockDiagonalSumLayer: the upstream prod output is "
                 "not a static (CUDA-graph) container."
             )
-            if _bd_dense_batched(B):
+            if static_ctx.query_masks or _bd_dense_batched(B):
+                self._cached_in_offsets[blk_idx] = _DENSE_BATCHED
                 self._dense_block_forward(node_mars, element_mars, params, block, sv_in)
             else:
                 in_offs = self._lookup_in_block_offsets(
                     blk_idx, is_missing=False, data=data, data_list=None,
                     device=node_mars.device, batch_size=B, batched=True,
                 )
+                self._cached_in_offsets[blk_idx] = (in_offs, self._MAX_K_IN_ACTIVE)
                 self._launch_forward(node_mars, params, block, sv_in, in_offs,
                                      sv_in.max_val, self._MAX_K_IN_ACTIVE, B)
 
@@ -526,7 +532,8 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             # fresh [B, K_stride] mirror per call (same as
             # SparseInputSumLayer's batched path).
             if sv_in.is_batched:
-                sv_flow_in = sv_in.like_pattern(torch.empty_like(sv_in.values))
+                sv_flow_in = sv_in.like_pattern(kwargs["static_ctx"].buffer((id(self), "bwd", blk_idx), tuple(sv_in.values.shape))
+                                                  if kwargs.get("static_ctx") is not None else torch.empty_like(sv_in.values))
             else:
                 ws_flow = self._bwd_flow_workspaces[blk_idx]
                 in_dist = self._input_sparsity_dists[blk_idx]
@@ -635,14 +642,7 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 # ======================================================================= #
 
 
-@triton.jit(
-    do_not_specialize=["nid_start", "pid_start", "batch_size", "BS", "CBS",
-                       "v_stride", "offs_stride"],
-    do_not_specialize_on_alignment=[
-        "in_indices_ptr", "in_values_ptr", "in_block_offsets_ptr",
-        "max_val_ptr", "col_starts_ptr",
-    ],
-)
+@runtime_triton_jit
 def _fw_sparse_in_bd_kernel(
     node_mars_ptr, mparams_ptr,
     in_indices_ptr, in_values_ptr, in_block_offsets_ptr, max_val_ptr,
@@ -710,6 +710,10 @@ def _fw_sparse_in_bd_kernel(
                      other=-float("inf"))
     cslot = in_idx - pid_nb * CBS                                                # [MAX_K_IN]
 
+    # Each BD block has its own support. A maximum from a different block
+    # can underflow every contributing child even when this sum is finite.
+    max_val = tl.max(in_val, axis=0)
+    max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
     in_val_lin = tl.where(mask_k, tl.exp(in_val - max_val), 0.0)
 
     # int64 cast on pid_nb: worst-case range analysis on ``pid_nb*BS*CBS``
@@ -734,7 +738,7 @@ def _fw_sparse_in_bd_kernel(
     result = tl.where(
         K_in_j == 0,
         -float("inf"),
-        tl.log(acc + 1e-24) + max_val,
+        tl.log(acc) + max_val,
     )
 
     out_ptr = (nid_start + pid_nb * BS + offs_s).to(tl.int64) * batch_size \
@@ -742,14 +746,7 @@ def _fw_sparse_in_bd_kernel(
     tl.store(node_mars_ptr + out_ptr, result, mask=mask_s)
 
 
-@triton.jit(
-    do_not_specialize=["nid_start", "pid_start", "pfid_start", "batch_size",
-                       "BS", "CBS", "v_stride", "f_stride", "offs_stride"],
-    do_not_specialize_on_alignment=[
-        "flow_in_ptr", "in_indices_ptr", "in_values_ptr",
-        "in_block_offsets_ptr", "pflows_ptr", "col_starts_ptr",
-    ],
-)
+@runtime_triton_jit
 def _bk_sparse_in_bd_kernel(
     flow_in_ptr,
     node_flows_ptr, node_mars_ptr,
