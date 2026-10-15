@@ -408,7 +408,8 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 "SparseInputBlockDiagonalSumLayer: the upstream prod output is "
                 "not a static (CUDA-graph) container."
             )
-            if static_ctx.query_masks or _bd_dense_batched(B):
+            # A masked input variable has all rows active: the dense path.
+            if static_ctx.is_masked(self._input_sparsity_var_ids[blk_idx]) or _bd_dense_batched(B):
                 self._cached_in_offsets[blk_idx] = _DENSE_BATCHED
                 self._dense_block_forward(node_mars, element_mars, params, block, sv_in)
             else:

@@ -408,13 +408,14 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         B = static_ctx.B
         for blk_idx, block in enumerate(self._bd_blocks):
             out_dist = self._output_sparsity_dists[blk_idx]
-            ws = static_ctx.buffer((id(self), "fwd", blk_idx), (B * static_ctx.capacity(out_dist),))
+            out_var = self._output_sparsity_var_ids[blk_idx]
+            ws = static_ctx.buffer((id(self), "fwd", blk_idx), (B * static_ctx.capacity(out_dist, out_var),))
             sv_out = static_ctx.pattern(
-                out_dist, self._output_sparsity_var_ids[blk_idx],
-                self._output_sparsity_num_rows[blk_idx], ws,
+                out_dist, out_var, self._output_sparsity_num_rows[blk_idx], ws,
             )
             self._sparse_outputs[blk_idx] = sv_out
-            if static_ctx.query_masks or _bd_dense_batched(B):
+            # A masked output variable needs all rows: the dense path.
+            if static_ctx.is_masked(out_var) or _bd_dense_batched(B):
                 self._cached_out_offsets[blk_idx] = _DENSE_BATCHED
                 self._dense_block_forward(node_mars, element_mars, params, blk_idx, block, sv_out)
                 continue

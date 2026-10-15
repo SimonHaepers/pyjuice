@@ -436,11 +436,11 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 "(CUDA-graph) container."
             )
             out_dist = self._output_sparsity_dists[blk_idx]
+            out_var = self._output_sparsity_var_ids[blk_idx]
             ws = static_ctx.buffer((id(self), "fwd", blk_idx),
-                                   (B * static_ctx.capacity(out_dist),))
+                                   (B * static_ctx.capacity(out_dist, out_var),))
             sv_out = static_ctx.pattern(
-                out_dist, self._output_sparsity_var_ids[blk_idx],
-                self._output_sparsity_num_rows[blk_idx], ws,
+                out_dist, out_var, self._output_sparsity_num_rows[blk_idx], ws,
             )
             self._sparse_outputs[blk_idx] = sv_out
 
@@ -455,8 +455,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
                        params: torch.Tensor, static_ctx) -> bool:
         """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
         column sizes: the cost guard uses the distribution's average support
-        (all rows for masked queries). The answer is memoised for consistent
-        warmup and capture dispatch."""
+        (all rows for a masked variable). The answer is memoised for
+        consistent warmup and capture dispatch."""
         key = (id(self), blk_idx)
         use = static_ctx.ws_decisions.get(key)
         if use is not None:
@@ -471,8 +471,11 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 in_dist = in_ns.sparse_input_ns.dist
                 out_dist = self._output_sparsity_dists[blk_idx]
                 # Distribution-level average, independent of the capture tokens.
-                avg_in = in_dist._num_nodes if static_ctx.query_masks else in_dist._nnz / in_dist.num_cats
-                avg_out = out_dist._num_nodes if static_ctx.query_masks else out_dist._nnz / out_dist.num_cats
+                out_var = self._output_sparsity_var_ids[blk_idx]
+                avg_in = (in_dist._num_nodes if static_ctx.is_masked(in_ns.var_id)
+                          else in_dist._nnz / in_dist.num_cats)
+                avg_out = (out_dist._num_nodes if static_ctx.is_masked(out_var)
+                           else out_dist._nnz / out_dist.num_cats)
                 pairs = static_ctx.B * avg_in * avg_out
                 use = (static_ctx.B >= _WS_MIN_BATCH
                        and pairs * _WS_COST_RATIO >= group.H_out * group.H_in)

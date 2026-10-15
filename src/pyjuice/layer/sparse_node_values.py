@@ -67,7 +67,8 @@ class SparseNodeValues:
                                    filled on device each replay,
                                    ``total_nnz`` the static bound
                                    ``_max_nnz_per_col`` (or all rows for a
-                                   masked-query profile) and no ``nnz_list``.
+                                   variable the query masks) and no
+                                   ``nnz_list``.
     """
 
     col_start: int

@@ -437,7 +437,7 @@ class CoSparseProdLayer(SparseProdLayer):
         for ns_idx, ns in enumerate(self.nodes):
             self._was_missing[ns_idx] = False
             dist = ns.sparse_input_ns.dist
-            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * static_ctx.capacity(dist),))
+            ws = static_ctx.buffer((id(self), "fwd", ns_idx), (B * static_ctx.capacity(dist, ns.var_id),))
             sv = static_ctx.pattern(dist, ns.var_id, ns.num_nodes, ws)
             sv.max_val = max_ws[ns_idx]
             sum_layer, sum_ns_idx = self._dense_sum_refs[ns_idx]

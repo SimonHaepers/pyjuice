@@ -237,7 +237,8 @@ def test_empty_columns(B):
 
 
 def test_missing_mask_replays_device_patterns():
-    """Mask values may change within a fixed query workspace and graph."""
+    """Mask values may change within a fixed set of masked variables and
+    replay its workspace and graph; a new set gets its own profile."""
     H, V, T, bs = 64, 20, 6, 16
     pc = _build(H, V, T, bs, 0.3, seed=6)
     x = torch.randint(0, V, (3, T), device=DEV)
@@ -246,11 +247,16 @@ def test_missing_mask_replays_device_patterns():
     ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
     got = pc(x, missing_mask=mm, record_cudagraph=True).detach().clone()
     state = pc._sparse_graph_fwd
-    assert state.query_masks and state.graph is not None
+    assert state.masked_vars == {2} and state.graph is not None
     torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
-    mm[:, 1] = True
+    mm[0, 2], mm[1:, 2] = False, True
     got = pc(x, missing_mask=mm).detach().clone()
     assert pc._sparse_graph_fwd is state
+    ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
+    torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
+    mm[:, 1] = True
+    got = pc(x, missing_mask=mm, record_cudagraph=True).detach().clone()
+    assert pc._sparse_graph_fwd.masked_vars == {1, 2} and pc._sparse_graph_fwd is not state
     ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
     torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
 

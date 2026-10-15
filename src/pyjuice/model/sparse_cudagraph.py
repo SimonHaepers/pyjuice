@@ -24,10 +24,12 @@ take part unchanged; a layer that still needs the host patterns opts out via
 ``Layer.graph_unsupported_reason`` and the circuit runs eagerly. See the
 protocol on :class:`pyjuice.layer.Layer`.
 
-One :class:`SparseGraphState` per batch size and execution profile. Observed
-profiles reserve the largest CSC column; masked-query profiles reserve all
-latent rows and append an all-row column to each distribution's indices.
-Tokens and masks are runtime device data. ``device_sparse=True`` uses this
+One :class:`SparseGraphState` per batch size and execution profile. A masked
+query's profile is keyed by the set of variables it marginalises (in any
+sample): only their columns reserve all latent rows (an all-row column is
+appended to the distribution's indices), every other column keeps the
+largest-CSC-column bound, so the query stays sparse away from the masked
+positions. Tokens and mask values are runtime device data. ``device_sparse=True`` uses this
 state without capture; ``record_cudagraph=True`` captures the inner forward.
 Node-flow backward reuses the same patterns and supports separate capture.
 Parameter-flow backward remains eagerly launched. Workspaces and graph
@@ -37,6 +39,7 @@ host-side patterns.
 from __future__ import annotations
 
 
+import itertools
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -52,6 +55,27 @@ _PATTERN_BLOCK_B = 128
 _NUM_WARMUP = 2
 """Eager passes before the capture: the first compiles the Triton kernels and
 allocates every workspace, the second runs the exact captured sequence."""
+
+MAX_MASKED_PROFILES = 8
+"""Masked-query profiles kept per circuit (one per masked-variable set; a
+sweep over query positions creates many). Least recently used go first."""
+
+_STATE_IDS = itertools.count()
+
+
+def masked_vars(missing_mask: Optional[torch.Tensor]) -> Tuple[int, ...]:
+    """Variables a ``[num_vars]`` / ``[B, num_vars]`` mask marginalises in any
+    sample. They fix the columns' capacities, so this reads the mask on the
+    host (one small copy for a CUDA mask)."""
+    if missing_mask is None:
+        return ()
+    mask = missing_mask.detach()
+    if mask.device.type != "cpu":
+        mask = mask.cpu()
+    mask = mask.bool()
+    if mask.dim() == 2:
+        mask = mask.any(dim=0)
+    return tuple(torch.nonzero(mask).flatten().tolist())
 
 
 def graph_unsupported_reason(pc) -> Optional[str]:
@@ -94,10 +118,14 @@ class SparseGraphState:
     the input buffer, the per-``(dist, var)`` column table, every workspace
     the captured layers write, and the graph itself."""
 
-    def __init__(self, pc, B: int, device: torch.device, data_dtype: torch.dtype = torch.long, query_masks: bool = False):
+    def __init__(self, pc, B: int, device: torch.device, data_dtype: torch.dtype = torch.long,
+                 masked_vars: Tuple[int, ...] = ()):
         self.B = B
-        self.query_masks = query_masks
+        self.masked_vars = frozenset(masked_vars)
         self.device = device
+        # Unique for the circuit's lifetime (unlike ``id``), so graphs keyed
+        # by it never match a later state.
+        self.uid = next(_STATE_IDS)
 
         # One slot per (dist, var) column some layer declared it reads, and
         # one row range per layer that accumulates running maxima.
@@ -121,11 +149,13 @@ class SparseGraphState:
 
         self._indices = {id(dist): torch.cat((dist._csc_indices,
                           torch.arange(dist._num_nodes, device=device, dtype=dist._csc_indices.dtype)))
-                         if query_masks else dist._csc_indices
+                         if self.masked_vars else dist._csc_indices
                          for dist, _ in per_dist.values()}
         self.forward_bindings = None
         self.backward_bindings = {}
         self.missing = torch.zeros(pc.num_vars, B, dtype=torch.bool, device=device)
+        self._maskable = torch.zeros(pc.num_vars, 1, dtype=torch.bool, device=device)
+        self._maskable[list(self.masked_vars)] = True
         n_slots = max(len(self._slot_of), 1)
         self.col_starts = torch.zeros(n_slots, B, dtype=torch.int32, device=device)
         self.nnz = torch.zeros(n_slots, B, dtype=torch.int32, device=device)
@@ -194,7 +224,7 @@ class SparseGraphState:
                 values_ws: torch.Tensor) -> SparseNodeValues:
         """Device-described observed or all-row columns in a fixed workspace."""
         s = self.slot(dist, var_id)
-        K = self.capacity(dist)
+        K = self.capacity(dist, var_id)
         return SparseNodeValues(
             col_start=0, total_nnz=K, indices=self._indices[id(dist)],
             values=values_ws[:self.B * K].view(self.B, K), num_rows=num_rows,
@@ -202,8 +232,14 @@ class SparseGraphState:
             static=True,
         )
 
-    def capacity(self, dist) -> int:
-        return dist._num_nodes if self.query_masks else dist._max_nnz_per_col
+    def is_masked(self, var_id: int) -> bool:
+        """Whether this profile lets ``var_id`` be marginalised."""
+        return var_id in self.masked_vars
+
+    def capacity(self, dist, var_id: int) -> int:
+        """Column-size bound of ``(dist, var_id)``: all latent rows for a
+        masked variable, else the largest CSC column."""
+        return dist._num_nodes if var_id in self.masked_vars else dist._max_nnz_per_col
 
     def snapshot_bindings(self):
         # Graph replay updates tensors but does not repeat Python assignments.
@@ -253,8 +289,6 @@ class SparseGraphState:
         if missing_mask is None:
             self.missing.zero_()
         else:
-            if not self.query_masks:
-                raise ValueError("A masked query requires a query workspace")
             mask = missing_mask.to(device=self.device, dtype=torch.bool)
             if mask.dim() == 1:
                 mask = mask[:, None].expand_as(self.missing)
@@ -262,7 +296,9 @@ class SparseGraphState:
                 mask = mask.T
             else:
                 raise ValueError("missing_mask must have shape [num_vars] or [B, num_vars]")
-            self.missing.copy_(mask)
+            # The profile is keyed by this mask's variables, so nothing is
+            # dropped; the AND only keeps every column within its capacity.
+            torch.logical_and(mask, self._maskable, out=self.missing)
         assert tuple(run_data.shape) == tuple(self.data.shape), (
             f"batch of shape {tuple(run_data.shape)} for a graph captured with "
             f"{tuple(self.data.shape)}")

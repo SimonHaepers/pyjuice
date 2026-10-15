@@ -29,7 +29,8 @@ from pyjuice.utils import BitSet
 from .backend import compile_cum_par_flows_fn, compute_cum_par_flows, cum_par_flows_to_device, \
                      compile_par_update_fn, em_par_update, par_update_to_device, \
                      normalize_parameters, eval_top_down_probs
-from .sparse_cudagraph import SparseGraphState, graph_unsupported_reason
+from .sparse_cudagraph import (MAX_MASKED_PROFILES, SparseGraphState, graph_unsupported_reason,
+                               masked_vars)
 
 
 def _pc_model_backward_hook(grad, pc, inputs, record_cudagraph, apply_cudagraph, propagation_alg, **kwargs):
@@ -480,7 +481,7 @@ class TensorCircuit(nn.Module):
                     try:
                         sparse_graph.capture(_sparse_graph_body)
                     except BaseException:
-                        self._sparse_graphs.pop(sparse_graph.key, None)
+                        self._drop_sparse_graph(sparse_graph.key)
                         raise
                 if sparse_replay and sparse_graph.graph is not None:
                     sparse_graph.graph.replay()
@@ -788,7 +789,7 @@ class TensorCircuit(nn.Module):
                          self._graph_options_key({k: v for k, v in kwargs.items()
                              if static_ctx is None or k not in ("missing_mask", "device_sparse", "target_vars")},
                              static_tensors=True),
-                         id(static_ctx))
+                         None if static_ctx is None else static_ctx.uid)
             if record_cudagraph or (apply_cudagraph and signature in self._recorded_cuda_graphs):
                 # The sparse graph state owns its mask; copy the other tensors.
                 inner_kwargs = {**kwargs, **self._graph_static_kwargs(signature, {
@@ -984,20 +985,37 @@ class TensorCircuit(nn.Module):
                 self._warned_sparse_cudagraph = True
             return None
 
-        query_masks = kwargs.get("missing_mask") is not None
+        # A masked query's columns are sized by the variables it masks.
+        masked = masked_vars(kwargs.get("missing_mask"))
         # Preserve the B key for the default observed-token profile.
-        key = B if not query_masks and precision == (False, False) and data_dtype == torch.long else (B, query_masks, precision, data_dtype)
+        key = B if not masked and precision == (False, False) and data_dtype == torch.long else (B, masked, precision, data_dtype)
         state = self._sparse_graphs.get(key)
         if state is not None and not state.matches(self):
             # Parameters were re-allocated (re-init / device move) since the
             # capture: the graph would read stale memory.
-            del self._sparse_graphs[key]
+            self._drop_sparse_graph(key)
             state = None
         if state is None and (record or create):
-            state = SparseGraphState(self, B, self.params.device, data_dtype, query_masks=query_masks)
+            state = SparseGraphState(self, B, self.params.device, data_dtype, masked_vars=masked)
             state.key = key
             self._sparse_graphs[key] = state
+        if state is not None and masked:
+            # Least recently used masked profiles go first.
+            self._sparse_graphs[key] = self._sparse_graphs.pop(key)
+            stale = [k for k, s in self._sparse_graphs.items() if s.masked_vars and k != key]
+            for k in stale[:max(len(stale) + 1 - MAX_MASKED_PROFILES, 0)]:
+                self._drop_sparse_graph(k)
         return state
+
+    def _drop_sparse_graph(self, key) -> None:
+        """Forget a :class:`SparseGraphState` together with the backward
+        graphs captured against its workspaces."""
+        state = self._sparse_graphs.pop(key, None)
+        if state is None:
+            return
+        for sig in [sig for sig in self._recorded_cuda_graphs if sig[0] == 1 and sig[-1] == state.uid]:
+            del self._recorded_cuda_graphs[sig]
+            self._graph_kwargs.pop(sig, None)
 
     def forward_ll(self, *args, **kwargs):
         self.forward(*args, propagation_alg = "LL", **kwargs)
