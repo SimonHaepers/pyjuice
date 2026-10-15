@@ -49,6 +49,8 @@ class BlockedProdLayer(ProdLayer):
     chain yet — it would need an "all H rows" mode of the container.
     """
 
+    supports_permutation_fusion = False
+
     def __init__(self, nodes: Sequence[ProdNodes],
                  global_nid_start: Optional[int] = None,
                  layer_sparsity_tol: Optional[float] = None,

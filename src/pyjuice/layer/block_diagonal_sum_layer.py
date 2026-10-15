@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
+from pyjuice.utils.kernel_launcher import triton_jit
 
 import torch
 import torch.nn as nn
@@ -54,6 +54,8 @@ class BlockDiagonalSumLayer(SumLayer):
     Tied ``SumNodes`` are supported: ``_param_range`` / ``_param_flow_range``
     alias the source's, same protocol as :class:`DenseSumLayer`.
     """
+
+    accepts_input_row_map = True
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
                  global_pid_start: int, global_pfid_start: int,
@@ -251,8 +253,11 @@ class BlockDiagonalSumLayer(SumLayer):
 
         return None
 
-    def _input_row_map(self, block):
+    def set_input_row_map(self, node_idx: int, rows: torch.Tensor) -> None:
         # Registered buffers follow .to(device), including after compilation.
+        self.register_buffer(f"_bd_input_map_{node_idx}", rows.contiguous())
+
+    def _input_row_map(self, block):
         return getattr(self, f"_bd_input_map_{self._bd_blocks.index(block)}", None)
 
     def _dense_forward_block(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
@@ -454,7 +459,7 @@ class BlockDiagonalSumLayer(SumLayer):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    @runtime_triton_jit
+    @triton_jit
     def _fw_bd_kernel(node_mars, element_mars, mparams, input_map, MAP_INPUT: tl.constexpr,
                       batch_size,
                       nid_start, cid_start, pid_start,
@@ -578,7 +583,7 @@ class BlockDiagonalSumLayer(SumLayer):
         )
 
     @staticmethod
-    @runtime_triton_jit
+    @triton_jit
     def _bk_bd_kernel(node_flows, element_flows, node_mars, element_mars,
                       mparams,
                       batch_size,
@@ -765,7 +770,7 @@ class BlockDiagonalSumLayer(SumLayer):
         tl.store(element_flows + out_ptr, acc, mask = mask_batch[None, :])
 
     @staticmethod
-    @runtime_triton_jit
+    @triton_jit
     def _bk_bd_par_kernel(node_flows, node_mars, element_mars, mparams,
                           param_flows,
                           batch_size,

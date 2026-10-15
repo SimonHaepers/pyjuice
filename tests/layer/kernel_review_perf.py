@@ -20,13 +20,24 @@ from pyjuice.queries import conditional
 from pyjuice.queries.conditional import _sparse_categorical_backward
 
 
-def measure(fn, repeats):
+def measure(fn, repeats, setup=None):
+    """Time fn with optional state preparation before every invocation.
+
+    Sparse backward consumes forward metadata. Its setup must run a fresh
+    forward each time; synchronizing before the timer excludes that work.
+    Memory peaks still include the state required by setup.
+    """
     for _ in range(2):
+        if setup is not None:
+            setup()
         fn()
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     wall, submit, gpu = [], [], []
     for _ in range(repeats):
+        if setup is not None:
+            setup()
+            torch.cuda.synchronize()
         start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         t0 = time.perf_counter()
         start.record()

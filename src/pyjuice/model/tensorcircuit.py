@@ -234,6 +234,8 @@ class TensorCircuit(nn.Module):
         # Fixed copies of the batch for the generic forward graphs, keyed like
         # them (inner layers may read the tokens on device).
         self._graph_data: Dict[tuple, torch.Tensor] = dict()
+        # Same for the CUDA-tensor keyword options (see ``_graph_static_kwargs``).
+        self._graph_kwargs: Dict[tuple, Dict[str, torch.Tensor]] = dict()
 
         # Mode for forward and backward pass
         self.default_propagation_alg = "LL" # Could be "LL", "MPE", or "GeneralLL"
@@ -488,7 +490,7 @@ class TensorCircuit(nn.Module):
             else:
                 signature = (0, id(self.node_mars), id(self.element_mars), id(self.params), B,
                              force_use_bf16, force_use_fp32, self._graph_options_key(propagation_alg),
-                             self._graph_options_key(kwargs))
+                             self._graph_options_key(inner_kwargs, static_tensors=True))
                 if (record_cudagraph or apply_cudagraph) and self._graph_reason is not None:
                     if record_cudagraph and not getattr(self, "_warned_sparse_cudagraph", False):
                         warnings.warn("CUDA graphs are not supported for this circuit "
@@ -506,6 +508,8 @@ class TensorCircuit(nn.Module):
                         self._graph_data[signature] = data_buf
                     data_buf.copy_(run_data)
                     self._run_data = data_buf
+                    inner_kwargs = self._graph_static_kwargs(signature, inner_kwargs)
+                    missing_mask_for_prod = inner_kwargs.get("missing_mask", missing_mask_for_prod)
                 if record_cudagraph and signature not in self._recorded_cuda_graphs:
                     # Warmup
                     s = torch.cuda.Stream()
@@ -696,6 +700,7 @@ class TensorCircuit(nn.Module):
             # line "_for_backward=True" below) and the sum-layer backward
             # need to see it so they take the all-rows-at-missing branch.
             missing_mask_for_prod = None if static_ctx is not None else self._host_missing_mask(kwargs.get("missing_mask", None))
+            inner_kwargs = kwargs
 
             # Inner layers
             def _run_inner_layers():
@@ -746,7 +751,7 @@ class TensorCircuit(nn.Module):
                                              param_flows = self.param_flows if compute_param_flows else None,
                                              allow_modify_flows = allow_modify_flows,
                                              propagation_alg = propagation_alg if isinstance(propagation_alg, str) else propagation_alg[layer_id],
-                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, static_ctx = static_ctx, **kwargs)
+                                             logspace_flows = logspace_flows, negate_pflows = negate_pflows, force_use_fp32 = force_use_fp32, static_ctx = static_ctx, **inner_kwargs)
 
                         # Execute post-backward callback
                         layer_group.callback(
@@ -779,8 +784,16 @@ class TensorCircuit(nn.Module):
                          B, allow_modify_flows, logspace_flows, compute_param_flows,
                          negate_pflows, force_use_fp32, self._graph_options_key(propagation_alg),
                          self._graph_options_key({k: v for k, v in kwargs.items()
-                             if static_ctx is None or k not in ("missing_mask", "device_sparse", "target_vars")}),
+                             if static_ctx is None or k not in ("missing_mask", "device_sparse", "target_vars")},
+                             static_tensors=True),
                          id(static_ctx))
+            if record_cudagraph or (apply_cudagraph and signature in self._recorded_cuda_graphs):
+                # The sparse graph state owns its mask; copy the other tensors.
+                inner_kwargs = {**kwargs, **self._graph_static_kwargs(signature, {
+                    k: v for k, v in kwargs.items()
+                    if static_ctx is None or k not in ("missing_mask", "device_sparse", "target_vars")})}
+                if static_ctx is None:
+                    missing_mask_for_prod = inner_kwargs.get("missing_mask", missing_mask_for_prod)
             if record_cudagraph and signature not in self._recorded_cuda_graphs:
                 # Warmup is real execution. Restore accumulated statistics
                 # and the caller's flow seed so capture does not count extra batches.
@@ -872,7 +885,7 @@ class TensorCircuit(nn.Module):
         owner = {ns: layer for group in self.inner_layer_groups for layer in group for ns in layer.nodes}
         for group in self.inner_layer_groups:
             for prod in group:
-                if type(prod) is not ProdLayer:
+                if not (prod.is_prod() and prod.supports_permutation_fusion):
                     continue
                 candidates = []
                 for ns in prod.nodes:
@@ -883,7 +896,7 @@ class TensorCircuit(nn.Module):
                     dst = parents[0]
                     layer = owner.get(dst)
                     if (len(consumers.get(src, [])) != 1
-                            or type(layer) not in (BlockDiagonalSumLayer, SparseOutputBlockDiagonalSumLayer)
+                            or not getattr(layer, "accepts_input_row_map", False)
                             or src.num_nodes != ns.num_nodes):
                         break
                     rows = ns.edge_ids[:, 0].cpu().long()
@@ -892,13 +905,25 @@ class TensorCircuit(nn.Module):
                     candidates.append((layer, layer.nodes.index(dst), rows + src._output_ind_range[0]))
                 else:
                     for layer, idx, rows in candidates:
-                        layer.register_buffer(f"_bd_input_map_{idx}", rows.to(self.params.device).contiguous())
+                        layer.set_input_row_map(idx, rows.to(self.params.device))
                     prod._fused_permutation = bool(candidates)
 
     @staticmethod
-    def _graph_options_key(value):
-        """Hash semantic launch options, including mutable tensor versions."""
+    def _graph_options_key(value, static_tensors: bool = False):
+        """Key a CUDA graph on what its capture baked in from ``value``.
+
+        Captured code reads a CPU tensor on the host, so its contents are
+        baked in and keyed. It can only read a CUDA tensor on device (a host
+        read aborts the capture), so only its address is baked in: with
+        ``static_tensors`` the top-level CUDA tensors of a kwargs dict are
+        replayed from graph-owned copies (``_graph_static_kwargs``) and keyed
+        on shape / dtype; other CUDA tensors are keyed on address + version.
+        """
         if isinstance(value, torch.Tensor):
+            if value.device.type == "cpu":
+                flat = value.detach().reshape(-1).contiguous()
+                return ("cpu-tensor", tuple(value.shape), value.dtype,
+                        flat.view(torch.uint8).numpy().tobytes())
             try:
                 version = value._version
             except RuntimeError:  # tensors created under torch.inference_mode
@@ -906,7 +931,12 @@ class TensorCircuit(nn.Module):
             return ("tensor", value.data_ptr(), tuple(value.shape), tuple(value.stride()),
                     value.dtype, version)
         if isinstance(value, dict):
-            return tuple((k, TensorCircuit._graph_options_key(v)) for k, v in sorted(value.items()))
+            return tuple(
+                (k, ("static", tuple(v.shape), v.dtype, v.device)
+                 if static_tensors and isinstance(v, torch.Tensor) and v.is_cuda
+                 else TensorCircuit._graph_options_key(v))
+                for k, v in sorted(value.items())
+            )
         if isinstance(value, (list, tuple)):
             return tuple(TensorCircuit._graph_options_key(v) for v in value)
         try:
@@ -914,6 +944,21 @@ class TensorCircuit(nn.Module):
         except TypeError:
             return (type(value).__qualname__, id(value))
         return value
+
+    def _graph_static_kwargs(self, signature: tuple, kwargs: dict) -> dict:
+        """``kwargs`` with each top-level CUDA tensor replaced by a graph-owned
+        copy for ``signature``, refreshed on every call. Replays read the
+        pointers they were captured with, so new / updated tensors (e.g. a fresh
+        mask per query) reuse one graph instead of recapturing."""
+        bufs = self._graph_kwargs.setdefault(signature, dict())
+        out = dict(kwargs)
+        for k, v in kwargs.items():
+            if isinstance(v, torch.Tensor) and v.is_cuda:
+                if k not in bufs:
+                    bufs[k] = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+                bufs[k].copy_(v)
+                out[k] = bufs[k]
+        return out
 
     def _sparse_graph_for_call(self, B: int, record: bool, input_layer_fn, propagation_alg,
                                kwargs: dict, custom_buffers: bool,
@@ -1834,10 +1879,9 @@ class TensorCircuit(nn.Module):
                         else:
                             layer_cls = SumLayer
                             extra_kwargs = {}
-                        packed_sum = self.compact_sparse_buffers and layer_cls in (
-                            SparseIOSumLayer, SparseIOBlockDiagonalSumLayer)
-                        scratch_sum = (self.compact_sparse_buffers
-                                       and layer_cls is SparseOutputBlockDiagonalSumLayer)
+                        storage = layer_cls.output_storage if self.compact_sparse_buffers else "dense"
+                        packed_sum = storage == "packed"
+                        scratch_sum = storage == "scratch"
                         output_start = (0 if packed_sum else self.num_dummy_nodes
                                         if scratch_sum else num_nodes)
                         sum_layer = layer_cls(

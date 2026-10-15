@@ -14,7 +14,7 @@ else:
     tlmath = tl.math
 
 from pyjuice.nodes import SumNodes
-from pyjuice.utils.kernel_launcher import triton_jit, runtime_triton_jit
+from pyjuice.utils.kernel_launcher import triton_jit
 from .layer import Layer
 from .sum_layer import SumLayer
 
@@ -749,7 +749,7 @@ class DenseSumLayer(SumLayer):
         tl.store(max_ptr, emars_max, mask = mask_batch)
 
     @staticmethod
-    @runtime_triton_jit
+    @triton_jit
     def _bk_triton_dense_modify_flow_kernel(node_flows, node_mars,
                                             nid_start,
                                             batch_size: tl.constexpr,

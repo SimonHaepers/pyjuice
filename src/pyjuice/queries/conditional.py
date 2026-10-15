@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 import torch
 import triton
@@ -24,7 +23,7 @@ from pyjuice.nodes.distributions.external_categorical import _condition_apply_ll
 
 ## Categorical layer ##
 
-@runtime_triton_jit
+@triton.jit
 def _soft_evi_categorical_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, node_nchs_ptr, local_ids,
                                     sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
                                     batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -128,7 +127,7 @@ def _external_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.
     layer.forward(data = inputs, node_mars = node_mars, missing_mask = missing_mask, **kwargs)
 
 
-@runtime_triton_jit
+@triton.jit
 def _soft_evi_discrete_logistic_fw_kernel(data_ptr, node_mars_ptr, params_ptr, vids_ptr, psids_ptr, s_mids_ptr, metadata_ptr, 
                                           local_ids, sid: tl.constexpr, num_nodes: tl.constexpr, num_cats: tl.constexpr, 
                                           batch_size: tl.constexpr, partial: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -240,7 +239,7 @@ def _discrete_logistic_forward(layer, inputs: torch.Tensor, node_mars: torch.Ten
     return None
 
 
-@runtime_triton_jit
+@triton.jit
 def _categorical_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                  node_nchs_ptr, params_ptr, sid, eid, num_target_nodes, batch_size: tl.constexpr, 
                                  num_cats: tl.constexpr, partial_eval: tl.constexpr, BLOCK_SIZE: tl.constexpr):
@@ -373,7 +372,7 @@ def _external_categorical_backward(layer, inputs: torch.Tensor, node_flows: torc
 
     return cat_probs
 
-@runtime_triton_jit
+@triton.jit
 def _discrete_logistic_backward_kernel(cat_probs_ptr, node_flows_ptr, local_ids_ptr, rev_vars_mapping_ptr, vids_ptr, psids_ptr, 
                                        msids_ptr, metadata_ptr, params_ptr, sid, eid, num_target_nodes, 
                                        batch_size: tl.constexpr, num_cats: tl.constexpr, partial_eval: tl.constexpr, 
@@ -510,7 +509,13 @@ def _sparse_categorical_forward(layer, inputs: torch.Tensor, node_mars: torch.Te
     return None
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["vid_out", "node_offset", "param_base",
+                        "batch_size", "num_cats"],
+    do_not_specialize_on_alignment=["cat_probs_ptr", "node_flows_ptr",
+                                     "params_ptr", "csc_indptr_ptr",
+                                     "csc_indices_ptr"],
+)
 def _sparse_categorical_cond_backward_kernel(
     cat_probs_ptr, node_flows_ptr, params_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -551,7 +556,13 @@ def _sparse_categorical_cond_backward_kernel(
     tl.atomic_add(cat_probs_ptr + cat_offs, contrib_sum, mask = mask_b)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["vid_out", "param_base", "num_cats", "batch_size", "value_stride"],
+    do_not_specialize_on_alignment=["cat_probs_ptr", "sv_indices_ptr",
+                                     "sv_values_ptr", "params_ptr",
+                                     "csr_indptr_ptr", "csr_cols_ptr",
+                                     "csr_to_csc_ptr", "col_starts_ptr", "nnz_ptr"],
+)
 def _sparse_categorical_cond_backward_sparse_kernel(
     cat_probs_ptr, sv_indices_ptr, sv_values_ptr, params_ptr,
     csr_indptr_ptr, csr_cols_ptr, csr_to_csc_ptr, col_starts_ptr, nnz_ptr,

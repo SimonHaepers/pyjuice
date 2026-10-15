@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 import hashlib
 import weakref
@@ -184,7 +183,7 @@ def _bd_dense_batched(batch_size: int) -> bool:
     return mode == "always" or batch_size >= _sparse_io._WS_MIN_BATCH
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["row_start", "batch_size", "v_stride"])
 def _sv_dense_rows_kernel(dense_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
                           row_map_ptr, row_start, batch_size, v_stride,
                           TO_DENSE: tl.constexpr, HAS_ROW_MAP: tl.constexpr,
@@ -265,6 +264,10 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
       :func:`torch.searchsorted` — no host-side sort, no preprocessing
       kernel.
     """
+
+    output_storage = "packed"
+    accepts_input_row_map = False
+    graph_host_state = ("_sparse_outputs", "_sparse_flows", "_cached_in_offsets", "_cached_out_offsets")
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
                  global_pid_start: int, global_pfid_start: int,
@@ -747,7 +750,14 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 # ======================================================================= #
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["pid_start"],
+    do_not_specialize_on_alignment=[
+        "in_indices_ptr", "in_values_ptr", "max_val_ptr",
+        "in_block_offsets_ptr", "out_indices_ptr",
+        "out_block_offsets_ptr", "out_values_ptr",
+    ],
+)
 def _fw_bd_sparse_io_kernel(
     out_values_ptr,
     mparams_ptr,
@@ -837,7 +847,15 @@ def _fw_bd_sparse_io_kernel(
     tl.store(out_values_ptr + out_s + offs_m, result, mask=mask_m)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["pid_start", "pfid_start"],
+    do_not_specialize_on_alignment=[
+        "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
+        "in_indices_ptr", "in_values_ptr", "in_block_offsets_ptr",
+        "out_indices_ptr", "out_block_offsets_ptr",
+        "pflows_ptr",
+    ],
+)
 def _bk_bd_sparse_io_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,

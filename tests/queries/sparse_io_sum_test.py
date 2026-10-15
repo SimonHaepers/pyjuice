@@ -323,10 +323,8 @@ def test_sparse_io_chain_conditional_matches_plain(T, H, V, bs):
     torch.testing.assert_close(out_sparse, out_plain, rtol=1e-3, atol=1e-4)
 
 
-def test_sparse_io_chain_conditional_b_gt_1_rejected():
-    """Conditional queries on the sparse chain stay B=1-only: the sparse-flow
-    conditional backward asserts batch_size == 1, and the batched training
-    path must not silently change that."""
+def test_sparse_io_chain_conditional_b_gt_1_matches_plain():
+    """Batched conditional queries match the plain circuit and B=1 calls."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     import pyjuice.queries as queries
@@ -342,10 +340,22 @@ def test_sparse_io_chain_conditional_b_gt_1_rejected():
     )
     pc_sparse = juice.TensorCircuit(root_sparse, verbose=False).to(device)
 
+    torch.manual_seed(11)
+    root_plain = _build_plain(T, H, V, bs, csc_indptr, csc_indices, csc_values)
+    pc_plain = juice.TensorCircuit(root_plain, verbose=False).to(device)
+    pc_sparse.params.data.copy_(pc_plain.params.data)
+
     torch.manual_seed(0)
     data = torch.randint(0, V, (3, T), device=device)
-    with pytest.raises(AssertionError, match="batch_size == 1"):
-        queries.conditional(pc_sparse, data=data, target_vars=list(range(T)))
+    target_vars = list(range(T))
+    actual = queries.conditional(pc_sparse, data=data, target_vars=target_vars)
+    expected = queries.conditional(pc_plain, data=data, target_vars=target_vars)
+    per_sample = torch.cat([
+        queries.conditional(pc_sparse, data=data[b:b + 1], target_vars=target_vars)
+        for b in range(data.size(0))
+    ], dim=0)
+    torch.testing.assert_close(actual, expected, rtol=1e-3, atol=1e-4)
+    torch.testing.assert_close(actual, per_sample, rtol=1e-3, atol=1e-4)
 
 
 if __name__ == "__main__":
@@ -358,5 +368,5 @@ if __name__ == "__main__":
     for params in [(4, 8, 4, 4), (5, 16, 8, 8)]:
         test_sparse_io_chain_conditional_matches_plain(*params)
         print(f"ok conditional: {params}")
-    test_sparse_io_chain_conditional_b_gt_1_rejected()
-    print("ok conditional B>1 rejected")
+    test_sparse_io_chain_conditional_b_gt_1_matches_plain()
+    print("ok conditional B>1 matches plain")

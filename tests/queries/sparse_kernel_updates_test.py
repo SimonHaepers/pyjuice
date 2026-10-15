@@ -1,7 +1,4 @@
 """Regression coverage for device patterns, query backward and Monarch fusion."""
-import importlib
-import inspect
-
 import pytest
 import torch
 import triton
@@ -9,40 +6,7 @@ import triton
 import pyjuice as juice
 from pyjuice.queries import conditional
 from pyjuice.queries.conditional import _conditional_fw_input_fn
-from pyjuice.structures import SparseMonarchHMM, random_emission_csc
-from pyjuice.utils.kernel_launcher import STABLE_BUFFER_POINTERS
-
-MODULES = (
-    'layer.block_diagonal_sum_layer', 'layer.sparse_input_sum_layer',
-    'layer.sparse_io_sum_layer', 'layer.sparse_io_block_diagonal_sum_layer',
-    'layer.sparse_input_block_diagonal_sum_layer', 'layer.sparse_output_block_diagonal_sum_layer',
-    'layer.sparse_prod_layer', 'layer.co_sparse_prod_layer',
-    'nodes.distributions.sparse_categorical', 'model.sparse_cudagraph', 'queries.conditional',
-)
-
-
-def test_runtime_specialization_contract():
-    """CPU-only: every runtime argument follows the same policy."""
-    count = 0
-    for name in MODULES:
-        module = importlib.import_module('pyjuice.' + name)
-        objects = list(vars(module).values())
-        for obj in list(objects):
-            if inspect.isclass(obj) and obj.__module__ == module.__name__:
-                objects.extend(vars(obj).values())
-        for obj in objects:
-            if isinstance(obj, staticmethod):
-                obj = obj.__func__
-            if isinstance(obj, triton.runtime.JITFunction) and obj.__module__ == module.__name__:
-                for arg in obj.params:
-                    if arg.name in ("batch_size", "B"):
-                        assert arg.is_constexpr, (name, obj.__name__, arg.name)
-                    if not arg.is_constexpr:
-                        dynamic = arg.name not in STABLE_BUFFER_POINTERS
-                        assert arg.do_not_specialize == dynamic, (name, obj.__name__, arg.name)
-                        assert arg.do_not_specialize_on_alignment == dynamic, (name, obj.__name__, arg.name)
-                count += 1
-    assert count > 25
+from pyjuice.structures import SparseHMM, SparseMonarchHMM, random_emission_csc
 
 
 def build(fuse=True, H=64, T=4, V=11, bs=8):
@@ -129,6 +93,38 @@ def test_new_tokens_do_not_add_sparse_kernel_variants(monkeypatch, B):
         x.fill_(token)
         mask[:, token % 4] = ~mask[:, token % 4]
         conditional(pc, x, missing_mask=mask, allow_modify_flows=False, apply_cudagraph=False)
+
+
+@pytest.mark.parametrize('structure', ['SparseHMM', 'SparseMonarchHMM'])
+@pytest.mark.parametrize('B', [1, 3])
+def test_new_tokens_do_not_recompile_plain_passes(monkeypatch, structure, B):
+    # Eager forward + param-flow backward on observed tokens: the per-token
+    # column offsets, support sizes and CSC-index views change every call,
+    # so none of them may be specialized on.
+    import triton.runtime.jit as jit
+    H, T, V = 64, 4, 11
+    indptr, indices, values, _ = random_emission_csc(H, V, 0.5, seed=718)
+    torch.manual_seed(123)
+    if structure == 'SparseHMM':
+        root = SparseHMM(T, H, V, indptr, indices, values, block_size=8)
+    else:
+        root = SparseMonarchHMM(T, H, V, indptr, indices, values, block_size=8,
+                                output_permutation=True)
+    root.init_parameters()
+    pc = juice.TensorCircuit(root, verbose=False).to(torch.device('cuda:0'))
+    g = torch.Generator().manual_seed(5)
+    def step():
+        x = torch.randint(0, V, (B, T), generator=g).to('cuda:0')
+        pc.init_param_flows(flows_memory=0.0)
+        pc(x, apply_cudagraph=False)
+        pc.backward(x, compute_param_flows=True, logspace_flows=False,
+                    allow_modify_flows=False, apply_cudagraph=False)
+    step()
+    def reject(*args, **kwargs):
+        raise AssertionError('Unexpected compilation for a new token')
+    monkeypatch.setattr(jit.JITFunction, '_do_compile', reject)
+    for _ in range(12):
+        step()
 
 
 def test_bd_sparse_input_uses_block_local_maximum():

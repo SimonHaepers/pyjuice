@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 import torch
 import triton
@@ -639,7 +638,7 @@ class SparseCategorical(Distribution):
 # =====================================================================
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_forward_kernel(
     data_ptr, node_mars_ptr, params_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -670,7 +669,7 @@ def _sparse_cat_forward_kernel(
     tl.store(node_mars_ptr + mars_offs, log_val, mask = slot_mask)
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_backward_kernel(
     data_ptr, node_flows_ptr, param_flows_ptr,
     csc_indptr_ptr, csc_indices_ptr,
@@ -703,7 +702,9 @@ def _sparse_cat_backward_kernel(
     tl.atomic_add(param_flows_ptr + pflow_base + slot_idx, flow, mask = slot_mask)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize = ["pflow_base", "total_nnz", "batch_size", "v_stride"],
+)
 def _sparse_cat_backward_sparse_kernel(
     values_ptr,
     param_flows_ptr,
@@ -755,7 +756,7 @@ def _sparse_cat_backward_sparse_kernel(
         tl.atomic_add(param_flows_ptr + pflow_base + offs, flow, mask = mask)
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_em_row_sum_kernel(
     params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, pflow_base, nnz,
@@ -782,7 +783,7 @@ def _sparse_cat_em_row_sum_kernel(
     tl.atomic_add(row_sums_ptr + row_id, contribution, mask = mask)
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_em_update_kernel(
     params_ptr, param_flows_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, pflow_base, nnz,
@@ -811,7 +812,7 @@ def _sparse_cat_em_update_kernel(
     tl.store(params_ptr + param_base + offs, new_param, mask = mask)
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_partition_accum_kernel(
     params_ptr, csc_indices_ptr, row_sums_ptr,
     param_base, nnz,
@@ -826,7 +827,7 @@ def _sparse_cat_partition_accum_kernel(
     tl.atomic_add(row_sums_ptr + row_id, val, mask = mask)
 
 
-@runtime_triton_jit
+@triton.jit
 def _sparse_cat_partition_write_kernel(
     node_mars_ptr, row_sums_ptr,
     node_offset, H,

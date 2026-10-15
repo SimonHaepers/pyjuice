@@ -27,6 +27,11 @@ from .compilation import next_power_of_2, get_prod_layer_stats, prod_layer_forwa
 
 class ProdLayer(Layer, nn.Module):
 
+    # Whether a layer of one-child products is a plain gather that a
+    # consumer with ``accepts_input_row_map`` may absorb (compile-time
+    # protocol, see ``TensorCircuit._init_permutation_fusion``).
+    supports_permutation_fusion = True
+
     def __init__(self, nodes: Sequence[ProdNodes], global_nid_start: Optional[int] = None, 
                  layer_sparsity_tol: Optional[float] = None, max_num_partitions: Optional[int] = None, 
                  disable_gpu_compilation: bool = False, force_gpu_compilation: bool = False,

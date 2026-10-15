@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 import os
 import warnings
@@ -118,6 +117,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
     (:class:`SparseIOBlockDiagonalSumLayer`), atomic_add into the canonical
     ``[NB, NB_ch, cbs, bs]`` flat pflow buffer.
     """
+
+    output_storage = "packed"
+    graph_host_state = ("_sparse_outputs", "_sparse_flows")
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
                  global_pid_start: int, global_pfid_start: int,
@@ -1046,7 +1048,16 @@ def build_ws_groups(inner_layer_groups) -> List[_WSGroup]:
 # Keep the logsumexp math in sync with the sibling kernels.
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["pid_start", "K_in", "K_out", "batch_size",
+                       "in_stride", "out_stride"],
+    do_not_specialize_on_alignment=[
+        "in_indices_ptr", "in_values_ptr", "max_val_ptr",
+        "out_indices_ptr", "values_out_ptr",
+        "in_col_starts_ptr", "in_nnz_ptr",
+        "out_col_starts_ptr", "out_nnz_ptr",
+    ],
+)
 def _sparse_io_sum_forward_kernel(
     values_out_ptr,
     mparams_ptr,
@@ -1215,7 +1226,18 @@ def _sparse_io_sum_forward_kernel(
         tl.store(values_out_ptr + offs_m, result, mask=mask_m)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["pid_start", "pfid_start", "K_out", "batch_size",
+                       "in_stride", "flow_out_stride", "out_stride",
+                       "flow_in_stride"],
+    do_not_specialize_on_alignment=[
+        "flow_in_ptr", "sv_flow_out_ptr", "sv_out_values_ptr",
+        "in_indices_ptr", "in_values_ptr", "out_indices_ptr",
+        "pflows_ptr",
+        "in_col_starts_ptr", "in_nnz_ptr",
+        "out_col_starts_ptr", "out_nnz_ptr",
+    ],
+)
 def _sparse_io_sum_backward_kernel(
     flow_in_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,
@@ -1389,7 +1411,7 @@ def _sparse_io_sum_backward_kernel(
 # =====================================================================
 
 
-@runtime_triton_jit
+@triton.jit
 def _ws_round_tf32(x):
     """Round non-negative finite fp32 to the nearest tf32 value (10-bit
     mantissa). Tensor cores drop the 13 low mantissa bits of fp32 operands;
@@ -1401,7 +1423,7 @@ def _ws_round_tf32(x):
     return xi.to(tl.float32, bitcast=True)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["src_start", "n"])
 def _ws_round_copy_kernel(dst_ptr, src_ptr, src_start, n, BLOCK: tl.constexpr):
     """``dst[i] = round_tf32(src[src_start + i])`` — the per-pass W copy."""
     offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
@@ -1410,7 +1432,7 @@ def _ws_round_copy_kernel(dst_ptr, src_ptr, src_start, n, BLOCK: tl.constexpr):
     tl.store(dst_ptr + offs, _ws_round_tf32(x), mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["v_stride", "dst_stride_b", "dst_stride_r", "dst_off"])
 def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
                          v_stride, dst_stride_b, dst_stride_r, dst_off,
                          BLOCK: tl.constexpr, ROUND: tl.constexpr):
@@ -1431,7 +1453,7 @@ def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
              mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["out_stride"])
 def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
                       BLOCK: tl.constexpr):
     """``out[b, k] = src[b, indices[col_starts[b] + k]]`` for ``k < nnz[b]``."""
@@ -1443,7 +1465,7 @@ def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
     tl.store(out_ptr + b * out_stride + k, v, mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["w_start", "B"])
 def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_out,
                    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                    TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
@@ -1488,7 +1510,7 @@ def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_
              mask=mask_b[:, None])
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["flow_stride", "mars_stride", "gt_ld", "gt_off"])
 def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr, kin_ptr,
                          cs_ptr, nnz_ptr, flow_stride, mars_stride, H_out, gt_ld, gt_off,
                          BLOCK: tl.constexpr, ROUND: tl.constexpr, WRITE_T: tl.constexpr):
@@ -1515,7 +1537,7 @@ def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr,
         tl.store(gt_ptr + gt_off + h * gt_ld + b, g, mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["w_start", "B"])
 def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, w_start, B, H_in, H_out,
                         NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                         TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr,
@@ -1548,7 +1570,7 @@ def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, w_start, B, H_in, H_out,
              mask=mask_b[:, None])
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["v_stride", "out_stride"])
 def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
                            v_stride, out_stride, H_in, BLOCK: tl.constexpr):
     """``flow_in[b, k] = exp(in[b, k] - max_b) * fd[b, indices[cs[b] + k]]``."""
@@ -1562,7 +1584,7 @@ def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, n
     tl.store(out_ptr + b * out_stride + k, tl.exp(v - mx) * f, mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["r0", "pid_start", "pfid_start"])
 def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H_in,
                               NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                               TM: tl.constexpr, TK: tl.constexpr, NEGATE: tl.constexpr):

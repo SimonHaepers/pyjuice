@@ -35,6 +35,25 @@ class SumLayer(Layer, nn.Module):
     PYTORCH = 2
     STR2MODE = {"block_sparse": 0, "sparse": 1, "pytorch": 2}
 
+    # Compile-time storage protocol, queried by ``TensorCircuit`` when
+    # ``compact_sparse_buffers`` is on:
+    #   "dense"   -- one persistent ``node_mars`` / ``node_flows`` row per node;
+    #   "packed"  -- outputs live only in the layer's own sparse containers,
+    #                so its nodes get no rows;
+    #   "scratch" -- rows are only read inside this layer's own forward /
+    #                backward, so all such layers share one transient arena.
+    output_storage = "dense"
+
+    # Whether the layer can read its children through a row map
+    # (:meth:`set_input_row_map`), which lets the compiler fold a pure
+    # permutation product feeding it into the layer itself.
+    accepts_input_row_map = False
+
+    def set_input_row_map(self, node_idx: int, rows: torch.Tensor) -> None:
+        """Read the children of ``self.nodes[node_idx]`` from ``node_mars``
+        rows ``rows`` (one per child) instead of from ``element_mars``."""
+        raise NotImplementedError(f"{type(self).__name__} does not accept input row maps.")
+
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int, 
                  global_pid_start: int, global_pfid_start: int, node2tiednodes: dict(),
                  layer_sparsity_tol: Optional[float] = None, 

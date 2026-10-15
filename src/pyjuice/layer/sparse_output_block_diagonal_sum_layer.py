@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import List, Optional, Sequence
 
@@ -73,6 +72,9 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
       * Single child group per sum node.
       * ``propagation_alg == 'LL'``.
     """
+
+    output_storage = "scratch"
+    graph_host_state = ("_sparse_outputs", "_sparse_flows", "_cached_out_offsets")
 
     def __init__(self, nodes: Sequence[SumNodes], global_nid_start: int,
                  global_pid_start: int, global_pfid_start: int,
@@ -612,7 +614,14 @@ class SparseOutputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
 # ======================================================================= #
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["cid_start", "pid_start", "batch_size", "BS", "CBS",
+                       "v_stride", "offs_stride"],
+    do_not_specialize_on_alignment=[
+        "out_values_ptr", "out_indices_ptr", "out_slots_ptr",
+        "out_block_offsets_ptr", "out_col_starts_ptr",
+    ],
+)
 def _fw_bd_sparse_out_kernel(
     out_values_ptr,
     element_mars_ptr, mparams_ptr,
@@ -716,7 +725,15 @@ def _fw_bd_sparse_out_kernel(
     tl.store(out_values_ptr + val_col + slot, result, mask=mask_m)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["cid_start", "pid_start", "pfid_start", "batch_size",
+                       "BS", "CBS", "v_stride", "f_stride", "offs_stride"],
+    do_not_specialize_on_alignment=[
+        "sv_flow_out_ptr", "sv_out_values_ptr", "out_indices_ptr",
+        "out_slots_ptr", "out_block_offsets_ptr", "out_col_starts_ptr",
+        "pflows_ptr",
+    ],
+)
 def _bk_bd_sparse_out_kernel(
     element_flows_ptr, element_mars_ptr,
     sv_flow_out_ptr, sv_out_values_ptr,

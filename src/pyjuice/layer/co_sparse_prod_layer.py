@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import List, Optional, Sequence, Tuple
 
@@ -21,7 +20,10 @@ _CO_BATCHED_BLOCK_B = 8
 only trades program count against register pressure."""
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["param_offset", "n", "batch_size", "in_stride",
+                       "out_stride"],
+)
 def _co_sparse_log_add_kernel(
     out_ptr, params_ptr, dense_values_ptr, max_out_ptr,
     col_starts_ptr, nnz_ptr,

@@ -36,7 +36,6 @@ host-side patterns.
 """
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -66,7 +65,7 @@ def graph_unsupported_reason(pc) -> Optional[str]:
     return None
 
 
-@runtime_triton_jit
+@triton.jit(do_not_specialize=["B", "num_cats"])
 def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_ptr,
                            B, num_cats, missing_ptr, nnz_total, num_rows, BLOCK_B: tl.constexpr):
     """``col_starts[slot, b] = indptr[tok]``, ``nnz[slot, b] = indptr[tok + 1] -
@@ -209,10 +208,8 @@ class SparseGraphState:
     def snapshot_bindings(self):
         # Graph replay updates tensors but does not repeat Python assignments.
         # Restore the containers/caches belonging to this execution profile.
-        names = ("_sparse_outputs", "_sparse_flows", "_cached_in_offsets",
-                 "_cached_out_offsets", "_was_missing")
         return [(layer, name, list(getattr(layer, name)))
-                for layer in self._layers for name in names if hasattr(layer, name)]
+                for layer in self._layers for name in getattr(layer, "graph_host_state", ())]
 
     @staticmethod
     def restore_bindings(bindings):

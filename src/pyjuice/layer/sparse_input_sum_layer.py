@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import List, Optional, Sequence, Tuple
 
@@ -442,7 +441,11 @@ class SparseInputSumLayer(DenseSumLayer):
 # =====================================================================
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["nid_start", "pid_start", "total_nnz", "v_stride"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr", "max_val_ptr",
+                                     "col_starts_ptr", "nnz_ptr"],
+)
 def _sparse_input_sum_forward_kernel(
     node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, max_val_ptr,
@@ -581,7 +584,10 @@ def _sparse_input_sum_forward_kernel(
         tl.store(node_mars_ptr + off_nid * batch_size, result)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["nid_start", "cid_start", "pid_start"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr"],
+)
 def _sparse_input_sum_backward_kernel(
     node_flows_ptr, node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, element_flows_ptr,
@@ -637,7 +643,14 @@ def _sparse_input_sum_backward_kernel(
     )
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["nid_start", "pid_start", "pfid_start", "v_stride",
+                       "f_stride"],
+    do_not_specialize_on_alignment=[
+        "indices_ptr", "values_ptr", "flow_out_ptr", "pflows_ptr",
+        "col_starts_ptr", "nnz_ptr",
+    ],
+)
 def _sparse_input_sum_backward_sv_kernel(
     node_flows_ptr, node_mars_ptr, mparams_ptr,
     indices_ptr, values_ptr, flow_out_ptr,

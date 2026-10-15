@@ -123,6 +123,12 @@ class Layer():
         at the start of every replay) this layer accumulates into."""
         return 0
 
+    # Host-side attributes the forward reassigns per pass (e.g. the lists of
+    # sparse containers its backward reads). A replay does not run that
+    # Python code, so the graph state snapshots these after an eager pass of
+    # a profile and restores them after every replay of it.
+    graph_host_state: Tuple[str, ...] = ()
+
     def graph_rebind_outputs(self, static_ctx, data_cpu, data_list, pattern_cache) -> None:
         """After a replay, before an eager backward: rebuild whatever
         host-side state that backward reads from this layer's forward."""

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pyjuice.utils.kernel_launcher import runtime_triton_jit
 
 from typing import List, Optional, Sequence
 
@@ -54,6 +53,9 @@ class SparseProdLayer(ProdLayer):
     Forward requires ``data`` (per-variable observed tokens) — pass it through
     as a ``data=...`` kwarg on ``layer_group(...)``.
     """
+
+    supports_permutation_fusion = False
+    graph_host_state = ("_sparse_outputs", "_sparse_flows", "_was_missing")
 
     def __init__(self, nodes: Sequence[ProdNodes],
                  global_nid_start: Optional[int] = None,
@@ -622,7 +624,12 @@ class SparseProdLayer(ProdLayer):
 # =====================================================================
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["num_rows", "total_nnz", "batch_size", "v_stride"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_ptr",
+                                     "dense_ch_lookup_ptr", "col_starts_ptr",
+                                     "nnz_ptr"],
+)
 def _sparse_prod_scatter_flow_kernel(
     node_flows_ptr, dense_ch_lookup_ptr,
     indices_ptr, values_ptr,
@@ -668,7 +675,13 @@ def _sparse_prod_scatter_flow_kernel(
             tl.store(node_flows_ptr + nid * batch_size, v, mask=mask)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["param_base", "num_rows", "total_nnz", "batch_size",
+                       "v_stride"],
+    do_not_specialize_on_alignment=["indices_ptr", "values_out_ptr",
+                                     "dense_ch_lookup_ptr", "col_starts_ptr",
+                                     "nnz_ptr", "max_out_ptr"],
+)
 def _sparse_prod_forward_kernel(
     params_ptr, node_mars_ptr, dense_ch_lookup_ptr,
     indices_ptr,
@@ -775,7 +788,11 @@ def _sparse_prod_forward_kernel(
         tl.atomic_max(max_out_ptr, tile_max)
 
 
-@runtime_triton_jit
+@triton.jit(
+    do_not_specialize=["out_base", "batch_size", "v_stride"],
+    do_not_specialize_on_alignment=["values_ptr", "indices_ptr", "col_starts_ptr",
+                                     "nnz_ptr"],
+)
 def _static_scatter_kernel(out_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
                            out_base, batch_size, v_stride, BLOCK: tl.constexpr):
     """``out[out_base + indices[col_starts[b] + k], b] = values[b, k]`` for

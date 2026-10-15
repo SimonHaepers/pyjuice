@@ -197,8 +197,7 @@ def test_sparse_input_sum_backward_b1_equivalence():
 
 def test_sparse_input_sum_b_gt_1_batched():
     """B>1 runs on the batched sparse fast path: the batched forward must
-    match a python loop of B single-sample calls. ``missing_mask`` stays
-    B=1-only and must still raise at B>1."""
+    match a python loop of B single-sample calls, including missing evidence."""
     device = torch.device("cuda:0")
     T, H, V, bs = 4, 8, 16, 4
     B = 4
@@ -218,8 +217,11 @@ def test_sparse_input_sum_b_gt_1_batched():
 
     missing_mask = torch.zeros(T, dtype=torch.bool, device=device)
     missing_mask[1] = True
-    with pytest.raises(AssertionError, match="batch_size == 1"):
-        pc(data, missing_mask=missing_mask)
+    masked = pc(data, missing_mask=missing_mask)
+    masked_loop = torch.cat([
+        pc(data[b:b + 1], missing_mask=missing_mask) for b in range(B)
+    ], dim=0)
+    torch.testing.assert_close(masked, masked_loop, rtol=1e-5, atol=1e-6)
 
 
 def test_sparse_prod_skip_scatter_when_all_consumers_sparse():
