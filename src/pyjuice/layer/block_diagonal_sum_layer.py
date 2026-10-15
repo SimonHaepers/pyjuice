@@ -244,38 +244,44 @@ class BlockDiagonalSumLayer(SumLayer):
         batch_size = node_mars.size(1)
 
         for block in self._bd_blocks:
-            nid_start, cid_start, pid_start, _pfid_start, NB, bs, cbs = block
-
-            CBS_PADDED = triton.next_power_of_2(cbs)
-            BS_PADDED = triton.next_power_of_2(bs)
-            BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
-            if BLOCK_B < 1:
-                BLOCK_B = 1
-
-            # Grid: one program per (parent_block, batch_tile). The
-            # forward kernel handles all ``bs`` parent rows in the block
-            # within a single program because per-block compute is small
-            # (BS_PADDED * CBS_PADDED weights) and reusing the linearised
-            # ``emars_lin`` across all parents in the block is the main
-            # arithmetic win over the general path.
-            grid = (NB, triton.cdiv(batch_size, BLOCK_B))
-
-            self._fw_bd_kernel[grid](
-                node_mars = node_mars,
-                element_mars = element_mars,
-                mparams = params,
-                batch_size = batch_size,
-                nid_start = nid_start,
-                cid_start = cid_start,
-                pid_start = pid_start,
-                BS = bs,
-                CBS = cbs,
-                BS_PADDED = BS_PADDED,
-                CBS_PADDED = CBS_PADDED,
-                BLOCK_B = BLOCK_B,
-            )
+            self._dense_forward_block(node_mars, element_mars, params, block, batch_size)
 
         return None
+
+    def _dense_forward_block(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                             params: torch.Tensor, block: tuple, batch_size: int) -> None:
+        """Forward of one block over every parent / child row (also the dense
+        batched path of the sparse BD subclasses, on densified rows)."""
+        nid_start, cid_start, pid_start, _pfid_start, NB, bs, cbs = block
+
+        CBS_PADDED = triton.next_power_of_2(cbs)
+        BS_PADDED = triton.next_power_of_2(bs)
+        BLOCK_B = min(triton.next_power_of_2(batch_size), 64)
+        if BLOCK_B < 1:
+            BLOCK_B = 1
+
+        # Grid: one program per (parent_block, batch_tile). The
+        # forward kernel handles all ``bs`` parent rows in the block
+        # within a single program because per-block compute is small
+        # (BS_PADDED * CBS_PADDED weights) and reusing the linearised
+        # ``emars_lin`` across all parents in the block is the main
+        # arithmetic win over the general path.
+        grid = (NB, triton.cdiv(batch_size, BLOCK_B))
+
+        self._fw_bd_kernel[grid](
+            node_mars = node_mars,
+            element_mars = element_mars,
+            mparams = params,
+            batch_size = batch_size,
+            nid_start = nid_start,
+            cid_start = cid_start,
+            pid_start = pid_start,
+            BS = bs,
+            CBS = cbs,
+            BS_PADDED = BS_PADDED,
+            CBS_PADDED = CBS_PADDED,
+            BLOCK_B = BLOCK_B,
+        )
 
     # ------------------------------------------------------------------ #
     # Backward
@@ -334,80 +340,97 @@ class BlockDiagonalSumLayer(SumLayer):
                 )
 
         for block in self._bd_blocks:
-            nid_start, cid_start, pid_start, pfid_start, NB, bs, cbs = block
-
-            # Same tile policy as the dense backward: 2-D [TILE_N, BLOCK_B]
-            # output tiles with a serial TILE_K loop over the parent rows.
-            # Passing ``NB_ch = NB`` makes the grid-saturation heuristic see
-            # the true total child-slot count (NB blocks × cbs slots each).
-            TILE_N, TILE_K, BLOCK_B, use_tl_dot = _select_bk_tiles(
-                cbs = cbs, bs = bs, batch_size = batch_size,
-                NB_ch = NB, force_use_fp32 = force_use_fp32,
+            self._dense_backward_block(
+                node_flows, element_flows, node_mars, element_mars, params, param_flows,
+                block, batch_size, allow_modify_flows = allow_modify_flows,
+                logspace_flows = logspace_flows, negate_pflows = negate_pflows,
+                accumulate_ch_flows = accumulate_ch_flows, force_use_fp32 = force_use_fp32,
             )
-            K_NUM_TILES = bs // TILE_K
 
-            grid = (triton.cdiv(batch_size, BLOCK_B), NB * (cbs // TILE_N))
+        return None
 
-            self._bk_bd_kernel[grid](
+    def _dense_backward_block(self, node_flows: torch.Tensor, element_flows: torch.Tensor,
+                              node_mars: torch.Tensor, element_mars: torch.Tensor,
+                              params: torch.Tensor, param_flows: Optional[torch.Tensor],
+                              block: tuple, batch_size: int, allow_modify_flows: bool = False,
+                              logspace_flows: bool = False, negate_pflows: bool = False,
+                              accumulate_ch_flows: bool = False,
+                              force_use_fp32: bool = False) -> None:
+        """Element-flow (+ param-flow) backward of one block over every parent /
+        child row; the ``allow_modify_flows`` pre-pass must already have run.
+        Also the dense batched path of the sparse BD subclasses."""
+        nid_start, cid_start, pid_start, pfid_start, NB, bs, cbs = block
+
+        # Same tile policy as the dense backward: 2-D [TILE_N, BLOCK_B]
+        # output tiles with a serial TILE_K loop over the parent rows.
+        # Passing ``NB_ch = NB`` makes the grid-saturation heuristic see
+        # the true total child-slot count (NB blocks × cbs slots each).
+        TILE_N, TILE_K, BLOCK_B, use_tl_dot = _select_bk_tiles(
+            cbs = cbs, bs = bs, batch_size = batch_size,
+            NB_ch = NB, force_use_fp32 = force_use_fp32,
+        )
+        K_NUM_TILES = bs // TILE_K
+
+        grid = (triton.cdiv(batch_size, BLOCK_B), NB * (cbs // TILE_N))
+
+        self._bk_bd_kernel[grid](
+            node_flows = node_flows,
+            element_flows = element_flows,
+            node_mars = node_mars,
+            element_mars = element_mars,
+            mparams = params,
+            batch_size = batch_size,
+            nid_start = nid_start,
+            cid_start = cid_start,
+            pid_start = pid_start,
+            BS = bs,
+            CBS = cbs,
+            BLOCK_B = BLOCK_B,
+            TILE_N = TILE_N,
+            TILE_K = TILE_K,
+            K_NUM_TILES = K_NUM_TILES,
+            ALLOW_MODIFY_FLOWS = 1 if allow_modify_flows else 0,
+            ACCUMULATE_CH_FLOWS = 1 if accumulate_ch_flows else 0,
+            LOGSPACE_FLOWS = 1 if logspace_flows else 0,
+            USE_TL_DOT = use_tl_dot,
+        )
+
+        if param_flows is not None:
+            # ``NB_ch = 1``: only the diagonal ``(pblock, pblock)`` edge
+            # blocks exist, so the true launch grid is
+            # ``NB * (cbs/TILE_N) * (bs/TILE_M)`` — with the child-slot
+            # stand-in reduced to a single block's ``cbs``, the
+            # grid-saturation estimate inside ``_select_par_tiles``
+            # matches it exactly.
+            P_TILE_M, P_TILE_N, P_TILE_B, use_tl_dot_p = _select_par_tiles(
+                bs = bs, cbs = cbs, batch_size = batch_size,
+                NB = NB, NB_ch = 1,
+            )
+            B_NUM_TILES = triton.cdiv(batch_size, P_TILE_B)
+            par_grid = (NB * (cbs // P_TILE_N), bs // P_TILE_M)
+
+            self._bk_bd_par_kernel[par_grid](
                 node_flows = node_flows,
-                element_flows = element_flows,
                 node_mars = node_mars,
                 element_mars = element_mars,
                 mparams = params,
+                param_flows = param_flows,
                 batch_size = batch_size,
                 nid_start = nid_start,
                 cid_start = cid_start,
                 pid_start = pid_start,
+                pfid_start = pfid_start,
                 BS = bs,
                 CBS = cbs,
-                BLOCK_B = BLOCK_B,
-                TILE_N = TILE_N,
-                TILE_K = TILE_K,
-                K_NUM_TILES = K_NUM_TILES,
+                TILE_M = P_TILE_M,
+                TILE_N = P_TILE_N,
+                TILE_B = P_TILE_B,
+                B_NUM_TILES = B_NUM_TILES,
                 ALLOW_MODIFY_FLOWS = 1 if allow_modify_flows else 0,
-                ACCUMULATE_CH_FLOWS = 1 if accumulate_ch_flows else 0,
                 LOGSPACE_FLOWS = 1 if logspace_flows else 0,
-                USE_TL_DOT = use_tl_dot,
+                NEGATE_PFLOWS = 1 if negate_pflows else 0,
+                USE_TL_DOT = use_tl_dot_p,
             )
-
-            if param_flows is not None:
-                # ``NB_ch = 1``: only the diagonal ``(pblock, pblock)`` edge
-                # blocks exist, so the true launch grid is
-                # ``NB * (cbs/TILE_N) * (bs/TILE_M)`` — with the child-slot
-                # stand-in reduced to a single block's ``cbs``, the
-                # grid-saturation estimate inside ``_select_par_tiles``
-                # matches it exactly.
-                P_TILE_M, P_TILE_N, P_TILE_B, use_tl_dot_p = _select_par_tiles(
-                    bs = bs, cbs = cbs, batch_size = batch_size,
-                    NB = NB, NB_ch = 1,
-                )
-                B_NUM_TILES = triton.cdiv(batch_size, P_TILE_B)
-                par_grid = (NB * (cbs // P_TILE_N), bs // P_TILE_M)
-
-                self._bk_bd_par_kernel[par_grid](
-                    node_flows = node_flows,
-                    node_mars = node_mars,
-                    element_mars = element_mars,
-                    mparams = params,
-                    param_flows = param_flows,
-                    batch_size = batch_size,
-                    nid_start = nid_start,
-                    cid_start = cid_start,
-                    pid_start = pid_start,
-                    pfid_start = pfid_start,
-                    BS = bs,
-                    CBS = cbs,
-                    TILE_M = P_TILE_M,
-                    TILE_N = P_TILE_N,
-                    TILE_B = P_TILE_B,
-                    B_NUM_TILES = B_NUM_TILES,
-                    ALLOW_MODIFY_FLOWS = 1 if allow_modify_flows else 0,
-                    LOGSPACE_FLOWS = 1 if logspace_flows else 0,
-                    NEGATE_PFLOWS = 1 if negate_pflows else 0,
-                    USE_TL_DOT = use_tl_dot_p,
-                )
-
-        return None
 
     # ------------------------------------------------------------------ #
     # Triton kernels

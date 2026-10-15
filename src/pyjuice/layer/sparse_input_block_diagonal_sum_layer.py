@@ -11,7 +11,10 @@ from .block_diagonal_sum_layer import BlockDiagonalSumLayer
 from .dense_sum_layer import DenseSumLayer
 from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
-from .sparse_io_block_diagonal_sum_layer import _build_block_offsets_table
+from .sparse_io_block_diagonal_sum_layer import (
+    _DENSE_BATCHED, _SharedTensor, _bd_dense_batched, _build_block_offsets_table,
+    _sv_dense_rows, _sv_to_dense_rows,
+)
 
 
 class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
@@ -48,6 +51,14 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
     the pure sparse chain (``_skip_scatter=True`` upstream); the dense
     fallback (mixed-consumer topologies) and ``missing_mask`` handling
     remain B=1-only — same constraints as :class:`SparseInputSumLayer`.
+
+    From ``_WS_MIN_BATCH`` samples up (the sparse-IO weight-stationary knobs)
+    a batched block takes the dense path instead: the active child values are
+    written into the child's own ``element_mars`` rows (``-inf`` elsewhere —
+    the skip-scatter producer never writes them) and the dense
+    :class:`BlockDiagonalSumLayer` kernels run; backward gathers the child
+    flows back from ``element_flows`` and writes each param flow once instead
+    of one atomic per (sample, active row, parent).
 
     Constraints (inherited or asserted):
       * Block-diagonal pattern (``NB == NB_ch``, ``bs == cbs``,
@@ -137,7 +148,7 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         #     all-rows case (``K_j == CBS``). Only ever needed at B=1
         #     (missing_mask is B=1-only on the sparse chain).
         # One Triton specialisation per bound actually used.
-        self._in_block_offsets_tables: List[torch.Tensor] = []
+        self._in_block_offsets_tables: List[_SharedTensor] = []
         self._missing_in_offsets: List[torch.Tensor] = []
         max_k_in_across_ns = 0
         max_cbs_across_ns = 0
@@ -160,11 +171,21 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             1,
         )
 
-    def graph_unsupported_reason(self) -> Optional[str]:
-        # Builds its sparsity patterns from the host copy of the data; it
-        # needs a ``static_ctx`` forward (see ``SparseIOSumLayer``) to be
-        # captured.
-        return f"{type(self).__name__} has no CUDA-graph forward yet"
+    def graph_rebind_outputs(self, static_ctx, data_cpu, data_list, pattern_cache) -> None:
+        """After a CUDA-graph replay, before the eager backward: the block
+        offsets (or dense-path marker) the eager forward would have cached.
+        The backward's ``sv_in`` comes from the upstream prod's re-forward."""
+        B = static_ctx.B
+        device = static_ctx.data.device
+        for blk_idx in range(len(self._bd_blocks)):
+            if _bd_dense_batched(B):
+                self._cached_in_offsets[blk_idx] = _DENSE_BATCHED
+            else:
+                in_offs = self._lookup_in_block_offsets(
+                    blk_idx, is_missing=False, data=static_ctx.data,
+                    data_list=data_list, device=device, batch_size=B,
+                )
+                self._cached_in_offsets[blk_idx] = (in_offs, self._MAX_K_IN_ACTIVE)
 
     def __repr__(self) -> str:
         return (
@@ -182,7 +203,8 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                                  data: torch.Tensor,
                                  data_list: Optional[list],
                                  device: torch.device,
-                                 batch_size: int = 1) -> torch.Tensor:
+                                 batch_size: int = 1,
+                                 batched: bool = False) -> torch.Tensor:
         """Per-block start offsets into the active column(s) — the
         input-side half of
         :meth:`SparseIOBlockDiagonalSumLayer._lookup_block_offsets` (same
@@ -193,21 +215,21 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         one table row per sample's observed token, gathered with a single
         ``index_select`` on the device data; the kernel rebases row ``b``
         on ``col_starts[b]`` (``sv_in.indices`` is the full
-        ``_csc_indices`` there)."""
+        ``_csc_indices`` there), as does *batched* (a static container) at
+        any B."""
         table = self._in_block_offsets_tables[blk_idx]
         missing_offs = self._missing_in_offsets[blk_idx]
 
         # Lazy device migration — plain attributes, so ``.to(device)``
-        # doesn't move them.
-        if table.device != device:
-            table = table.to(device)
-            self._in_block_offsets_tables[blk_idx] = table
+        # doesn't move them. The table's device copy is shared with every
+        # layer reading the same pattern.
+        table = table.on(device)
         if missing_offs.device != device:
             missing_offs = missing_offs.to(device)
             self._missing_in_offsets[blk_idx] = missing_offs
 
         var_id = self._input_sparsity_var_ids[blk_idx]
-        if batch_size > 1:
+        if batch_size > 1 or batched:
             # ``is_missing`` is excluded up front at B>1 (family-wide
             # constraint, see forward).
             return table.index_select(0, data[var_id, :]).contiguous()
@@ -267,12 +289,16 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 data_cpu: Optional[torch.Tensor] = None,
                 data_list: Optional[list] = None,
                 missing_mask: Optional[torch.Tensor] = None,
+                static_ctx=None,
                 **kwargs) -> None:
         batch_size = node_mars.size(1)
         assert propagation_alg == "LL", (
             "SparseInputBlockDiagonalSumLayer requires propagation_alg == 'LL'."
         )
         assert params.dim() == 1
+        if static_ctx is not None:
+            self._forward_static(node_mars, element_mars, params, data, static_ctx)
+            return None
         if batch_size > 1:
             assert missing_mask is None, (
                 "SparseInputBlockDiagonalSumLayer: missing_mask handling is "
@@ -302,7 +328,7 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._bd_blocks, self._sparse_input_refs,
         )):
-            nid_start, _cid_start, pid_start, _pfid_start, NB, BS, CBS = block
+            nid_start, cid_start, pid_start, _pfid_start, NB, BS, CBS = block
             sv_in = sparse_prod._sparse_outputs[ns_idx]
             K_in = sv_in.total_nnz
 
@@ -311,6 +337,11 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 # zero terms ⇒ log(0) = -inf.
                 node_mars[nid_start:nid_start + NB * BS, :].fill_(float("-inf"))
                 self._cached_in_offsets[blk_idx] = None
+                continue
+
+            if _bd_dense_batched(sv_in.batch_size):
+                self._dense_block_forward(node_mars, element_mars, params, block, sv_in)
+                self._cached_in_offsets[blk_idx] = _DENSE_BATCHED
                 continue
 
             in_var_id = self._input_sparsity_var_ids[blk_idx]
@@ -330,7 +361,6 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             # backward compiles against the same specialisation.
             self._cached_in_offsets[blk_idx] = (in_offs, max_k_in)
 
-            BS_PADDED = triton.next_power_of_2(BS)
             if sv_in.is_batched:
                 # Per-sample columns: each program handles one
                 # (parent_block, sample). ``sv_in.max_val`` is the fused
@@ -341,26 +371,8 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                     "requires the fused per-sample sv.max_val from the "
                     "upstream prod layer."
                 )
-                grid = (NB, batch_size)
-                _fw_sparse_in_bd_kernel[grid](
-                    node_mars_ptr=node_mars,
-                    mparams_ptr=params,
-                    in_indices_ptr=sv_in.indices,
-                    in_values_ptr=sv_in.values,
-                    in_block_offsets_ptr=in_offs,
-                    max_val_ptr=sv_in.max_val,
-                    col_starts_ptr=sv_in.col_starts,
-                    nid_start=nid_start,
-                    pid_start=pid_start,
-                    batch_size=batch_size,
-                    v_stride=sv_in.values.stride(0),
-                    offs_stride=in_offs.stride(0),
-                    BS=BS,
-                    CBS=CBS,
-                    BS_PADDED=BS_PADDED,
-                    MAX_K_IN=max_k_in,
-                    IS_BATCHED=True,
-                )
+                self._launch_forward(node_mars, params, block, sv_in, in_offs,
+                                     sv_in.max_val, max_k_in, batch_size)
             else:
                 assert batch_size == 1, (
                     "batch_size > 1 but the upstream SparseProdLayer "
@@ -368,28 +380,74 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 )
                 max_val = sv_in.max_val if sv_in.max_val is not None \
                     else sv_in.values.max()
-                grid = (NB, 1)
-                _fw_sparse_in_bd_kernel[grid](
-                    node_mars_ptr=node_mars,
-                    mparams_ptr=params,
-                    in_indices_ptr=sv_in.indices,
-                    in_values_ptr=sv_in.values,
-                    in_block_offsets_ptr=in_offs,
-                    max_val_ptr=max_val,
-                    col_starts_ptr=sv_in.values,  # unused at B=1
-                    nid_start=nid_start,
-                    pid_start=pid_start,
-                    batch_size=batch_size,
-                    v_stride=0,
-                    offs_stride=0,
-                    BS=BS,
-                    CBS=CBS,
-                    BS_PADDED=BS_PADDED,
-                    MAX_K_IN=max_k_in,
-                    IS_BATCHED=False,
-                )
+                self._launch_forward(node_mars, params, block, sv_in, in_offs,
+                                     max_val, max_k_in, batch_size)
 
         return None
+
+    def _forward_static(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                        params: torch.Tensor, data: torch.Tensor, static_ctx) -> None:
+        """CUDA-graph forward (see ``pyjuice.model.sparse_cudagraph``): the
+        upstream prod's static containers (columns resolved on device), block
+        offsets gathered on device from the graph's batch, and the batched
+        kernels at any B (B=1 included) or the dense path. No empty-column
+        shortcut: the kernels write ``-inf`` for a sample with an empty column."""
+        B = static_ctx.B
+        for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
+            self._bd_blocks, self._sparse_input_refs,
+        )):
+            sv_in = sparse_prod._sparse_outputs[ns_idx]
+            assert sv_in.static and sv_in.max_val is not None, (
+                "SparseInputBlockDiagonalSumLayer: the upstream prod output is "
+                "not a static (CUDA-graph) container."
+            )
+            if _bd_dense_batched(B):
+                self._dense_block_forward(node_mars, element_mars, params, block, sv_in)
+            else:
+                in_offs = self._lookup_in_block_offsets(
+                    blk_idx, is_missing=False, data=data, data_list=None,
+                    device=node_mars.device, batch_size=B, batched=True,
+                )
+                self._launch_forward(node_mars, params, block, sv_in, in_offs,
+                                     sv_in.max_val, self._MAX_K_IN_ACTIVE, B)
+
+    def _dense_block_forward(self, node_mars: torch.Tensor, element_mars: torch.Tensor,
+                             params: torch.Tensor, block: tuple,
+                             sv_in: SparseNodeValues) -> None:
+        """Dense batched path: the active child values go into the child's
+        own ``element_mars`` rows (``-inf`` elsewhere), then the dense
+        block-diagonal forward."""
+        _, cid_start, _, _, NB, _, CBS = block
+        _sv_to_dense_rows(element_mars, cid_start, NB * CBS, float("-inf"), sv_in, sv_in.values)
+        self._dense_forward_block(node_mars, element_mars, params, block, sv_in.batch_size)
+
+    def _launch_forward(self, node_mars: torch.Tensor, params: torch.Tensor,
+                        block: tuple, sv_in: SparseNodeValues, in_offs: torch.Tensor,
+                        max_val: torch.Tensor, max_k_in: int, batch_size: int) -> None:
+        """:func:`_fw_sparse_in_bd_kernel` over grid ``(NB, B)``: the batched
+        layout (per-sample columns / offset rows) whenever *sv_in* is batched
+        — B>1 or a static container — else the B=1 column view."""
+        nid_start, _, pid_start, _, NB, BS, CBS = block
+        batched = sv_in.is_batched
+        _fw_sparse_in_bd_kernel[(NB, batch_size)](
+            node_mars_ptr=node_mars,
+            mparams_ptr=params,
+            in_indices_ptr=sv_in.indices,
+            in_values_ptr=sv_in.values,
+            in_block_offsets_ptr=in_offs,
+            max_val_ptr=max_val,
+            col_starts_ptr=sv_in.col_starts if batched else sv_in.values,  # unused at B=1
+            nid_start=nid_start,
+            pid_start=pid_start,
+            batch_size=batch_size,
+            v_stride=sv_in.values.stride(0) if batched else 0,
+            offs_stride=in_offs.stride(0) if batched else 0,
+            BS=BS,
+            CBS=CBS,
+            BS_PADDED=triton.next_power_of_2(BS),
+            MAX_K_IN=max_k_in,
+            IS_BATCHED=batched,
+        )
 
     # ------------------------------------------------------------------ #
     # Backward
@@ -457,7 +515,7 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         for blk_idx, (block, (sparse_prod, ns_idx)) in enumerate(zip(
             self._bd_blocks, self._sparse_input_refs,
         )):
-            nid_start, _cid_start, pid_start, pfid_start, NB, BS, CBS = block
+            nid_start, cid_start, pid_start, pfid_start, NB, BS, CBS = block
             sv_in = sparse_prod._sparse_outputs[ns_idx]
             K_in = sv_in.total_nnz
 
@@ -492,6 +550,20 @@ class SparseInputBlockDiagonalSumLayer(BlockDiagonalSumLayer):
                 "SparseInputBlockDiagonalSumLayer.backward expected cached "
                 "block offsets from forward; call forward before backward."
             )
+            if cached is _DENSE_BATCHED:
+                # Re-densify (other layers reuse these element rows in between),
+                # dense element + param flows, gather the child flows.
+                _sv_to_dense_rows(element_mars, cid_start, NB * CBS, float("-inf"),
+                                  sv_in, sv_in.values)
+                self._dense_backward_block(
+                    node_flows, element_flows, node_mars, element_mars, params,
+                    param_flows if compute_pflows else None, block, batch_size,
+                    allow_modify_flows=allow_modify_flows, negate_pflows=negate_pflows,
+                    force_use_fp32=force_use_fp32,
+                )
+                _sv_dense_rows(element_flows, cid_start, sv_in, sv_flow_in.values, False)
+                self._cached_in_offsets[blk_idx] = None
+                continue
             in_offs, max_k_in = cached
 
             if sv_in.is_batched:

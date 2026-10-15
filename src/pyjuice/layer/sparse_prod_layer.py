@@ -101,16 +101,10 @@ class SparseProdLayer(ProdLayer):
             # Per-row lookup for each dense child: the global ``node_mars`` nid
             # for the h-th row of ns's output. Registered as a buffer so the
             # Module's ``.to(device)`` moves it.
-            H = ns.num_nodes
-            bs = ns.block_size
-            h_range = torch.arange(H, dtype=torch.long)
-            h_block = h_range // bs
-            h_within = h_range % bs
             dense_lookups = []
             for ch_idx in ns.dense_ch_idxs:
                 cs = ns.chs[ch_idx]
-                eids = ns.edge_ids[:, ch_idx].to(torch.long)
-                dense_lookups.append(cs._output_ind_range[0] + eids[h_block] * bs + h_within)
+                dense_lookups.append(cs._output_ind_range[0] + ns.dense_row_map(ch_idx))
             if dense_lookups:
                 dense_lookup = torch.stack(dense_lookups, dim=0)  # [num_dense_chs, H]
             else:

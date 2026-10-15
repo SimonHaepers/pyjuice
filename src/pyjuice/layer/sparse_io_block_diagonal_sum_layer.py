@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import weakref
 from typing import List, Optional, Sequence, Tuple
 
 import torch
@@ -11,45 +13,225 @@ from pyjuice.utils.kernel_launcher import triton_jit
 from .block_diagonal_sum_layer import BlockDiagonalSumLayer
 from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
+from . import sparse_io_sum_layer as _sparse_io
 
 
-def _build_block_offsets_table(dist, NB: int, BS: int) -> Tuple[torch.Tensor, int]:
-    """Precompute ``[V, NB+1]`` int32 block-offset table for a
+class _SharedTensor:
+    """A host tensor plus lazily made per-device copies. The compile-time
+    tables of a homogeneous chain are identical for every timestep's layer,
+    so those layers share one of these instead of each building, holding
+    and migrating its own ``[V, NB+1]`` copy."""
+
+    __slots__ = ("cpu", "_on_device")
+
+    def __init__(self, cpu: torch.Tensor) -> None:
+        self.cpu = cpu
+        self._on_device: dict = {}
+
+    def on(self, device: torch.device) -> torch.Tensor:
+        if device.type == "cpu":
+            return self.cpu
+        t = self._on_device.get(device)
+        if t is None:
+            t = self.cpu.to(device)
+            self._on_device[device] = t
+        return t
+
+
+# Compile-time tables derived from a SparseCategorical's CSC pattern, cached
+# per dist (tied emission nodes share one dist) so they die with it.
+_DIST_TABLE_CACHE: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _dist_table_cache(dist) -> dict:
+    cache = _DIST_TABLE_CACHE.get(dist)
+    if cache is None:
+        cache = {}
+        _DIST_TABLE_CACHE[dist] = cache
+    return cache
+
+
+def _csc_pattern(dist) -> Tuple[torch.Tensor, torch.Tensor, tuple]:
+    """Host ``(indptr, indices)`` of *dist* plus a key identifying them."""
+    assert dist._csc_indptr is not None and dist._csc_indices is not None, (
+        "SparseCategorical dist must have CSC pattern set "
+        "(call set_meta_parameters / set_params first)."
+    )
+    key = (dist._csc_indices.data_ptr(), dist._csc_indices.numel())
+    return dist._csc_indptr.cpu().long(), dist._csc_indices.cpu().long(), key
+
+
+def _csc_column_ids(indptr: torch.Tensor) -> torch.Tensor:
+    """Column id of every CSC entry."""
+    lens = indptr[1:] - indptr[:-1]
+    return torch.repeat_interleave(torch.arange(lens.numel()), lens)
+
+
+def _block_offsets(indptr: torch.Tensor, rows: torch.Tensor, NB: int,
+                   BS: int) -> Tuple[torch.Tensor, int]:
+    """``[V, NB+1]`` int32 table with ``table[v, b]`` = the position within
+    column ``v`` where block ``b`` starts (``rows`` ascending per column, so
+    this is the number of the column's rows below ``b * BS``), plus the
+    worst per-block nnz over all columns."""
+    V = indptr.numel() - 1
+    blk = torch.div(rows, BS, rounding_mode="floor").clamp_(max=NB)
+    counts = torch.bincount(
+        _csc_column_ids(indptr) * (NB + 1) + blk, minlength=V * (NB + 1),
+    ).view(V, NB + 1)[:, :NB]
+    table = torch.zeros(V, NB + 1, dtype=torch.int32)
+    table[:, 1:] = counts.cumsum(1)
+    return table, (int(counts.max()) if counts.numel() > 0 else 0)
+
+
+def _build_block_offsets_table(dist, NB: int, BS: int) -> Tuple[_SharedTensor, int]:
+    """``[V, NB+1]`` int32 block-offset table for a
     :class:`SparseCategorical` dist.
 
     For each CSC column ``v``, ``table[v, b]`` is the position WITHIN
     ``csc_indices[indptr[v]:indptr[v+1]]`` where block ``b`` starts —
     equivalent to ``searchsorted(col_indices, b * BS)``.
 
-    Done once at layer compile time so per-call forward / backward is a
+    Done once per ``(dist, NB, BS)`` at layer compile time (shared by every
+    layer reading the same pattern) so per-call forward / backward is a
     plain ``table[v]`` device gather (no ``searchsorted``, no host sync).
 
     Also returns ``max_k_per_block`` (the worst per-block nnz across the
     entire table), used by the caller to size the kernel's MAX_K_IN /
     MAX_K_OUT constexpr.
     """
-    assert dist._csc_indptr is not None and dist._csc_indices is not None, (
-        "SparseCategorical dist must have CSC pattern set "
-        "(call set_meta_parameters / set_params first)."
+    indptr, indices, pattern_key = _csc_pattern(dist)
+    key = ("offsets", NB, BS, pattern_key)
+    cache = _dist_table_cache(dist)
+    if key not in cache:
+        table, max_k = _block_offsets(indptr, indices, NB, BS)
+        cache[key] = (_SharedTensor(table), max_k)
+    return cache[key]
+
+
+class _RowMappedCSC:
+    """A dist's CSC pattern seen through an output row map (see
+    :meth:`SparseProdNodes.dense_row_map`): per column, the mapped rows in
+    ascending order (``rows``, CSC layout) and each entry's original
+    within-column slot (``slots``), so a block-diagonal kernel can walk the
+    mapped rows block by block and still write the consumer's slot order.
+    ``missing_*`` describe the all-rows pattern (slot ``h`` ↔ row
+    ``row_map[h]``) of a marginalised position."""
+
+    __slots__ = ("rows", "slots", "offsets", "max_k",
+                 "missing_rows", "missing_slots", "missing_offsets", "missing_max_k")
+
+
+def _row_mapped_csc(dist, row_map: torch.Tensor, NB: int, BS: int) -> _RowMappedCSC:
+    row_map = row_map.detach().cpu().long().contiguous()
+    indptr, indices, pattern_key = _csc_pattern(dist)
+    digest = hashlib.sha1(row_map.numpy().tobytes()).hexdigest()
+    key = ("row_map", NB, BS, pattern_key, digest)
+    cache = _dist_table_cache(dist)
+    if key in cache:
+        return cache[key]
+
+    assert int(row_map.max()) < NB * BS, "row map points past the sum's nodes"
+    cols = _csc_column_ids(indptr)
+    mapped = row_map[indices]
+    # Sort by (column, mapped row): columns stay in place, so an output
+    # position's original slot is its source index minus the column start.
+    order = torch.argsort(cols * (NB * BS) + mapped)
+    rows = mapped[order].contiguous()
+    table, max_k = _block_offsets(indptr, rows, NB, BS)
+
+    m = _RowMappedCSC()
+    m.rows = _SharedTensor(rows)
+    m.slots = _SharedTensor((order - indptr[cols]).to(torch.int32))
+    m.offsets = _SharedTensor(table)
+    m.max_k = max_k
+    m_rows, m_slots = torch.sort(row_map)
+    m_table, m.missing_max_k = _block_offsets(
+        torch.tensor([0, row_map.numel()]), m_rows, NB, BS,
     )
-    indptr = dist._csc_indptr.cpu()
-    indices = dist._csc_indices.cpu()
-    V = indptr.numel() - 1
-    boundary = torch.arange(NB + 1, dtype=indices.dtype) * BS
-    table = torch.empty(V, NB + 1, dtype=torch.int32)
-    max_k_per_block = 0
-    for v in range(V):
-        col_s = int(indptr[v])
-        col_e = int(indptr[v + 1])
-        col = indices[col_s:col_e]
-        offs = torch.searchsorted(col, boundary)
-        table[v] = offs.to(torch.int32)
-        if col_e > col_s:
-            block_sizes = offs[1:] - offs[:-1]
-            cur = int(block_sizes.max().item())
-            if cur > max_k_per_block:
-                max_k_per_block = cur
-    return table, max_k_per_block
+    m.missing_rows = _SharedTensor(m_rows.contiguous())
+    m.missing_slots = _SharedTensor(m_slots.to(torch.int32))
+    m.missing_offsets = _SharedTensor(m_table[0].contiguous())
+    cache[key] = m
+    return m
+
+
+# --------------------------------------------------------------------------- #
+# Dense batched path of the sparse block-diagonal layers
+# --------------------------------------------------------------------------- #
+#
+# The per-sample kernels gather their block's weights for every sample and add
+# param flows with one atomic per (sample, active row, child) — 14 G atomics per
+# backward on a trained H=16k Monarch chain at B=64. From ``_WS_MIN_BATCH``
+# samples up (the sparse-IO weight-stationary knobs, ``PYJUICE_SPARSE_IO_WS``)
+# the sparse layers instead write their sparse side into dense rows and run the
+# dense :class:`BlockDiagonalSumLayer` kernels: each weight tile is loaded once
+# per batch tile, the batch is reduced in-tile and every param flow is written
+# once. A block-diagonal layer's weights are only ``H x bs``, so the dense pass
+# is cheap, and at these batch sizes the samples' supports cover most rows.
+
+_DENSE_BATCHED = object()
+"""Marker a sparse BD layer caches in forward when a block took the dense
+batched path, so backward takes it too."""
+
+
+def _bd_dense_batched(batch_size: int) -> bool:
+    """Run a block on the dense batched path at this batch size? Never at B=1
+    (the per-sample kernels win there); ``"always"`` takes it at any B > 1."""
+    mode = _sparse_io._WS_MODE  # read per call: tests switch it on the module
+    if batch_size < 2 or mode == "never":
+        return False
+    return mode == "always" or batch_size >= _sparse_io._WS_MIN_BATCH
+
+
+@triton.jit(do_not_specialize=["row_start", "batch_size", "v_stride"])
+def _sv_dense_rows_kernel(dense_ptr, values_ptr, indices_ptr, col_starts_ptr, nnz_ptr,
+                          row_map_ptr, row_start, batch_size, v_stride,
+                          TO_DENSE: tl.constexpr, HAS_ROW_MAP: tl.constexpr,
+                          BLOCK: tl.constexpr):
+    """Move a batched pattern's values between the packed ``[B, K]`` layout
+    and dense ``[rows, B]`` rows: entry ``(b, j)`` sits at row ``row_start +
+    r`` with ``r = indices[col_starts[b] + j]`` (``row_map[r]`` when
+    ``HAS_ROW_MAP``). ``TO_DENSE`` scatters into the rows, else gathers from
+    them. Grid ``(cdiv(K, BLOCK), B)``; entries past ``nnz[b]`` are skipped."""
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    b = tl.program_id(1)
+    mask = offs < tl.load(nnz_ptr + b)
+    row = tl.load(indices_ptr + tl.load(col_starts_ptr + b) + offs, mask=mask, other=0)
+    if HAS_ROW_MAP:
+        row = tl.load(row_map_ptr + row, mask=mask, other=0)
+    d_addr = (row_start + row).to(tl.int64) * batch_size + b
+    v_addr = b.to(tl.int64) * v_stride + offs
+    if TO_DENSE:
+        tl.store(dense_ptr + d_addr, tl.load(values_ptr + v_addr, mask=mask), mask=mask)
+    else:
+        tl.store(values_ptr + v_addr, tl.load(dense_ptr + d_addr, mask=mask), mask=mask)
+
+
+_SV_DENSE_BLOCK = 128
+
+
+def _sv_dense_rows(dense: torch.Tensor, row_start: int, sv: SparseNodeValues,
+                   values: torch.Tensor, to_dense: bool,
+                   row_map: Optional[torch.Tensor] = None) -> None:
+    """Launch :func:`_sv_dense_rows_kernel` for the pattern of *sv* with the
+    packed *values* (``[B, K_stride]``, e.g. ``sv.values`` or a flow mirror)."""
+    if sv.total_nnz == 0:
+        return
+    _sv_dense_rows_kernel[(triton.cdiv(sv.total_nnz, _SV_DENSE_BLOCK), sv.batch_size)](
+        dense, values, sv.indices, sv.col_starts, sv.nnz,
+        values if row_map is None else row_map,
+        row_start, dense.size(1), values.stride(0),
+        TO_DENSE=to_dense, HAS_ROW_MAP=row_map is not None, BLOCK=_SV_DENSE_BLOCK,
+    )
+
+
+def _sv_to_dense_rows(dense: torch.Tensor, row_start: int, num_rows: int, fill: float,
+                      sv: SparseNodeValues, values: torch.Tensor,
+                      row_map: Optional[torch.Tensor] = None) -> None:
+    """Rows ``[row_start, row_start + num_rows)`` of *dense* := *fill* outside
+    the pattern of *sv*, *values* on it."""
+    dense[row_start:row_start + num_rows].fill_(fill)
+    _sv_dense_rows(dense, row_start, sv, values, True, row_map)
 
 
 class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
@@ -203,8 +385,8 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         # next power of two. Compiling for the global max means a single
         # Triton specialisation serves every (token, missing-mask)
         # combination at runtime.
-        self._in_block_offsets_tables: List[Optional[torch.Tensor]] = []
-        self._out_block_offsets_tables: List[Optional[torch.Tensor]] = []
+        self._in_block_offsets_tables: List[_SharedTensor] = []
+        self._out_block_offsets_tables: List[_SharedTensor] = []
         max_k_in_across_ns = 0
         max_k_out_across_ns = 0
         for blk_idx, (block, in_dist, in_var) in enumerate(zip(
@@ -233,13 +415,11 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
         self._missing_out_offsets: List[Optional[torch.Tensor]] = [None] * len(self.nodes)
         for blk_idx, block in enumerate(self._bd_blocks):
             _, _, _, _, NB, BS, CBS = block
-            in_table = self._in_block_offsets_tables[blk_idx]
-            device = in_table.device if in_table is not None else torch.device("cpu")
             self._missing_in_offsets[blk_idx] = (
-                torch.arange(NB + 1, dtype=torch.int32, device=device) * CBS
+                torch.arange(NB + 1, dtype=torch.int32) * CBS
             )
             self._missing_out_offsets[blk_idx] = (
-                torch.arange(NB + 1, dtype=torch.int32, device=device) * BS
+                torch.arange(NB + 1, dtype=torch.int32) * BS
             )
 
     def graph_unsupported_reason(self) -> Optional[str]:
@@ -536,15 +716,9 @@ class SparseIOBlockDiagonalSumLayer(BlockDiagonalSumLayer):
             missing_offs = self._missing_out_offsets[blk_idx]
 
         # Lazy device migration — the layer's ``.to(device)`` doesn't see
-        # these tensors (they're not registered buffers, just plain
-        # attributes on a list). Cheap one-time copy on first forward; the
-        # tables are tiny (``V × (NB+1)`` int32, typically <1 MB).
-        if table.device != device:
-            table = table.to(device)
-            if side == "in":
-                self._in_block_offsets_tables[blk_idx] = table
-            else:
-                self._out_block_offsets_tables[blk_idx] = table
+        # these tensors (they're not registered buffers). The table's device
+        # copy is shared with every layer reading the same pattern.
+        table = table.on(device)
         if missing_offs.device != device:
             missing_offs = missing_offs.to(device)
             if side == "in":

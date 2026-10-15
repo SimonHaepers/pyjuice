@@ -5,8 +5,8 @@ from typing import Optional
 
 import torch
 
-from pyjuice.nodes import multiply, summate, inputs, set_block_size
-from pyjuice.nodes.distributions import Categorical
+from pyjuice.nodes import multiply, summate, inputs, set_block_size, sparse_multiply, sparse_summate
+from pyjuice.nodes.distributions import Categorical, SparseCategorical
 
 
 def monarch_block_size(num_latents: int) -> int:
@@ -42,7 +42,8 @@ def monarch_permutation(num_latents: int, permute_block_size: int) -> torch.Tens
 def MonarchHMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: bool = True,
                block_size: Optional[int] = None, permute_block_size: Optional[int] = None,
                bd1: Optional[torch.Tensor] = None, bd2: Optional[torch.Tensor] = None,
-               beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None):
+               beta: Optional[torch.Tensor] = None, gamma: Optional[torch.Tensor] = None,
+               output_permutation: bool = False):
     """
     Hidden Markov Model whose ``[H, H]`` transition is a single **Monarch**
     matrix: ``BD1 -> permutation -> BD2``, two block-diagonal sums with
@@ -68,7 +69,72 @@ def MonarchHMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: b
     :param bd2: optional parameters of the second block-diagonal sum, same shape
     :param beta: optional ``[num_latents, num_emits]`` emission parameters
     :param gamma: optional ``[num_latents]`` initial-state distribution
+    :param output_permutation: also permute BD2's output, giving the standard
+        Monarch ``P · BD2 · P · BD1``; the permutation is folded into the
+        emission product as node-level edges ``[h, perm(h)]``
     """
+    def build_input(num_node_blocks: int):
+        ns = inputs(seq_length - 1, num_node_blocks = num_node_blocks,
+                    dist = Categorical(num_cats = num_emits))
+        if beta is not None:
+            assert beta.size(0) == num_latents and beta.size(1) == num_emits
+            ns.set_params(beta)
+        return ns
+
+    return _monarch_chain(seq_length, num_latents, build_input, multiply, summate,
+                          homogeneous, block_size, permute_block_size,
+                          bd1, bd2, gamma, output_permutation)
+
+
+def SparseMonarchHMM(seq_length: int, num_latents: int, num_emits: int,
+                     csc_indptr: torch.Tensor, csc_indices: torch.Tensor,
+                     csc_values: Optional[torch.Tensor] = None,
+                     homogeneous: bool = True, block_size: Optional[int] = None,
+                     permute_block_size: Optional[int] = None,
+                     bd1: Optional[torch.Tensor] = None, bd2: Optional[torch.Tensor] = None,
+                     gamma: Optional[torch.Tensor] = None,
+                     output_permutation: bool = False):
+    """
+    :func:`MonarchHMM` with a **fixed sparse emission support** (the Monarch
+    counterpart of :func:`SparseHMM`): emissions are a
+    :class:`SparseCategorical` in CSC form and the chain uses
+    :func:`sparse_multiply` / :func:`sparse_summate`, so BD1 compiles to
+    :class:`SparseInputBlockDiagonalSumLayer`, BD2 to
+    :class:`SparseOutputBlockDiagonalSumLayer` and the emission products to
+    :class:`CoSparseProdLayer` — per block only the rows active under the
+    observed token are computed.
+
+    :param csc_indptr: long ``[num_emits + 1]`` column pointers
+    :param csc_indices: long ``[nnz]`` latent (row) ids, column-major order
+    :param csc_values: optional ``[nnz]`` emission probabilities in CSC order;
+        random (row-normalised) when omitted
+
+    The remaining parameters are those of :func:`MonarchHMM`.
+    """
+    csc_indptr = torch.as_tensor(csc_indptr, dtype = torch.long).cpu().contiguous()
+    csc_indices = torch.as_tensor(csc_indices, dtype = torch.long).cpu().contiguous()
+
+    def build_input(num_node_blocks: int):
+        ns = inputs(seq_length - 1, num_node_blocks = num_node_blocks,
+                    dist = SparseCategorical(num_cats = num_emits),
+                    csc_indptr = csc_indptr, csc_indices = csc_indices)
+        if csc_values is not None:
+            values = torch.as_tensor(csc_values, dtype = torch.float32).cpu().contiguous()
+            assert values.numel() == csc_indices.numel()
+            ns.set_params(values, normalize = False)
+        return ns
+
+    return _monarch_chain(seq_length, num_latents, build_input, sparse_multiply, sparse_summate,
+                          homogeneous, block_size, permute_block_size,
+                          bd1, bd2, gamma, output_permutation)
+
+
+def _monarch_chain(seq_length, num_latents, build_input, emit_multiply, root_summate,
+                   homogeneous, block_size, permute_block_size, bd1, bd2, gamma,
+                   output_permutation):
+    """Shared chain of :func:`MonarchHMM` / :func:`SparseMonarchHMM`;
+    ``build_input`` makes the emission input nodes, ``emit_multiply`` /
+    ``root_summate`` are the (sparse or plain) product / root constructors."""
     if block_size is None:
         block_size = monarch_block_size(num_latents)
     assert block_size > 0 and (block_size & (block_size - 1)) == 0, "block_size must be a power of two"
@@ -81,16 +147,16 @@ def MonarchHMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: b
     num_node_blocks = num_latents // block_size
     bd_edges = block_diagonal_edge_ids(num_node_blocks)
     perm = monarch_permutation(num_latents, permute_block_size)
+    emit_kwargs = {}
+    if output_permutation:
+        emit_kwargs = dict(
+            edge_ids = torch.stack([torch.arange(num_latents), perm[:, 0]], dim = 1),
+            sparse_edges = True,
+        )
 
     with set_block_size(block_size = block_size):
 
-        ns_input = inputs(
-            seq_length - 1, num_node_blocks = num_node_blocks,
-            dist = Categorical(num_cats = num_emits)
-        )
-        if beta is not None:
-            assert beta.size(0) == num_latents and beta.size(1) == num_emits
-            ns_input.set_params(beta)
+        ns_input = build_input(num_node_blocks)
 
         ns_bd1 = None
         ns_bd2 = None
@@ -118,9 +184,9 @@ def MonarchHMM(seq_length: int, num_latents: int, num_emits: int, homogeneous: b
             else:
                 ns2 = ns_bd2.duplicate(np_perm, tie_params = homogeneous)
 
-            curr_zs = multiply(curr_xs, ns2)
+            curr_zs = emit_multiply(curr_xs, ns2, **emit_kwargs)
 
-        ns = summate(curr_zs, num_node_blocks = 1, block_size = 1)
+        ns = root_summate(curr_zs, num_node_blocks = 1, block_size = 1)
 
         if gamma is not None:
             assert gamma.dim() == 1 and gamma.size(0) == num_latents

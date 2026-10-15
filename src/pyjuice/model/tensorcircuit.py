@@ -405,8 +405,11 @@ class TensorCircuit(nn.Module):
             # The standard ``_fw_missing_mask_kernel`` runs on ``node_mars`` at
             # the input layer, but sparse-input ns's bypass ``node_mars``
             # entirely and write straight to ``element_mars``, so the mask has
-            # to be re-applied here. Plain :class:`ProdLayer` ignores it.
-            missing_mask_for_prod = kwargs.get("missing_mask", None)
+            # to be re-applied here. Plain :class:`ProdLayer` ignores it. Inner
+            # layers only read it on the host (see ``_host_missing_mask``).
+            missing_mask_for_prod = self._host_missing_mask(kwargs.get("missing_mask", None))
+            inner_kwargs = kwargs if "missing_mask" not in kwargs else \
+                {**kwargs, "missing_mask": missing_mask_for_prod}
 
             # Inner layers
             def _run_inner_layers(static_ctx = None):
@@ -432,7 +435,7 @@ class TensorCircuit(nn.Module):
                                     data_cpu = self._run_data_cpu,
                                     data_list = self._run_data_list,
                                     pattern_cache = self._run_pattern_cache,
-                                    **kwargs, **extra)
+                                    **inner_kwargs, **extra)
 
                     else:
                         raise ValueError(f"Unknown layer type {type(layer)}.")
@@ -663,7 +666,7 @@ class TensorCircuit(nn.Module):
             # marginalised positions. Both the prod-layer re-forward (at
             # line "_for_backward=True" below) and the sum-layer backward
             # need to see it so they take the all-rows-at-missing branch.
-            missing_mask_for_prod = kwargs.get("missing_mask", None)
+            missing_mask_for_prod = self._host_missing_mask(kwargs.get("missing_mask", None))
 
             # Inner layers
             def _run_inner_layers():
@@ -897,6 +900,15 @@ class TensorCircuit(nn.Module):
         with torch.no_grad():
             self.forward(inputs, params)
             self.backward(inputs = inputs, compute_param_flows = True, flows_memory = 1.0)
+
+    def _host_missing_mask(self, missing_mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """``missing_mask`` as the inner layers get it. They only read it on the
+        host (per-variable branch choices of the sparse layers), so a device
+        mask is copied once per pass here instead of once per layer call — a
+        device sync each, 4 per step of a sparse Monarch chain."""
+        if missing_mask is not None and self._has_sparse_prod and missing_mask.device.type != "cpu":
+            return missing_mask.cpu()
+        return missing_mask
 
     def init_param_flows(self, flows_memory: float = 1.0, batch_size: Optional[int] = None):
         """
@@ -1614,16 +1626,21 @@ class TensorCircuit(nn.Module):
                             out_var_ids = []
                             out_dists = []
                             out_num_rows = []
+                            out_row_maps = []
                             for sum_ns in nodes:
                                 consumer = sparse_out_sums[id(sum_ns)]
                                 out_var_ids.append(consumer.var_id)
                                 out_dists.append(consumer.sparse_input_ns.dist)
                                 out_num_rows.append(consumer.num_nodes)
+                                # Which of this sum's nodes each consumer row
+                                # reads (e.g. a second Monarch permutation).
+                                out_row_maps.append(consumer.dense_row_map(consumer.dense_ch_idxs[0]))
                             layer_cls = SparseOutputBlockDiagonalSumLayer
                             extra_kwargs = {
                                 "output_sparsity_var_ids": out_var_ids,
                                 "output_sparsity_dists": out_dists,
                                 "output_sparsity_num_rows": out_num_rows,
+                                "output_row_maps": out_row_maps,
                             }
                         elif mode == "dense":
                             layer_cls = DenseSumLayer
@@ -1971,6 +1988,12 @@ class TensorCircuit(nn.Module):
                 if id(consumer) in demoted:
                     continue
                 if consumer.num_dense_chs != 1:
+                    continue
+                # The sparse-IO sum kernels compute the consumer's own CSC
+                # rows; a row-mapped consumer (see
+                # ``SparseProdNodes.dense_row_map``) reads other rows, so
+                # leave this sum dense-out and the consumer reads node_mars.
+                if not consumer.has_identity_dense_maps():
                     continue
                 sparse_io_sums[id(ns)] = consumer
 
