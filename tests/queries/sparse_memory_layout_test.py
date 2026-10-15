@@ -85,7 +85,8 @@ def test_existing_tree_builder_preserves_fallback_rows(monkeypatch, plain):
                         lambda layer: reduce(gcd, [n.num_nodes for n in layer.nodes]))
     monkeypatch.setattr(cls, 'to', lambda self, device: self)
     monkeypatch.setattr(juice, 'TensorCircuit',
-                        lambda root, **kw: cls(root, disable_gpu_compilation=True, **kw))
+                        lambda root, **kw: cls(root, disable_gpu_compilation=True,
+                                               compact_sparse_buffers=True, **kw))
     pc, _ = _build_tree(plain_subtree_roots=plain)
     found = False
     for layer in pc.input_layer_group:
@@ -111,7 +112,8 @@ def test_packed_products_need_no_dense_metadata(monkeypatch, kind):
     else:
         root = SparseHMM(4, 8, 16, cptr, rid, vals, block_size=8)
     root.init_parameters()
-    pc = juice.TensorCircuit(root, disable_gpu_compilation=True, verbose=False)
+    pc = juice.TensorCircuit(root, disable_gpu_compilation=True, verbose=False,
+                             compact_sparse_buffers=True)
     from pyjuice.layer.sparse_prod_layer import SparseProdLayer
     packed = [layer for group in pc.inner_layer_groups for layer in group
               if isinstance(layer, SparseProdLayer)]

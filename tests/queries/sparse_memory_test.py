@@ -24,7 +24,7 @@ def test_compact_training_and_conditional_match_dense_layout(kind, B):
     assert a.num_logical_nodes == b.num_nodes
     for turn in range(2):
         x = torch.randint(0, 23, (B, 7), device='cuda:0')
-        ya = a(x, apply_cudagraph=False)
+        ya = a(x, record_cudagraph=True)  # training replays the compact forward graph
         yb = b(x, apply_cudagraph=False)
         torch.testing.assert_close(ya, yb, rtol=0, atol=3e-5)
         for pc in (a, b):

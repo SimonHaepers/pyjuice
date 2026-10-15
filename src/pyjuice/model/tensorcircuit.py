@@ -161,9 +161,11 @@ class TensorCircuit(nn.Module):
     :type fuse_permutations: bool
 
     :param compact_sparse_buffers: Omit dense storage for compiler-proven packed
-        inputs/sums, and share the temporary rows of sparse-output BD layers.
-        Mixed input layers retain their dense layout. Set False for custom
-        callbacks or diagnostics that directly index every logical node.
+        inputs/sums, and share the temporary rows of sparse-output BD layers
+        (saves memory on large sparse models). Mixed input layers retain their
+        dense layout. Off by default: then every logical node keeps its
+        ``node_mars`` / ``node_flows`` rows, so partition evaluation, sampling,
+        custom callbacks and diagnostics can index any node.
     :type compact_sparse_buffers: bool
 
     :param verbose: Whether to display the progress of the compilation
@@ -178,7 +180,7 @@ class TensorCircuit(nn.Module):
                  use_dense_sum_layer: bool = False,
                  param_dtype: torch.dtype = torch.float32,
                  verbose: bool = True, fuse_permutations: bool = True,
-                 compact_sparse_buffers: bool = True) -> None:
+                 compact_sparse_buffers: bool = False) -> None:
 
         super(TensorCircuit, self).__init__()
 
@@ -2450,7 +2452,7 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
             max_tied_ns_per_parflow_block: int = 8,
             device: Optional[Union[int,torch.device]] = None,
             use_dense_sum_layer: bool = False,
-            verbose: bool = True, compact_sparse_buffers: bool = True) -> nn.Module:
+            verbose: bool = True, compact_sparse_buffers: bool = False) -> nn.Module:
     """
     Compile a PC represented by a DAG into an equivalent `torch.nn.Module`.
 
@@ -2479,9 +2481,11 @@ def compile(ns: CircuitNodes, layer_sparsity_tol: float = 0.5,
     :type use_dense_sum_layer: bool
 
     :param compact_sparse_buffers: Omit dense storage for compiler-proven packed
-        inputs/sums, and share the temporary rows of sparse-output BD layers.
-        Mixed input layers retain their dense layout. Set False for custom
-        callbacks or diagnostics that directly index every logical node.
+        inputs/sums, and share the temporary rows of sparse-output BD layers
+        (saves memory on large sparse models). Mixed input layers retain their
+        dense layout. Off by default: then every logical node keeps its
+        ``node_mars`` / ``node_flows`` rows, so partition evaluation, sampling,
+        custom callbacks and diagnostics can index any node.
     :type compact_sparse_buffers: bool
 
     :param verbose: Whether to display the progress of the compilation
