@@ -75,11 +75,11 @@ def _build_tree(plain_subtree_roots=False, H=64, V=30, bs=16, density=0.3, seed=
 
 def _set_ws(monkeypatch, mode, prec="ieee", active_children=None):
     """``active_children``: force the WS kernels on (True) / off (False) the
-    batch's active children (``_WS_GATHER_MIN_W``), or leave the default."""
+    batch's active children (``_WS_ACTIVE_MODE``), or leave the default."""
     monkeypatch.setattr(sio, "_WS_MODE", mode)
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
     if active_children is not None:
-        monkeypatch.setattr(sio, "_WS_GATHER_MIN_W", 0 if active_children else 1 << 62)
+        monkeypatch.setattr(sio, "_WS_ACTIVE_MODE", "always" if active_children else "never")
 
 
 def _eager(pc, x):

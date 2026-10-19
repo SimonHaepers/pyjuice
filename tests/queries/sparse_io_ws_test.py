@@ -42,11 +42,11 @@ def _pass(pc, data, flows_memory=0.0, negate=False):
 
 def _set(monkeypatch, mode, prec="ieee", active_children=None):
     """``active_children``: force the WS kernels on (True) / off (False) the
-    batch's active children (``_WS_GATHER_MIN_W``), or leave the default."""
+    batch's active children (``_WS_ACTIVE_MODE``), or leave the default."""
     monkeypatch.setattr(sio, "_WS_MODE", mode)
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
     if active_children is not None:
-        monkeypatch.setattr(sio, "_WS_GATHER_MIN_W", 0 if active_children else 1 << 62)
+        monkeypatch.setattr(sio, "_WS_ACTIVE_MODE", "always" if active_children else "never")
 
 
 def _assert_flows_close(got, ref, rtol, what):
@@ -55,16 +55,22 @@ def _assert_flows_close(got, ref, rtol, what):
     assert err < rtol, f"{what}: max |diff| / max |ref| = {err:.2e} (tol {rtol:.0e})"
 
 
+_NO_WS = {"fwd": 0, "bwd": 0, "fwd_active": 0, "bwd_active": 0}
+
+
 def _count_ws_calls(monkeypatch):
-    calls = {"fwd": 0, "bwd": 0}
+    """WS block calls per pass, and how many of them took the active-children pass."""
+    calls = dict(_NO_WS)
     fwd, bwd = sio.SparseIOSumLayer._ws_forward_block, sio.SparseIOSumLayer._ws_backward_block
 
     def counted_fwd(self, *a, **k):
         calls["fwd"] += 1
+        calls["fwd_active"] += bool(k.get("active_children"))
         return fwd(self, *a, **k)
 
     def counted_bwd(self, *a, **k):
         calls["bwd"] += 1
+        calls["bwd_active"] += bool(k.get("active_children"))
         return bwd(self, *a, **k)
 
     monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_forward_block", counted_fwd)
@@ -180,45 +186,50 @@ def test_ws_em_step_matches_gather(monkeypatch):
     torch.testing.assert_close(params["always_ll"], params["never_ll"], rtol=0.0, atol=1e-4)
 
 
-def test_ws_auto_batch_threshold(monkeypatch):
-    """``auto`` (the default) takes WS from ``_WS_MIN_BATCH`` samples up and
-    leaves smaller batches — B=1 inference above all — on the gather kernels.
-    The emission density here keeps the circuit well clear of the
-    ``_WS_COST_RATIO`` guard, so the batch size is what decides."""
+def test_ws_auto_dispatch_by_cost(monkeypatch):
+    """``auto`` (the default) takes per batch the cheapest kernel set by the
+    cost model of ``_ws_dispatch``: B=1 inference stays on the gather kernels;
+    at H=4096 / d=0.2 (W right at ``_WS_MIN_W``) a small batch takes the WS
+    pass over its active children (few of them, while the batched gather
+    kernel is latency-bound), a big one the full pass (most children active,
+    the forward kernel over the active ones no longer pays). Lifting the W
+    floor above W keeps every batch on the gather kernels."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     H, V, T = 4096, 50, 4
     pc = _build(H, V, T, 1024, 0.2, seed=7)
     assert all(g.eligible for g in pc._sparse_io_ws_groups)
+    assert sio._WS_MIN_W <= H * H
 
-    for B, expect_ws in ((1, False), (2, False), (15, False), (16, True), (24, True)):
+    for B, expect in ((1, None), (2, "active"), (4, "active"), (16, "full"), (64, "full")):
         calls = _count_ws_calls(monkeypatch)
         _set(monkeypatch, "auto")
-        monkeypatch.setattr(sio, "_WS_MIN_BATCH", 16)
         _pass(pc, torch.randint(0, V, (B, T), device="cuda:0"))
-        used = calls["fwd"] > 0
-        assert used is expect_ws, f"B={B}: WS used={used}, expected {expect_ws}"
-        if expect_ws:
-            assert calls["fwd"] == T - 1 and calls["bwd"] == T - 1
+        if expect is None:
+            assert calls == _NO_WS, f"B={B}: {calls}"
+        else:
+            active = T - 1 if expect == "active" else 0
+            assert calls == {"fwd": T - 1, "bwd": T - 1, "fwd_active": active,
+                             "bwd_active": active}, f"B={B}: {calls}"
 
-    # The threshold is the knob: raising it pushes B=16 back to gather.
+    # The W floor is a knob: a W below it stays on the gather kernels at any B.
     calls = _count_ws_calls(monkeypatch)
     _set(monkeypatch, "auto")
-    monkeypatch.setattr(sio, "_WS_MIN_BATCH", 32)
+    monkeypatch.setattr(sio, "_WS_MIN_W", H * H + 1)
     _pass(pc, torch.randint(0, V, (16, T), device="cuda:0"))
-    assert calls == {"fwd": 0, "bwd": 0}
+    assert calls == _NO_WS
 
 
 def test_ws_auto_skips_small_circuits(monkeypatch):
-    """A circuit too small to amortise a pass over W stays on the gather
-    kernels however large the batch (``_WS_COST_RATIO``)."""
+    """A circuit whose W sits in the L2 cache stays on the gather kernels
+    however large the batch (``_WS_MIN_W``)."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     pc = _build(1024, 400, 4, 1024, 0.01, seed=8)
     calls = _count_ws_calls(monkeypatch)
     _set(monkeypatch, "auto")
     _pass(pc, torch.randint(0, 400, (64, 4), device="cuda:0"))
-    assert calls == {"fwd": 0, "bwd": 0}
+    assert calls == _NO_WS
 
 
 def _skewed_csc(H, V, n_dense, tail_nnz, seed):
@@ -263,6 +274,7 @@ def test_ws_graph_dispatch_uses_expected_support(monkeypatch, skewed):
 
     calls = _count_ws_calls(monkeypatch)
     _set(monkeypatch, "auto")
+    monkeypatch.setattr(sio, "_WS_MIN_W", 0)       # H=1024: let the pairs decide
     ll = pc(x, record_cudagraph=True).detach().clone()
     pc.backward(x, compute_param_flows=True, flows_memory=0.0)
     emit = torch.cat([layer.param_flows.detach().reshape(-1).clone()
@@ -278,7 +290,7 @@ def test_ws_graph_dispatch_uses_expected_support(monkeypatch, skewed):
         assert calls["fwd"] > 0 and calls["bwd"] == T - 1
     else:
         assert est < 400, est
-        assert calls == {"fwd": 0, "bwd": 0}
+        assert calls == _NO_WS
     torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
     _assert_flows_close(pf, pf_ref, 1e-4, "transition param flows")
     _assert_flows_close(emit, emit_ref, 1e-4, "emission param flows")
@@ -339,4 +351,4 @@ def test_ws_skips_ineligible_blocks(monkeypatch):
     calls = _count_ws_calls(monkeypatch)
     _set(monkeypatch, "always")
     _pass(pc, torch.randint(0, 12, (6, 5), device="cuda:0"))
-    assert calls == {"fwd": 0, "bwd": 0}
+    assert calls == _NO_WS

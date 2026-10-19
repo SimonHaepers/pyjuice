@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import math
 import os
 import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -64,15 +65,17 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 # reduction axis block by block, and multiply against the batch's activations
 # densified for that block (zeros outside each sample's support) on the tensor
 # cores. Cost is one pass over W per step, independent of the support size —
-# or, from ``_WS_GATHER_MIN_W`` elements of W on, one pass over the rows of
-# W^T of the batch's active children only (their sorted union, compacted on
-# the device each step), which is what the batch can share.
+# or one pass over the rows of W^T of the batch's active children only (their
+# sorted union, compacted on the device each step), which is what the batch
+# can share, when that union is small (:func:`_ws_dispatch`).
 #
 # Parameter flows of tied transitions (the homogeneous HMM chain) are deferred:
 # each step stashes its densified factors and bounded chunks feed GEMMs,
 # ``pflow += W * sum_t G_t^T X_t``, instead of B * K_in * K_out atomics per step.
 #
-# This is ON BY DEFAULT from ``_WS_MIN_BATCH`` samples up (EM training); B=1
+# This is ON BY DEFAULT (``"auto"``): every batched block takes the cheapest of
+# gather / full W pass / active-children pass by the cost model of
+# :func:`_ws_dispatch`, calibrated on the trained wikitext chains; B=1
 # inference keeps the gather kernels, which are faster there. It costs one fp32
 # copy of W plus the stash, and :meth:`_WSGroup.ensure_ready` falls back to the
 # gather kernels rather than OOM when those do not fit. Results differ from the
@@ -80,20 +83,26 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 # ``_WS_PRECISION="ieee"`` is bit-comparable but gives up most of the speedup.
 
 _WS_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS", "auto")
-"""``"auto"`` (the default) — WS from ``_WS_MIN_BATCH`` samples up, as long as
-the circuit is big enough for a W pass to pay off (``_WS_COST_RATIO``);
-``"always"`` — WS whenever eligible (tests / A-B runs); ``"never"`` — gather
-kernels only."""
+"""``"auto"`` (the default) — each batched block takes the cheapest of its
+kernel sets by the cost model of :func:`_ws_dispatch` (gather / full W pass /
+active-children pass; the block-diagonal layers go dense from
+``_WS_MIN_BATCH`` samples up); ``"always"`` — WS whenever eligible (tests /
+A-B runs; ``_WS_ACTIVE_MODE`` picks the pass); ``"never"`` — gather kernels
+only."""
+
+_WS_ACTIVE_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_ACTIVE", "auto")
+"""Which W pass the WS kernels take: ``"auto"`` — the cost model decides
+between the full pass and the pass over the batch's active children;
+``"always"`` / ``"never"`` — force one (tests / A-B runs)."""
 
 _WS_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_MIN_BATCH", "16"))
-"""Smallest batch size that takes the WS kernels in ``"auto"`` mode. Below it
-the gather kernels win: they touch only the active ``(sample, in, out)`` pairs,
-while a W pass costs the same whatever the batch. That makes the choice a
-near-pure function of B — measured EM step (fwd+bwd, trained H=16k / d=0.01
-chain, T=128) WS vs gather: B=2 0.85x, B=4 0.87x, B=8 0.94x, B=16 1.06x,
-B=32 1.32x, B=64 2.4x (3.8x on an uncontended H100). The crossover sits
-between 8 and 16, hence 16. WS step time is nearly flat in B (477 ms at B=2,
-501 ms at B=32), so raising the training batch size is close to free."""
+"""Smallest batch the block-diagonal (Monarch) layers run their dense batched
+path at in ``"auto"`` mode (``_bd_dense_batched`` in
+``sparse_io_block_diagonal_sum_layer``); below it their per-sample kernels
+win. The sparse-IO layer does not use it any more: its cost model
+(:func:`_ws_dispatch`) covers every batch from B=2 up, and on the trained
+H=16k chains a WS pass already wins from B=2 (the batched gather kernel is
+latency-bound below ~16 samples)."""
 
 _WS_PRECISION = os.environ.get("PYJUICE_SPARSE_IO_WS_PRECISION", "tf32")
 """``"tf32"`` — tensor-core tf32 on operands pre-rounded to nearest (a per-pass
@@ -101,28 +110,77 @@ rounded copy of W plus rounding at densify time), so the error is zero-mean
 (~1e-4 relative) rather than the ~-6e-4 bias of tf32 truncation; ``"ieee"`` —
 exact fp32 FMA, ~3x slower than tf32 but still memory-bound at B=64."""
 
-_WS_COST_RATIO = 32.0
-"""Measured (H100) cost of one gathered (sample, in, out) pair in the gather
-kernels relative to one streamed W element in the WS kernels. Guards the
-batch-size rule against circuits too small to amortise a W pass: a chain with
-H=1024 / d=0.01 gathers ~1e4 pairs per step against 1e6 W elements, so it stays
-on the gather kernels at any batch size. On the H=16k chains this is slack
-(B=16 gathers ~5e8 weighted pairs against H^2 = 2.7e8), i.e. the effective rule
-there is ``B >= _WS_MIN_BATCH``."""
+_WS_MIN_W = 1 << 24
+"""Elements of W (``H_out * H_in``) below which a block stays on the gather
+kernels at any batch size: a smaller W (64 MB fp32 at 2^24) sits in the L2
+cache, where the gather kernels read it as cheaply as a streaming pass. On the
+trained H=2048 wikitext chains gather beats every WS variant up to B=64
+(forward 1.0 vs 1.7 ms, EM step 15 vs 26 ms at B=64)."""
+
+# Cost model of :func:`_ws_dispatch`, in units of one streamed W element of the
+# full WS pass (~2.9 TB/s on an H100 NVL). Calibrated 2026-10-19 on the trained
+# wikitext chains (H=8k..32k, emission density 0.01..0.1, T=128): per-sample
+# gather kernels vs the two WS passes, CUDA-graph forward and eager EM backward.
+_WS_GATHER_PAIR_COST = 6.0
+"""Forward cost of one gathered ``(sample, in, out)`` pair from B=16 up (the
+gather kernel moves ~1.2e11 pairs/s: one 32B sector per 4B weight)."""
+_WS_GATHER_PAIR_COST_SMALL = 14.0
+"""The same below B=16, where the batched gather kernel's grid (one program per
+32 output rows and sample) leaves most of the SMs idle (~5e10 pairs/s)."""
+_WS_GATHER_PAIR_COST_BWD = 15.0
+"""Backward with parameter flows: the gather kernel adds one atomic per pair
+(~4e10 pairs/s at H=16k, worse when the samples' supports overlap)."""
+_WS_ACTIVE_COST = 1.7
+"""Forward cost of one element of the active children's rows of W^T relative
+to a streamed element of the full pass (gathered rows, index loads), up to
+``_WS_ACTIVE_MAX_BATCH`` samples; above that the forward kernel loses its
+advantage (2x the full pass per element at B=16, 4.5x at B=64, H=16k)."""
+_WS_ACTIVE_MAX_BATCH = 8
+"""Largest batch the forward takes the active-children pass at."""
+_WS_ACTIVE_COST_BWD = 2.0
+"""Backward counterpart of ``_WS_ACTIVE_COST``; the backward kernel keeps its
+advantage at every batch size (0.8x the full pass at B=16, 1.0x at B=64)."""
+_WS_UNION_EXP = 0.7
+"""The expected union of ``B`` samples' input supports is modelled as that of
+``B ** _WS_UNION_EXP`` independent columns of the expected length: the
+frequent tokens' supports overlap heavily (fits 0.56..0.84 on the chains)."""
 
 _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
 GEMM materialises at a time (256 MB fp32)."""
 
-_WS_GATHER_MIN_W = 1 << 24
-"""From this many elements of W (``H_out * H_in``) on, the WS kernels walk
-only the batch's active children — the sorted union of the samples' input
-columns, compacted on the device each step (:func:`_ws_active_children`) —
-each a contiguous run of parents of W, instead of streaming all of W: the W
-traffic of a step becomes ``U_in * H_out`` for a union of ``U_in`` children
-(37-62 % of H at B=16 on the trained H<=16k wikitext chains, ~100 % at B=64,
-where nothing changes). Below the threshold the four extra launches per step
-cost more than the bytes they save; 2^24 (H=4096) is provisional."""
+def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
+                 backward: bool) -> Optional[str]:
+    """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
+    kernels), ``"full"`` (WS, one pass over W) or ``"active"`` (WS, one pass
+    over the rows of W^T of the batch's active children, compacted on the
+    device each step by :func:`_ws_active_children`) — the cheapest by the
+    cost model above for ``B`` samples with ``pairs`` active ``(sample, in,
+    out)`` pairs per step and ``k_in`` active children per sample (the batch's
+    own counts, or the model's expectation for a CUDA graph), under the
+    ``_WS_MODE`` / ``_WS_ACTIVE_MODE`` overrides."""
+    if _WS_MODE == "never":
+        return None
+    W = float(H_in) * float(H_out)
+    # Expected fraction of the children some sample of the batch activates.
+    u = 1.0 - (1.0 - min(k_in, H_in) / H_in) ** (B ** _WS_UNION_EXP)
+    if backward:
+        c_gather = pairs * _WS_GATHER_PAIR_COST_BWD
+        c_active = u * W * _WS_ACTIVE_COST_BWD
+    else:
+        c_gather = pairs * (_WS_GATHER_PAIR_COST if B >= 16 else _WS_GATHER_PAIR_COST_SMALL)
+        c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
+    c_full = W
+    if _WS_ACTIVE_MODE == "never":
+        c_active = math.inf
+    elif _WS_ACTIVE_MODE == "always":
+        c_full = math.inf
+    ws, c_ws = ("active", c_active) if c_active < c_full else ("full", c_full)
+    if _WS_MODE == "always":
+        return ws
+    if B < 2 or W < _WS_MIN_W or c_gather <= c_ws:
+        return None
+    return ws
 
 
 class SparseIOSumLayer(SparseInputSumLayer):
@@ -370,8 +428,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
             TILE_M = 32
 
-            if sv_in.is_batched and self._ws_use(blk_idx, block, sv_in, sv_out, params):
-                self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params)
+            ws = self._ws_use(blk_idx, block, sv_in, sv_out, params) if sv_in.is_batched else None
+            if ws is not None:
+                self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params,
+                                       active_children=ws == "active")
             elif sv_in.is_batched:
                 assert sv_out.is_batched
                 self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
@@ -510,8 +570,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
             )
             self._sparse_outputs[blk_idx] = sv_out
 
-            if self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx):
-                self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params)
+            ws = self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx)
+            if ws is not None:
+                self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params,
+                                       active_children=ws == "active")
             elif B == 1:
                 self._launch_single_forward(blk_idx, block, sv_in, sv_out, sv_in.max_val,
                                             params, static_ctx)
@@ -521,32 +583,37 @@ class SparseIOSumLayer(SparseInputSumLayer):
                                              params, B, TILE_M)
 
     def _ws_use_static(self, blk_idx: int, sparse_prod: SparseProdLayer, ns_idx: int,
-                       params: torch.Tensor, static_ctx) -> bool:
+                       params: torch.Tensor, static_ctx) -> Optional[str]:
         """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
-        column sizes: the cost guard uses the model's expected supports
-        (:meth:`_ws_static_pairs`). The answer is memoised for consistent
+        column sizes: the cost model runs on the model's expected supports
+        (:meth:`_ws_static_support`). The answer is memoised for consistent
         warmup and capture dispatch."""
         key = (id(self), blk_idx)
-        use = static_ctx.ws_decisions.get(key)
-        if use is not None:
-            return use
-        use = False
+        if key in static_ctx.ws_decisions:
+            return static_ctx.ws_decisions[key]
+        use = None
         ws = self._ws_slots[blk_idx]
         if ws is not None and _WS_MODE != "never" and ws[0].eligible:
             group = ws[0]
-            use = True
-            if _WS_MODE != "always":
-                pairs = self._ws_static_pairs(blk_idx, static_ctx.B, static_ctx)
-                use = (static_ctx.B >= _WS_MIN_BATCH
-                       and pairs * _WS_COST_RATIO >= group.H_out * group.H_in)
-            use = use and group.ensure_ready(params, static_ctx.B, need_stash=False)
+            B = static_ctx.B
+            avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
+            use = _ws_dispatch(B, group.H_in, group.H_out, B * avg_in * avg_out, avg_in,
+                               backward=False)
+            if use is not None and not group.ensure_ready(params, B, need_stash=False):
+                use = None
         static_ctx.ws_decisions[key] = use
         return use
 
     def _ws_static_pairs(self, blk_idx: int, B: int, static_ctx) -> float:
-        """Expected active ``(sample, in, out)`` pairs per step of a batch
-        whose column lengths live on the device (CUDA-graph forward, backward
-        after a replay), from the model rather than from the tokens of any
+        """Expected active ``(sample, in, out)`` pairs per step of a batch of
+        ``B`` (:meth:`_ws_static_support`)."""
+        avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
+        return B * avg_in * avg_out
+
+    def _ws_static_support(self, blk_idx: int, static_ctx) -> Tuple[float, float]:
+        """Expected active children and parents per sample of a batch whose
+        column lengths live on the device (CUDA-graph forward, backward after
+        a replay), from the model rather than from the tokens of any
         particular batch, so a graph's dispatch does not depend on what it
         was captured on: the expected column length of each side's
         distribution (:meth:`SparseCategorical.expected_col_nnz`, weighted by
@@ -568,7 +635,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             avg_out = out_dist._num_nodes
         else:
             avg_out = out_dist.expected_col_nnz()
-        return B * avg_in * avg_out
+        return avg_in, avg_out
 
     def graph_columns(self):
         return list(zip(self._output_sparsity_dists, self._output_sparsity_var_ids))
@@ -680,12 +747,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_flow_in.values.zero_()
                 continue
 
-            if sv_in.is_batched and self._ws_use(blk_idx, block, sv_in, sv_out, params,
-                                                 need_stash=compute_pflows,
-                                                 static_ctx=kwargs.get("static_ctx")):
+            ws = (self._ws_use(blk_idx, block, sv_in, sv_out, params, need_stash=compute_pflows,
+                               static_ctx=kwargs.get("static_ctx"))
+                  if sv_in.is_batched else None)
+            if ws is not None:
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
+                    active_children=ws == "active",
                 )
             elif sv_in.is_batched:
                 BLOCK_B = _BWD_BATCHED_BLOCK_B
@@ -760,41 +829,44 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
     def _ws_use(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                 sv_out: SparseNodeValues, params: torch.Tensor,
-                need_stash: bool = False, static_ctx=None) -> bool:
-        """Take the WS kernels for this batched block? (see ``_WS_MODE``)
+                need_stash: bool = False, static_ctx=None) -> Optional[str]:
+        """Kernel set for this batched block: ``None`` for the gather kernels,
+        ``"full"`` / ``"active"`` for the WS kernels and their W pass (see
+        ``_WS_MODE``, :func:`_ws_dispatch`).
 
-        ``"auto"`` asks two cheap questions: is the batch at least
-        ``_WS_MIN_BATCH`` samples (below that the gather kernels win), and is
-        the circuit big enough that one pass over W beats gathering the active
-        pairs (``_WS_COST_RATIO``) — the batch's own pairs, or the model's
-        expected pairs (:meth:`_ws_static_pairs`) for static containers, whose
-        column lengths are on the device. Then :meth:`_WSGroup.ensure_ready`
-        has the last word, so a group whose buffers do not fit stays on the
-        gather kernels instead of failing the run.
+        ``"auto"`` runs the cost model on the batch's own pairs and support,
+        or on the model's expected ones (:meth:`_ws_static_support`) for
+        static containers, whose column lengths are on the device; a backward
+        that accumulates parameter flows (``need_stash``) uses the backward
+        costs. Then :meth:`_WSGroup.ensure_ready` has the last word, so a
+        group whose buffers do not fit stays on the gather kernels instead of
+        failing the run.
         """
         ws = self._ws_slots[blk_idx]
         if ws is None or _WS_MODE == "never":
-            return False
+            return None
         group = ws[0]
         if not group.eligible:
-            return False
-        if _WS_MODE != "always":
-            if sv_in.batch_size < _WS_MIN_BATCH:
-                return False
-            if sv_in.static or sv_out.static:
-                pairs = self._ws_static_pairs(blk_idx, sv_in.batch_size, static_ctx)
-            else:
-                pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
-            if pairs * _WS_COST_RATIO < group.H_out * group.H_in:
-                return False
-        return group.ensure_ready(params, sv_in.batch_size, need_stash)
+            return None
+        B = sv_in.batch_size
+        if sv_in.static or sv_out.static:
+            avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
+            pairs, k_in = B * avg_in * avg_out, avg_in
+        else:
+            pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
+            k_in = sv_in.total_nnz / max(B, 1)
+        use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash)
+        if use is not None and not group.ensure_ready(params, B, need_stash):
+            use = None
+        return use
 
     def _ws_forward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                           sv_out: SparseNodeValues, max_val: torch.Tensor,
-                          params: torch.Tensor) -> None:
+                          params: torch.Tensor, active_children: bool = False) -> None:
         """``sv_out = log(W @ exp(sv_in - max)) + max`` for the whole batch:
-        densify the inputs, stream W once through :func:`_ws_fwd_kernel`,
-        gather the active parents."""
+        densify the inputs, stream W once through :func:`_ws_fwd_kernel` (all
+        of it, or with ``active_children`` only the rows of W^T of the batch's
+        active children), gather the active parents."""
         group, _ = self._ws_slots[blk_idx]
         _, _, _, _, _NB, NB_ch, BS, CBS = block
         B = sv_in.batch_size
@@ -814,15 +886,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
         yd = _ws_scratch("y", (B, H_out), device)
         TM, BB, warps, stages = _ws_tiles(H_out, B, BS, 128, device)
         TK = min(32, CBS)
-        gather_k = H_in * H_out >= _WS_GATHER_MIN_W
-        if gather_k:
+        if active_children:
             active, n_active = _ws_active_children(sv_in, H_in, device)
         else:
             active = n_active = sv_in.nnz                  # unused
         _ws_fwd_kernel[(triton.cdiv(B, BB), H_out // TM)](
             yd, w, xd, max_val, sv_in.nnz, active, n_active, w_start, B, H_in, H_out,
             NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
-            PREC="tf32" if rnd else "ieee", GATHER_K=gather_k,
+            PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
             num_warps=warps, num_stages=stages,
         )
 
@@ -835,8 +906,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
                            sv_out: SparseNodeValues, sv_flow_out: SparseNodeValues,
                            sv_flow_in: SparseNodeValues, params: torch.Tensor,
                            param_flows: Optional[torch.Tensor],
-                           negate_pflows: bool) -> None:
-        """Element flows through :func:`_ws_bwd_flow_kernel`; the parameter
+                           negate_pflows: bool, active_children: bool = False) -> None:
+        """Element flows through :func:`_ws_bwd_flow_kernel` (over all
+        children, or with ``active_children`` only the batch's); the parameter
         flows are only *stashed* here (densified ``G`` / ``X`` factors in
         this block's slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
 
@@ -881,15 +953,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
         fd = _ws_scratch("f", (B, H_in), device)
         TK, BB, warps, stages = _ws_tiles(H_in, B, CBS, 128, device)
         TM = min(32, BS)
-        gather_k = H_in * H_out >= _WS_GATHER_MIN_W
-        if gather_k:
+        if active_children:
             active, n_active = _ws_active_children(sv_in, H_in, device)
         else:
             active = n_active = sv_in.nnz                  # unused
         _ws_bwd_flow_kernel[(triton.cdiv(B, BB), H_in // TK)](
             fd, w, gd, active, n_active, w_start, B, H_in, H_out,
             NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB,
-            PREC="tf32" if rnd else "ieee", GATHER_K=gather_k,
+            PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
             num_warps=warps, num_stages=stages,
         )
 

@@ -184,7 +184,7 @@ class SparseGraphState:
         # tokens on device, e.g. the blocked layers).
         self.data = torch.zeros(pc.num_vars, B, dtype=data_dtype, device=device)
         self._buffers: Dict[tuple, torch.Tensor] = {}
-        self.ws_decisions: Dict[tuple, bool] = {}
+        self.ws_decisions: Dict[tuple, Optional[str]] = {}   # None / "full" / "active"
 
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.node_mars: Optional[torch.Tensor] = None
