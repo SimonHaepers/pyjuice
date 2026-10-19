@@ -438,7 +438,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             TILE_M = 32
 
             ws = self._ws_use(blk_idx, block, sv_in, sv_out, params) if sv_in.is_batched else None
-            if ws is not None:
+            if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params,
                                        active_children=ws == "active")
             elif sv_in.is_batched:
@@ -580,7 +580,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             self._sparse_outputs[blk_idx] = sv_out
 
             ws = self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx)
-            if ws is not None:
+            if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params,
                                        active_children=ws == "active")
             elif B == 1:
@@ -759,7 +759,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws = (self._ws_use(blk_idx, block, sv_in, sv_out, params, need_stash=compute_pflows,
                                static_ctx=kwargs.get("static_ctx"))
                   if sv_in.is_batched else None)
-            if ws is not None:
+            if ws:
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
@@ -863,7 +863,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             pairs, k_in = B * avg_in * avg_out, avg_in
         else:
             pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
-            k_in = sv_in.total_nnz / max(B, 1)
+            k_in = sum(sv_in.nnz_list) / max(B, 1)    # total_nnz is the longest column
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash)
         if use is not None and not group.ensure_ready(params, B, need_stash):
             use = None

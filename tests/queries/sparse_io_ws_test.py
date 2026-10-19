@@ -133,7 +133,9 @@ def test_ws_mixed_dispatch_and_stash_reuse(monkeypatch, active_children):
     def alternating(self, blk_idx, block, sv_in, sv_out, params, need_stash=False,
                     static_ctx=None):
         counter["n"] += 1
-        return self._ws_slots[blk_idx] is not None and counter["n"] % 2 == 0
+        if self._ws_slots[blk_idx] is None or counter["n"] % 2:
+            return None
+        return "active" if active_children else "full"
 
     monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_use", alternating)
     got1 = _pass(pc, d1)
