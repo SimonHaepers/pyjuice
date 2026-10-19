@@ -16,9 +16,23 @@ from .sparse_prod_layer import SparseProdLayer
 
 
 _FWD_BLOCK_K = 64
-"""Fixed K_in-axis tile size for :func:`_sparse_io_sum_forward_kernel`.
-Matches ``sparse_input_sum_layer._FWD_BLOCK_K``; kept as a separate constant
-so the two kernels can diverge in tuning if needed."""
+"""Fixed K_in-axis tile size for :func:`_sparse_io_sum_forward_kernel` and
+:func:`_sparse_io_sum_forward_single_kernel`. Matches
+``sparse_input_sum_layer._FWD_BLOCK_K``; kept as a separate constant so the
+kernels can diverge in tuning if needed."""
+
+_FWD_SINGLE_PROGRAMS_PER_SM = 8
+"""Programs per SM of the single-sample forward
+(:func:`_sparse_io_sum_forward_single_kernel`). Every loop step of a program
+gathers one ``[TILE_M, BLOCK_K]`` tile of scattered weights and then waits a
+full memory latency for it, so the kernel only approaches HBM bandwidth with
+many programs in flight per SM. One program per parent tile gives 15-94 of
+them on the trained H=8k-16k chains (under one wave of 132 SMs, 0.5-1 TB/s
+where cuSPARSE reads 2.8 TB/s), so the children are split as well (split-K:
+one partial sum per (parent tile, child range), reduced by
+:func:`_sparse_io_sum_forward_single_epilogue_kernel`) up to this many
+programs per SM. The split is computed on the device from the actual column
+lengths, so a captured B=1 graph adapts to the batch it replays on."""
 
 _FWD_BATCHED_BLOCK_B = 1
 """Batch-axis tile size for the batched (B>1) forward. Per-sample columns
@@ -350,32 +364,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
                                              batch_size, TILE_M)
             else:
-                grid = (triton.cdiv(K_out, TILE_M), 1)
-                _sparse_io_sum_forward_kernel[grid](
-                    values_out_ptr=sv_out.values,
-                    mparams_ptr=params,
-                    in_indices_ptr=sv_in.indices,
-                    in_values_ptr=sv_in.values,
-                    max_val_ptr=max_val,
-                    out_indices_ptr=sv_out.indices,
-                    in_col_starts_ptr=sv_in.values,   # unused at B=1
-                    in_nnz_ptr=sv_in.values,
-                    out_col_starts_ptr=sv_in.values,
-                    out_nnz_ptr=sv_in.values,
-                    pid_start=pid_start,
-                    K_in=K_in,
-                    K_out=K_out,
-                    batch_size=1,
-                    in_stride=0,
-                    out_stride=0,
-                    NB_ch=NB_ch,
-                    BS=BS,
-                    CBS=CBS,
-                    TILE_M=TILE_M,
-                    BLOCK_K=_FWD_BLOCK_K,
-                    BLOCK_B=1,
-                    IS_BATCHED=False,
-                )
+                self._launch_single_forward(blk_idx, block, sv_in, sv_out, max_val, params)
         return None
 
     def _launch_batched_forward(self, block: tuple, sv_in: SparseNodeValues,
@@ -383,14 +372,11 @@ class SparseIOSumLayer(SparseInputSumLayer):
                                 params: torch.Tensor, batch_size: int,
                                 TILE_M: int) -> None:
         """Batched-layout launch of :func:`_sparse_io_sum_forward_kernel` (B>1,
-        or static containers at any B). Both ``total_nnz`` only bound the
-        grid: the kernel bounds its loop by the per-sample sizes on device.
-        A static B=1 pair takes the single-sample variant (same code as the
-        eager B=1 path), reading its column offsets / sizes on device."""
+        eager or static containers). Both ``total_nnz`` only bound the grid:
+        the kernel bounds its loop by the per-sample sizes on device."""
         _, _, pid_start, _, _, NB_ch, BS, CBS = block
-        single = batch_size == 1
-        assert not single or (sv_in.static and sv_out.static)
-        BLOCK_B = 1 if single else _FWD_BATCHED_BLOCK_B
+        assert batch_size > 1
+        BLOCK_B = _FWD_BATCHED_BLOCK_B
         grid = (triton.cdiv(sv_out.total_nnz, TILE_M),
                 triton.cdiv(batch_size, BLOCK_B))
         _sparse_io_sum_forward_kernel[grid](
@@ -416,9 +402,76 @@ class SparseIOSumLayer(SparseInputSumLayer):
             TILE_M=TILE_M,
             BLOCK_K=_FWD_BLOCK_K,
             BLOCK_B=BLOCK_B,
-            IS_BATCHED=not single,
-            DEVICE_SIZES=single,
         )
+
+    def _launch_single_forward(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
+                               sv_out: SparseNodeValues, max_val: torch.Tensor,
+                               params: torch.Tensor, static_ctx=None) -> None:
+        """Single-sample launch (eager B=1, or the static B=1 containers of a
+        CUDA-graph forward, which read their column offsets / sizes on the
+        device). The grid is ``min(parent tiles * child tiles,
+        _FWD_SINGLE_PROGRAMS_PER_SM * SMs)`` programs that walk the (parent
+        tile, child range) work items — see
+        :func:`_sparse_io_sum_forward_single_kernel`. An eager launch whose
+        children fit one range per parent tile writes the result directly;
+        otherwise the kernel writes one partial sum per work item and the
+        epilogue reduces them."""
+        _, _, pid_start, _, _, NB_ch, BS, CBS = block
+        TILE_M, BLOCK_K = 32, _FWD_BLOCK_K
+        static = sv_in.static
+        assert static == sv_out.static and (not static or static_ctx is not None)
+        n_m = triton.cdiv(sv_out.total_nnz, TILE_M)        # a bound for static containers
+        k_tiles = triton.cdiv(sv_in.total_nnz, BLOCK_K)
+        n_prog = max(1, min(n_m * k_tiles, _FWD_SINGLE_PROGRAMS_PER_SM * _num_sms(params.device)))
+        direct = not static and _single_forward_splits(k_tiles, n_m, n_prog)[0] == 1
+        if direct:
+            partials = sv_out.values                       # unused
+        else:
+            n = max(n_prog, n_m) * TILE_M                  # >= splits * parent tiles * TILE_M
+            if static:
+                partials = static_ctx.buffer((id(self), "fwd_partials", blk_idx), (n,))
+            else:
+                partials = _ws_scratch("fwd_partials", (n,), params.device)
+        _sparse_io_sum_forward_single_kernel[(n_prog,)](
+            values_out_ptr=sv_out.values,
+            partials_ptr=partials,
+            mparams_ptr=params,
+            in_indices_ptr=sv_in.indices,
+            in_values_ptr=sv_in.values,
+            max_val_ptr=max_val,
+            out_indices_ptr=sv_out.indices,
+            in_col_starts_ptr=sv_in.col_starts if static else sv_in.values,  # unused unless static
+            in_nnz_ptr=sv_in.nnz if static else sv_in.values,
+            out_col_starts_ptr=sv_out.col_starts if static else sv_in.values,
+            out_nnz_ptr=sv_out.nnz if static else sv_in.values,
+            pid_start=pid_start,
+            K_in=sv_in.total_nnz,
+            K_out=sv_out.total_nnz,
+            n_prog=n_prog,
+            NB_ch=NB_ch,
+            BS=BS,
+            CBS=CBS,
+            TILE_M=TILE_M,
+            BLOCK_K=BLOCK_K,
+            DEVICE_SIZES=static,
+            DIRECT=direct,
+        )
+        if not direct:
+            BLOCK = 256
+            _sparse_io_sum_forward_single_epilogue_kernel[(triton.cdiv(sv_out.total_nnz, BLOCK),)](
+                values_out_ptr=sv_out.values,
+                partials_ptr=partials,
+                max_val_ptr=max_val,
+                in_nnz_ptr=sv_in.nnz if static else sv_in.values,
+                out_nnz_ptr=sv_out.nnz if static else sv_in.values,
+                K_in=sv_in.total_nnz,
+                K_out=sv_out.total_nnz,
+                n_prog=n_prog,
+                TILE_M=TILE_M,
+                BLOCK_K=BLOCK_K,
+                BLOCK=BLOCK,
+                DEVICE_SIZES=static,
+            )
 
     def _forward_static(self, params: torch.Tensor, static_ctx) -> None:
         """CUDA-graph forward (see ``pyjuice.model.sparse_cudagraph``): output
@@ -446,6 +499,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
             if self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx):
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params)
+            elif B == 1:
+                self._launch_single_forward(blk_idx, block, sv_in, sv_out, sv_in.max_val,
+                                            params, static_ctx)
             else:
                 TILE_M = 32
                 self._launch_batched_forward(block, sv_in, sv_out, sv_in.max_val,
@@ -851,6 +907,23 @@ def _ws_scratch(name: str, shape: Tuple[int, ...], device: torch.device) -> torc
     return buf[:n].view(shape)
 
 
+def _num_sms(device: torch.device) -> int:
+    n_sm = _WS_NUM_SMS.get(device)
+    if n_sm is None:
+        n_sm = torch.cuda.get_device_properties(device).multi_processor_count
+        _WS_NUM_SMS[device] = n_sm
+    return n_sm
+
+
+def _single_forward_splits(k_tiles: int, n_m: int, n_prog: int) -> Tuple[int, int]:
+    """Host mirror of the split rule in :func:`_sparse_io_sum_forward_single_kernel`:
+    ``(splits, child tiles per split)`` for ``k_tiles`` child tiles, ``n_m``
+    parent tiles and ``n_prog`` programs."""
+    n_s = max(1, min(k_tiles, n_prog // max(n_m, 1)))
+    ct = -(-k_tiles // n_s)
+    return -(-k_tiles // ct) if ct > 0 else 1, ct
+
+
 def _ws_tiles(n_rows: int, B: int, blk: int, t_max: int,
               device: torch.device) -> Tuple[int, int, int, int]:
     """``(row tile, batch tile, num_warps, num_stages)``: largest tiles that
@@ -858,10 +931,7 @@ def _ws_tiles(n_rows: int, B: int, blk: int, t_max: int,
     >= 16); batch slices of the same row block are launched adjacently so
     they share W through L2. From B=128 on the in-tile MMA starts to bind
     (H=16k, B=256: 128-wide batch tiles 0.90 ms/step vs 1.35 with 64-wide)."""
-    n_sm = _WS_NUM_SMS.get(device)
-    if n_sm is None:
-        n_sm = torch.cuda.get_device_properties(device).multi_processor_count
-        _WS_NUM_SMS[device] = n_sm
+    n_sm = _num_sms(device)
     BB = 128 if B >= 128 else (64 if B >= 64 else max(16, triton.next_power_of_2(B)))
     T = min(t_max, blk)
     while T > 16 and (n_rows // T) * triton.cdiv(B, BB) < n_sm:
@@ -1091,158 +1161,242 @@ def _sparse_io_sum_forward_kernel(
     in_stride, out_stride,
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
-    BLOCK_B: tl.constexpr, IS_BATCHED: tl.constexpr,
-    DEVICE_SIZES: tl.constexpr = False,
+    BLOCK_B: tl.constexpr,
 ):
-    """Forward for one SparseIOSumLayer block. Grid =
-    ``(cdiv(K_out, TILE_M), cdiv(B, BLOCK_B))`` (axis 1 degenerate at B=1).
-    ``DEVICE_SIZES`` (B=1 variant only): read the column offsets / sizes from
-    the ``*_col_starts`` / ``*_nnz`` pointers — a static B=1 container of the
-    CUDA-graph forward — with ``K_in`` / ``K_out`` as mere bounds.
+    """Batched forward for one SparseIOSumLayer block. Grid =
+    ``(cdiv(K_out, TILE_M), cdiv(B, BLOCK_B))``. Per-program (K_out tile,
+    batch lanes) math:
 
-    Per-program (K_out-tile) math at ``IS_BATCHED == 0``:
-
-      v_k = exp(log_in_values[k] - max_val)                    [per K_in chunk]
-      h_m   = out_indices[m]                                   [TILE_M gather]
+      v_k = exp(log_in_values[b, k] - max_val[b])              [per K_in chunk]
+      h_m   = out_indices[out_col_starts[b] + m]               [TILE_M gather]
       pblock_m, within_m = h_m // BS, h_m % BS
-      cblock_k, cslot_k  = in_indices[k] // CBS, in_indices[k] % CBS
+      c_k = in_indices[in_col_starts[b] + k]
+      cblock_k, cslot_k  = c_k // CBS, c_k % CBS
       W[m, k] = mparams[pid_start + (pblock_m*NB_ch + cblock_k)*CBS*BS
                                    + cslot_k*BS + within_m]
       acc_sum[m] += Σ_{k ∈ chunk} W[m, k] · v_k                [TILE_M]
-      values_out[m] = log(acc_sum[m] + 1e-24) + max_val
+      values_out[b, m] = log(acc_sum[m]) + max_val[b]
 
-    ``IS_BATCHED == 1``: each batch lane reads its own in/out columns
-    (``in_indices[in_col_starts[b] + k]`` masked ``k < in_nnz[b]``,
-    ``out_indices[out_col_starts[b] + m]`` masked ``m < out_nnz[b]``),
-    ``K_in`` / ``K_out`` are only upper bounds (the per-batch max, or the
-    column-size bound of a CUDA-graph forward) — the grid covers ``K_out``
-    and the loop runs to the lanes' own ``in_nnz`` — per-sample
-    ``max_val[b]`` is clamped to ``-1e30``, and lanes with
-    ``in_nnz[b] == 0`` store exact ``-inf``.
+    Each batch lane reads its own in/out columns (``k < in_nnz[b]``,
+    ``m < out_nnz[b]``); ``K_in`` / ``K_out`` are only upper bounds (the
+    per-batch max, or the column-size bound of a CUDA-graph forward) — the
+    grid covers ``K_out`` and the loop runs to the lanes' own ``in_nnz`` —
+    per-sample ``max_val[b]`` is clamped to ``-1e30``, and lanes with
+    ``in_nnz[b] == 0`` store exact ``-inf``. The single-sample case has its
+    own kernel, :func:`_sparse_io_sum_forward_single_kernel`.
     """
     pid_m = tl.program_id(0)
     offs_m = pid_m * TILE_M + tl.arange(0, TILE_M)              # [TILE_M]
 
-    if IS_BATCHED:
-        pid_b = tl.program_id(1)
-        offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)        # [BLOCK_B]
-        mask_b = offs_b < batch_size
-        cs_in_b = tl.load(in_col_starts_ptr + offs_b, mask=mask_b, other=0)
-        k_in_b = tl.load(in_nnz_ptr + offs_b, mask=mask_b, other=0)
-        cs_out_b = tl.load(out_col_starts_ptr + offs_b, mask=mask_b, other=0)
-        k_out_b = tl.load(out_nnz_ptr + offs_b, mask=mask_b, other=0)
-        # Tile past every lane's output column (the grid only bounds them):
-        # nothing to write. An early return, not a zero trip count, which
-        # measurably slows the loop below.
-        if pid_m * TILE_M >= tl.max(k_out_b, axis=0):
-            return
+    pid_b = tl.program_id(1)
+    offs_b = pid_b * BLOCK_B + tl.arange(0, BLOCK_B)            # [BLOCK_B]
+    mask_b = offs_b < batch_size
+    cs_in_b = tl.load(in_col_starts_ptr + offs_b, mask=mask_b, other=0)
+    k_in_b = tl.load(in_nnz_ptr + offs_b, mask=mask_b, other=0)
+    cs_out_b = tl.load(out_col_starts_ptr + offs_b, mask=mask_b, other=0)
+    k_out_b = tl.load(out_nnz_ptr + offs_b, mask=mask_b, other=0)
+    # Tile past every lane's output column (the grid only bounds them):
+    # nothing to write. An early return, not a zero trip count, which
+    # measurably slows the loop below.
+    if pid_m * TILE_M >= tl.max(k_out_b, axis=0):
+        return
 
-        mask_mb = mask_b[None, :] & (offs_m[:, None] < k_out_b[None, :])
-        h_m = tl.load(
-            out_indices_ptr + cs_out_b[None, :] + offs_m[:, None],
-            mask=mask_mb, other=0,
-        )                                                       # [TILE_M, BLOCK_B]
+    mask_mb = mask_b[None, :] & (offs_m[:, None] < k_out_b[None, :])
+    h_m = tl.load(
+        out_indices_ptr + cs_out_b[None, :] + offs_m[:, None],
+        mask=mask_mb, other=0,
+    )                                                           # [TILE_M, BLOCK_B]
+    pblock_m = h_m // BS
+    within_m = h_m % BS
+
+    max_b = tl.load(max_val_ptr + offs_b, mask=mask_b, other=0.0)
+    max_b = tl.maximum(max_b, -1e30)                            # empty col guard
+
+    # Loop bound from the device sizes, not the host ``K_in``, which only
+    # bounds the batch (the CUDA-graph forward passes the column-size
+    # bound): masked iterations add exact zeros, so this only skips work.
+    acc_sum = tl.zeros([TILE_M, BLOCK_B], dtype=tl.float32)
+    for k0 in tl.range(0, tl.max(k_in_b, axis=0), BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)                     # [BLOCK_K]
+        mask_kb = mask_b[:, None] & (offs_k[None, :] < k_in_b[:, None])
+
+        child_ids = tl.load(
+            in_indices_ptr + cs_in_b[:, None] + offs_k[None, :],
+            mask=mask_kb, other=0,
+        )                                                       # [BLOCK_B, BLOCK_K]
+        log_vals = tl.load(
+            in_values_ptr + offs_b[:, None] * in_stride + offs_k[None, :],
+            mask=mask_kb, other=-float("inf"),
+        )
+
+        v_k = tl.where(mask_kb, tl.exp(log_vals - max_b[:, None]), 0.0)
+
+        cblock = child_ids // CBS
+        cslot = child_ids % CBS
+
+        W_ptr_off = (
+            pid_start
+            + (pblock_m[:, :, None] * NB_ch + cblock[None, :, :]) * CBS * BS
+            + cslot[None, :, :] * BS
+            + within_m[:, :, None]
+        )                                                       # [TILE_M, BLOCK_B, BLOCK_K]
+        combined_mask = mask_mb[:, :, None] & mask_kb[None, :, :]
+        W = tl.load(mparams_ptr + W_ptr_off, mask=combined_mask,
+                    other=0.0).to(tl.float32)
+
+        acc_sum += tl.sum(W * v_k[None, :, :], axis=2)          # [TILE_M, BLOCK_B]
+
+    result = tl.log(acc_sum) + max_b[None, :]
+    result = tl.where(k_in_b[None, :] == 0, -float("inf"), result)
+
+    tl.store(
+        values_out_ptr + offs_b[None, :] * out_stride + offs_m[:, None],
+        result, mask=mask_mb,
+    )
+
+
+@triton.jit
+def _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M: tl.constexpr,
+                               BLOCK_K: tl.constexpr):
+    """Device twin of :func:`_single_forward_splits`: ``(parent tiles, splits,
+    child tiles per split)`` of the single-sample forward. As many splits as
+    fit ``n_prog`` programs next to the parent tiles, never more than there
+    are child tiles, each split a whole number of ``BLOCK_K`` chunks."""
+    n_m = tl.cdiv(k_out, TILE_M)
+    k_tiles = tl.cdiv(k_in, BLOCK_K)
+    n_s = tl.maximum(tl.minimum(k_tiles, n_prog // tl.maximum(n_m, 1)), 1)
+    ct = tl.cdiv(k_tiles, n_s)
+    n_s = tl.cdiv(k_tiles, tl.maximum(ct, 1))
+    return n_m, n_s, ct
+
+
+@triton.jit(
+    do_not_specialize=["pid_start", "K_in", "K_out", "n_prog"],
+    do_not_specialize_on_alignment=[
+        "values_out_ptr", "partials_ptr",
+        "in_indices_ptr", "in_values_ptr", "max_val_ptr", "out_indices_ptr",
+        "in_col_starts_ptr", "in_nnz_ptr", "out_col_starts_ptr", "out_nnz_ptr",
+    ],
+)
+def _sparse_io_sum_forward_single_kernel(
+    values_out_ptr, partials_ptr,
+    mparams_ptr,
+    in_indices_ptr, in_values_ptr, max_val_ptr,
+    out_indices_ptr,
+    in_col_starts_ptr, in_nnz_ptr,
+    out_col_starts_ptr, out_nnz_ptr,
+    pid_start, K_in, K_out, n_prog,
+    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+    TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
+    DEVICE_SIZES: tl.constexpr, DIRECT: tl.constexpr,
+):
+    """Single-sample forward of one SparseIOSumLayer block, grid ``(n_prog,)``.
+    The work items are the (parent tile, child range) pairs of a split-K
+    decomposition sized on the device (:func:`_single_forward_splits_dev`):
+    ``cdiv(k_out, TILE_M)`` parent tiles times as many child ranges as fit
+    ``n_prog`` programs, so that the gathers of many items are in flight on
+    every SM (see ``_FWD_SINGLE_PROGRAMS_PER_SM``). Program ``p`` handles
+    items ``p, p + n_prog, ...``; per item (``s`` its child range):
+
+      v_k = exp(log_in_values[k] - max_val)                [per BLOCK_K chunk of the range]
+      h_m   = out_indices[m]                               [TILE_M gather]
+      pblock_m, within_m = h_m // BS, h_m % BS
+      cblock_k, cslot_k  = in_indices[k] // CBS, in_indices[k] % CBS
+      W[m, k] = mparams[pid_start + (pblock_m*NB_ch + cblock_k)*CBS*BS
+                                   + cslot_k*BS + within_m]
+      partial[m] = Σ_{k ∈ range} W[m, k] · v_k
+      DIRECT:  values_out[m] = log(partial[m]) + max_val   (one range per parent tile)
+      else:    partials[s * n_m * TILE_M + m] = partial[m] (summed by the epilogue)
+
+    ``DEVICE_SIZES``: the static B=1 containers of a CUDA-graph forward, whose
+    column offsets / sizes live on the device; ``K_in`` / ``K_out`` then only
+    bound the grid and the split adapts to the column lengths at replay.
+    """
+    pid = tl.program_id(0)
+    if DEVICE_SIZES:
+        k_in = tl.load(in_nnz_ptr)
+        k_out = tl.load(out_nnz_ptr)
+        in_idx_ptr = in_indices_ptr + tl.load(in_col_starts_ptr)
+        out_idx_ptr = out_indices_ptr + tl.load(out_col_starts_ptr)
+    else:
+        k_in = K_in
+        k_out = K_out
+        in_idx_ptr = in_indices_ptr
+        out_idx_ptr = out_indices_ptr
+    n_m, n_s, ct = _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M, BLOCK_K)
+    max_val = tl.load(max_val_ptr)                              # scalar
+    max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
+
+    n_items = tl.cdiv(n_m * n_s - pid, n_prog)
+    for i in range(0, n_items):
+        w = pid + i * n_prog
+        m_tile = w // n_s
+        s = w - m_tile * n_s
+        offs_m = m_tile * TILE_M + tl.arange(0, TILE_M)         # [TILE_M]
+        mask_m = offs_m < k_out
+        h_m = tl.load(out_idx_ptr + offs_m, mask=mask_m, other=0)
         pblock_m = h_m // BS
         within_m = h_m % BS
+        k_lo = s * (ct * BLOCK_K)
+        k_hi = tl.minimum(k_lo + ct * BLOCK_K, k_in)
 
-        max_b = tl.load(max_val_ptr + offs_b, mask=mask_b, other=0.0)
-        max_b = tl.maximum(max_b, -1e30)                        # empty col guard
-
-        # Loop bound from the device sizes, not the host ``K_in``, which only
-        # bounds the batch (the CUDA-graph forward passes the column-size
-        # bound): masked iterations add exact zeros, so this only skips work.
-        acc_sum = tl.zeros([TILE_M, BLOCK_B], dtype=tl.float32)
-        for k0 in tl.range(0, tl.max(k_in_b, axis=0), BLOCK_K):
+        acc = tl.zeros([TILE_M, BLOCK_K], dtype=tl.float32)
+        for k0 in range(k_lo, k_hi, BLOCK_K):
             offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
-            mask_kb = mask_b[:, None] & (offs_k[None, :] < k_in_b[:, None])
-
-            child_ids = tl.load(
-                in_indices_ptr + cs_in_b[:, None] + offs_k[None, :],
-                mask=mask_kb, other=0,
-            )                                                   # [BLOCK_B, BLOCK_K]
-            log_vals = tl.load(
-                in_values_ptr + offs_b[:, None] * in_stride + offs_k[None, :],
-                mask=mask_kb, other=-float("inf"),
-            )
-
-            v_k = tl.where(mask_kb, tl.exp(log_vals - max_b[:, None]), 0.0)
-
-            cblock = child_ids // CBS
-            cslot = child_ids % CBS
-
-            W_ptr_off = (
-                pid_start
-                + (pblock_m[:, :, None] * NB_ch + cblock[None, :, :]) * CBS * BS
-                + cslot[None, :, :] * BS
-                + within_m[:, :, None]
-            )                                                   # [TILE_M, BLOCK_B, BLOCK_K]
-            combined_mask = mask_mb[:, :, None] & mask_kb[None, :, :]
-            W = tl.load(mparams_ptr + W_ptr_off, mask=combined_mask,
-                        other=0.0).to(tl.float32)
-
-            acc_sum += tl.sum(W * v_k[None, :, :], axis=2)      # [TILE_M, BLOCK_B]
-
-        result = tl.log(acc_sum) + max_b[None, :]
-        result = tl.where(k_in_b[None, :] == 0, -float("inf"), result)
-
-        tl.store(
-            values_out_ptr + offs_b[None, :] * out_stride + offs_m[:, None],
-            result, mask=mask_mb,
-        )
-    else:
-        if DEVICE_SIZES:
-            # Static B=1 containers (CUDA-graph forward): the column offsets
-            # and sizes live on device, K_in / K_out only bound the grid.
-            k_in = tl.load(in_nnz_ptr)
-            k_out = tl.load(out_nnz_ptr)
-            if pid_m * TILE_M >= k_out:
-                return
-            in_idx_ptr = in_indices_ptr + tl.load(in_col_starts_ptr)
-            out_idx_ptr = out_indices_ptr + tl.load(out_col_starts_ptr)
-        else:
-            k_in = K_in
-            k_out = K_out
-            in_idx_ptr = in_indices_ptr
-            out_idx_ptr = out_indices_ptr
-        mask_m = offs_m < k_out
-
-        h_m = tl.load(out_idx_ptr + offs_m, mask=mask_m, other=0)
-        pblock_m = h_m // BS                                    # [TILE_M]
-        within_m = h_m % BS                                     # [TILE_M]
-
-        max_val = tl.load(max_val_ptr)                          # scalar
-        max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
-
-        acc_sum = tl.zeros([TILE_M], dtype=tl.float32)
-        for k0 in tl.range(0, k_in, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
-            mask_k = offs_k < k_in
-
+            mask_k = offs_k < k_hi
             child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
             log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
                                other=-float("inf"))
-
             v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
-
             cblock = child_ids // CBS
             cslot = child_ids % CBS
-
             W_ptr_off = (
                 pid_start
                 + (pblock_m[:, None] * NB_ch + cblock[None, :]) * CBS * BS
                 + cslot[None, :] * BS
                 + within_m[:, None]
             )
-            combined_mask = mask_m[:, None] & mask_k[None, :]
-            W = tl.load(mparams_ptr + W_ptr_off, mask=combined_mask,
+            W = tl.load(mparams_ptr + W_ptr_off, mask=mask_m[:, None] & mask_k[None, :],
                         other=0.0).to(tl.float32)
+            acc += W * v_k[None, :]
+        partial = tl.sum(acc, axis=1)                           # [TILE_M]
+        if DIRECT:
+            tl.store(values_out_ptr + offs_m, tl.log(partial) + max_val, mask=mask_m)
+        else:
+            tl.store(partials_ptr + s * (n_m * TILE_M) + offs_m, partial, mask=mask_m)
 
-            acc_sum += tl.sum(W * v_k[None, :], axis=1)
 
-        result = tl.log(acc_sum) + max_val
-        if DEVICE_SIZES:
-            result = tl.where(k_in == 0, -float("inf"), result)
-        tl.store(values_out_ptr + offs_m, result, mask=mask_m)
+@triton.jit(
+    do_not_specialize=["K_in", "K_out", "n_prog"],
+    do_not_specialize_on_alignment=["values_out_ptr", "partials_ptr", "max_val_ptr",
+                                    "in_nnz_ptr", "out_nnz_ptr"],
+)
+def _sparse_io_sum_forward_single_epilogue_kernel(
+    values_out_ptr, partials_ptr, max_val_ptr, in_nnz_ptr, out_nnz_ptr,
+    K_in, K_out, n_prog,
+    TILE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK: tl.constexpr,
+    DEVICE_SIZES: tl.constexpr,
+):
+    """``values_out[m] = log(Σ_s partials[s * n_m * TILE_M + m]) + max_val``
+    over the splits of :func:`_sparse_io_sum_forward_single_kernel` (same
+    rule, same sizes), ``-inf`` for an empty input column. Grid
+    ``(cdiv(K_out, BLOCK),)``."""
+    if DEVICE_SIZES:
+        k_in = tl.load(in_nnz_ptr)
+        k_out = tl.load(out_nnz_ptr)
+    else:
+        k_in = K_in
+        k_out = K_out
+    n_m, n_s, _ = _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M, BLOCK_K)
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < k_out
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    for s in range(0, n_s):
+        acc += tl.load(partials_ptr + s * (n_m * TILE_M) + offs, mask=mask, other=0.0)
+    max_val = tl.load(max_val_ptr)
+    max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
+    res = tl.where(k_in == 0, -float("inf"), tl.log(acc) + max_val)
+    tl.store(values_out_ptr + offs, res, mask=mask)
 
 
 @triton.jit(

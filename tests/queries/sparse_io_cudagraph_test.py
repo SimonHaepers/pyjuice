@@ -159,6 +159,42 @@ def test_backward_after_replay_matches_eager(monkeypatch, ws_mode, B):
         _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
 
 
+def test_single_forward_split_k(monkeypatch):
+    """The single-sample forward splits the children of each parent tile
+    across programs when the parent tiles alone would not fill the GPU
+    (``_FWD_SINGLE_PROGRAMS_PER_SM``), eagerly and in the captured graph,
+    where the split is sized on the device from the replayed columns. Small
+    chunks and a large program budget force many splits here; the reduced
+    partial sums must equal the one-range result, and the eager backward
+    after a replay must still see the forward it needs."""
+    _set_ws(monkeypatch, "never")
+    H, V, T, bs = 128, 40, 8, 32
+    pc = _build(H, V, T, bs, 0.5, seed=6)
+    xs = [torch.randint(0, V, (1, T), device=DEV) for _ in range(3)]
+    refs = [_pass(pc, x, graph=False) for x in xs]       # one child range per parent tile
+
+    monkeypatch.setattr(sio, "_FWD_BLOCK_K", 8)
+    monkeypatch.setattr(sio, "_FWD_SINGLE_PROGRAMS_PER_SM", 64)
+    # ~64 active children -> 8 chunks of 8, 2 parent tiles, 16 programs: 8 splits.
+    assert sio._single_forward_splits(8, 2, 16) == (8, 1)
+    assert sio._single_forward_splits(8, 2, 5) == (2, 4)  # budget-limited: 2 splits of 4 chunks
+    assert sio._single_forward_splits(3, 2, 16) == (3, 1)
+    assert sio._single_forward_splits(0, 2, 16) == (1, 0)
+
+    for x, ref in zip(xs, refs):
+        got = _pass(pc, x, graph=False)
+        torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+        _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+        _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+
+    pc(xs[0], record_cudagraph=True)
+    for x, ref in zip(xs + xs[::-1], refs + refs[::-1]):
+        got = _pass(pc, x, graph=True)
+        torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+        _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+        _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+
+
 @pytest.mark.parametrize("prec", ["ieee", "tf32"])
 def test_replay_follows_em_updates(monkeypatch, prec):
     """EM rewrites the parameters in place: a replay must read the new values,
