@@ -144,6 +144,12 @@ _WS_UNION_EXP = 0.7
 """The expected union of ``B`` samples' input supports is modelled as that of
 ``B ** _WS_UNION_EXP`` independent columns of the expected length: the
 frequent tokens' supports overlap heavily (fits 0.56..0.84 on the chains)."""
+_WS_MMA_COST_PER_SAMPLE = 0.012
+"""Tensor-core work of a W element per sample relative to streaming it: the
+WS passes stop being memory-bound from ``1 / _WS_MMA_COST_PER_SAMPLE`` (~80)
+samples on and their cost then grows with B (105 TFLOP/s tf32 measured at
+B=128). Without it a 99 %-sparse H=4096 chain went to WS from B~300 and
+trained 2-3x slower than on the gather kernels at B=8192 (2026-10-16)."""
 
 _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
@@ -161,8 +167,10 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     ``_WS_MODE`` / ``_WS_ACTIVE_MODE`` overrides."""
     if _WS_MODE == "never":
         return None
-    W = float(H_in) * float(H_out)
-    # Expected fraction of the children some sample of the batch activates.
+    # A W pass streams W (memory-bound) until the tensor-core work of the batch
+    # tile takes over; the active-children pass only reads the expected union.
+    n_w = float(H_in) * float(H_out)
+    W = n_w * max(1.0, _WS_MMA_COST_PER_SAMPLE * B)
     u = 1.0 - (1.0 - min(k_in, H_in) / H_in) ** (B ** _WS_UNION_EXP)
     if backward:
         c_gather = pairs * _WS_GATHER_PAIR_COST_BWD
@@ -171,14 +179,15 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
         c_gather = pairs * (_WS_GATHER_PAIR_COST if B >= 16 else _WS_GATHER_PAIR_COST_SMALL)
         c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
     c_full = W
-    if _WS_ACTIVE_MODE == "never":
-        c_active = math.inf
-    elif _WS_ACTIVE_MODE == "always":
-        c_full = math.inf
-    ws, c_ws = ("active", c_active) if c_active < c_full else ("full", c_full)
+    if _WS_ACTIVE_MODE == "always":         # forced, whatever the batch
+        ws, c_ws = "active", u * W * (_WS_ACTIVE_COST_BWD if backward else _WS_ACTIVE_COST)
+    elif _WS_ACTIVE_MODE == "never" or c_active >= c_full:
+        ws, c_ws = "full", c_full
+    else:
+        ws, c_ws = "active", c_active
     if _WS_MODE == "always":
         return ws
-    if B < 2 or W < _WS_MIN_W or c_gather <= c_ws:
+    if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
         return None
     return ws
 

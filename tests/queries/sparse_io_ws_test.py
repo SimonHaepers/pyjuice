@@ -352,3 +352,40 @@ def test_ws_skips_ineligible_blocks(monkeypatch):
     _set(monkeypatch, "always")
     _pass(pc, torch.randint(0, 12, (6, 5), device="cuda:0"))
     assert calls == _NO_WS
+
+
+def test_ws_dispatch_cost_model(monkeypatch):
+    """The dispatch rule on the measured map (2026-10-19, trained wikitext
+    chains; ``k`` = active children per sample): no WS while W sits in L2;
+    at H=16k the active-children pass for small batches, the full pass from
+    B=16; the full pass from B=2 once a sample activates half the children
+    (32k _early chains); gather at any batch for a 99 %-sparse H=4096 chain,
+    where the W pass is compute-bound long before it beats gathering ~41
+    states per token (2026-10-16 regression). Pure host logic, no GPU."""
+    d = sio._ws_dispatch
+    for B in (2, 16, 64, 1024):
+        assert d(B, 2048, 2048, B * 339 * 339, 339, False) is None
+        assert d(B, 2048, 2048, B * 339 * 339, 339, True) is None
+    H, k = 16384, 1818                                   # 16384_d0.05
+    assert [d(B, H, H, B * k * k, k, False) for B in (1, 2, 4, 8, 16, 64)] == \
+        [None, "active", "active", "active", "full", "full"]
+    assert [d(B, H, H, B * k * k, k, True) for B in (2, 8, 16, 64)] == \
+        ["active", "active", "full", "full"]
+    H, k = 16384, 995                                    # 16384_d0.01: few pairs
+    assert d(16, H, H, 16 * k * k, k, False) is None and d(16, H, H, 16 * k * k, k, True) == "active"
+    H, k = 32768, 17130                                  # 32768_d0.01_early
+    assert d(1, H, H, k * k, k, False) is None and d(2, H, H, 2 * k * k, k, False) == "full"
+    H, k = 4096, 41                                      # random 99 % sparse emissions
+    assert all(d(B, H, H, B * k * k, k, bwd) is None for B in (16, 312, 8192) for bwd in (False, True))
+    H, k = 16384, 995
+    assert d(256, H, H, 256 * k * k, k, False) == "full"   # compute-bound, still cheaper than gather
+
+    monkeypatch.setattr(sio, "_WS_MODE", "always")
+    assert d(1, 2048, 2048, 339 * 339, 339, False) == "active"
+    monkeypatch.setattr(sio, "_WS_ACTIVE_MODE", "never")
+    assert d(1, 2048, 2048, 339 * 339, 339, False) == "full"
+    monkeypatch.setattr(sio, "_WS_MODE", "auto")
+    monkeypatch.setattr(sio, "_WS_ACTIVE_MODE", "always")
+    assert d(64, 16384, 16384, 64 * 1818 * 1818, 1818, False) == "active"
+    monkeypatch.setattr(sio, "_WS_MODE", "never")
+    assert d(64, 16384, 16384, 64 * 1818 * 1818, 1818, False) is None
