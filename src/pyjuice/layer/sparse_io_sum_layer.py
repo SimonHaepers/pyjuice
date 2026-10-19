@@ -63,7 +63,10 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 # programs own a block of rows (forward: parents, backward: children), walk the
 # reduction axis block by block, and multiply against the batch's activations
 # densified for that block (zeros outside each sample's support) on the tensor
-# cores. Cost is one pass over W per step, independent of the support size.
+# cores. Cost is one pass over W per step, independent of the support size —
+# or, from ``_WS_GATHER_MIN_W`` elements of W on, one pass over the rows of
+# W^T of the batch's active children only (their sorted union, compacted on
+# the device each step), which is what the batch can share.
 #
 # Parameter flows of tied transitions (the homogeneous HMM chain) are deferred:
 # each step stashes its densified factors and bounded chunks feed GEMMs,
@@ -110,6 +113,16 @@ there is ``B >= _WS_MIN_BATCH``."""
 _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
 GEMM materialises at a time (256 MB fp32)."""
+
+_WS_GATHER_MIN_W = 1 << 24
+"""From this many elements of W (``H_out * H_in``) on, the WS kernels walk
+only the batch's active children — the sorted union of the samples' input
+columns, compacted on the device each step (:func:`_ws_active_children`) —
+each a contiguous run of parents of W, instead of streaming all of W: the W
+traffic of a step becomes ``U_in * H_out`` for a union of ``U_in`` children
+(37-62 % of H at B=16 on the trained H<=16k wikitext chains, ~100 % at B=64,
+where nothing changes). Below the threshold the four extra launches per step
+cost more than the bytes they save; 2^24 (H=4096) is provisional."""
 
 
 class SparseIOSumLayer(SparseInputSumLayer):
@@ -801,10 +814,16 @@ class SparseIOSumLayer(SparseInputSumLayer):
         yd = _ws_scratch("y", (B, H_out), device)
         TM, BB, warps, stages = _ws_tiles(H_out, B, BS, 128, device)
         TK = min(32, CBS)
+        gather_k = H_in * H_out >= _WS_GATHER_MIN_W
+        if gather_k:
+            active, n_active = _ws_active_children(sv_in, H_in, device)
+        else:
+            active = n_active = sv_in.nnz                  # unused
         _ws_fwd_kernel[(triton.cdiv(B, BB), H_out // TM)](
-            yd, w, xd, max_val, sv_in.nnz, w_start, B, H_in, H_out,
+            yd, w, xd, max_val, sv_in.nnz, active, n_active, w_start, B, H_in, H_out,
             NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
-            PREC="tf32" if rnd else "ieee", num_warps=warps, num_stages=stages,
+            PREC="tf32" if rnd else "ieee", GATHER_K=gather_k,
+            num_warps=warps, num_stages=stages,
         )
 
         _ws_gather_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
@@ -862,10 +881,16 @@ class SparseIOSumLayer(SparseInputSumLayer):
         fd = _ws_scratch("f", (B, H_in), device)
         TK, BB, warps, stages = _ws_tiles(H_in, B, CBS, 128, device)
         TM = min(32, BS)
+        gather_k = H_in * H_out >= _WS_GATHER_MIN_W
+        if gather_k:
+            active, n_active = _ws_active_children(sv_in, H_in, device)
+        else:
+            active = n_active = sv_in.nnz                  # unused
         _ws_bwd_flow_kernel[(triton.cdiv(B, BB), H_in // TK)](
-            fd, w, gd, w_start, B, H_in, H_out,
+            fd, w, gd, active, n_active, w_start, B, H_in, H_out,
             NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB,
-            PREC="tf32" if rnd else "ieee", num_warps=warps, num_stages=stages,
+            PREC="tf32" if rnd else "ieee", GATHER_K=gather_k,
+            num_warps=warps, num_stages=stages,
         )
 
         _ws_gather_flow_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
@@ -893,18 +918,39 @@ _WS_W_OWNER: Dict[torch.device, Tuple["_WSGroup", int]] = {}
 _WS_NUM_SMS: Dict[torch.device, int] = {}
 
 
-def _ws_scratch(name: str, shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
-    """Process-wide grow-only fp32 scratch. Layers run one at a time on one
-    stream, so every WS call can reuse the same buffers."""
+def _ws_scratch(name: str, shape: Tuple[int, ...], device: torch.device,
+                dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Process-wide grow-only scratch (one dtype per name). Layers run one at
+    a time on one stream, so every WS call can reuse the same buffers."""
     n = 1
     for s in shape:
         n *= s
     buf = _WS_SCRATCH.get((name, device))
     if buf is None or buf.numel() < n:
         _WS_SCRATCH.pop((name, device), None)
-        buf = torch.empty(n, dtype=torch.float32, device=device)
+        buf = torch.empty(n, dtype=dtype, device=device)
         _WS_SCRATCH[(name, device)] = buf
     return buf[:n].view(shape)
+
+
+def _ws_active_children(sv_in: SparseNodeValues, H_in: int,
+                        device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(active, count)``: the sorted union of the batch's active input rows,
+    its first ``count[0]`` entries (``count`` a one-element device view, read
+    by the kernels as their loop bound). Flags, inclusive prefix sum,
+    compaction: four launches, all graph-capturable, no host sync."""
+    flags = _ws_scratch("u_flags", (H_in,), device, torch.int32)
+    pos = _ws_scratch("u_pos", (H_in,), device, torch.int32)
+    active = _ws_scratch("u_active", (H_in,), device, torch.int32)
+    flags.zero_()
+    _ws_union_mark_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), sv_in.batch_size)](
+        flags, sv_in.indices, sv_in.col_starts, sv_in.nnz, BLOCK=_WS_VEC,
+    )
+    torch.cumsum(flags, 0, dtype=torch.int32, out=pos)
+    _ws_union_compact_kernel[(triton.cdiv(H_in, _WS_VEC),)](
+        active, flags, pos, H_in, BLOCK=_WS_VEC,
+    )
+    return active, pos[H_in - 1:]
 
 
 def _num_sms(device: torch.device) -> int:
@@ -1638,11 +1684,35 @@ def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
     tl.store(out_ptr + b * out_stride + k, v, mask=mask)
 
 
+@triton.jit
+def _ws_union_mark_kernel(flags_ptr, idx_ptr, cs_ptr, nnz_ptr, BLOCK: tl.constexpr):
+    """``flags[indices[col_starts[b] + k]] = 1`` for ``k < nnz[b]``. Grid
+    ``(cdiv(max nnz, BLOCK), B)``; samples sharing a row store the same 1."""
+    b = tl.program_id(1)
+    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = k < tl.load(nnz_ptr + b)
+    row = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
+    tl.store(flags_ptr + row, tl.full([BLOCK], 1, tl.int32), mask=mask)
+
+
+@triton.jit
+def _ws_union_compact_kernel(active_ptr, flags_ptr, pos_ptr, H, BLOCK: tl.constexpr):
+    """``active[pos[c] - 1] = c`` for every flagged row ``c``, ``pos`` the
+    inclusive prefix sum of the flags: the sorted active rows, ``pos[H - 1]``
+    of them. Grid ``(cdiv(H, BLOCK),)``."""
+    c = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = c < H
+    f = tl.load(flags_ptr + c, mask=mask, other=0)
+    p = tl.load(pos_ptr + c, mask=mask, other=0)
+    tl.store(active_ptr + p - 1, c, mask=mask & (f != 0))
+
+
 @triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_out,
+def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, act_ptr, nact_ptr, w_start, B,
+                   H_in, H_out,
                    NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                    TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
-                   PREC: tl.constexpr):
+                   PREC: tl.constexpr, GATHER_K: tl.constexpr):
     """Weight-stationary forward of one SparseIOSumLayer block. Grid
     ``(cdiv(B, BB), H_out // TM)``: program = (batch slice, block of TM
     parents). It walks the children — the softmax / reduction axis — TK at a
@@ -1653,7 +1723,10 @@ def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_
 
     W[h, c] sits at ``w_start + (pb*NB_ch + cb)*CBS*BS + cs*BS + w`` with
     ``h = pb*BS + w`` and ``c = cb*CBS + cs`` (parents contiguous), so the
-    loaded ``[TK, TM]`` tile is the dot's ``[K, N]`` operand as is.
+    loaded ``[TK, TM]`` tile is the dot's ``[K, N]`` operand as is. With
+    ``GATHER_K`` the children walked are the batch's active ones only,
+    ``act[0:nact]`` (sorted, :func:`_ws_active_children`), each a contiguous
+    run of TM parents at ``w_rows + c*BS``: W traffic ``nact * H_out``.
     """
     pid_b = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -1667,13 +1740,25 @@ def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, w_start, B, H_in, H_
 
     w_rows = w_ptr + w_start + pb.to(tl.int64) * (NB_ch * CBS * BS) + w0
     acc = tl.zeros([BB, TM], dtype=tl.float32)
-    for k0 in range(0, H_in, TK):
-        cb = k0 // CBS
-        cs0 = k0 % CBS
-        wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
-        x = tl.load(xd_ptr + offs_b[:, None] * H_in + (k0 + offs_k)[None, :],
-                    mask=mask_b[:, None], other=0.0)
-        acc += tl.dot(x, wt, input_precision=PREC)
+    if GATHER_K:
+        n_act = tl.load(nact_ptr)
+        for k0 in range(0, n_act, TK):
+            offs = k0 + offs_k
+            mask_k = offs < n_act
+            c = tl.load(act_ptr + offs, mask=mask_k, other=0)
+            wt = tl.load(w_rows + c.to(tl.int64)[:, None] * BS + offs_m[None, :],
+                         mask=mask_k[:, None], other=0.0)
+            x = tl.load(xd_ptr + offs_b[:, None] * H_in + c[None, :],
+                        mask=mask_b[:, None] & mask_k[None, :], other=0.0)
+            acc += tl.dot(x, wt, input_precision=PREC)
+    else:
+        for k0 in range(0, H_in, TK):
+            cb = k0 // CBS
+            cs0 = k0 % CBS
+            wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
+            x = tl.load(xd_ptr + offs_b[:, None] * H_in + (k0 + offs_k)[None, :],
+                        mask=mask_b[:, None], other=0.0)
+            acc += tl.dot(x, wt, input_precision=PREC)
 
     mx = tl.maximum(tl.load(max_ptr + offs_b, mask=mask_b, other=0.0), -1e30)
     kin = tl.load(kin_ptr + offs_b, mask=mask_b, other=0)
@@ -1711,36 +1796,47 @@ def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr,
 
 
 @triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, w_start, B, H_in, H_out,
+def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, act_ptr, nact_ptr, w_start, B, H_in, H_out,
                         NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
                         TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr,
-                        PREC: tl.constexpr):
+                        PREC: tl.constexpr, GATHER_K: tl.constexpr):
     """Weight-stationary element-flow backward. Grid ``(cdiv(B, BB),
     H_in // TK)``: program = (batch slice, block of TK children); walks the
     parents TM at a time, ``fd[b, c] = sum_h gd[b, h] * W[h, c]``. The
-    ``[TM, TK]`` W tile is parents-contiguous, i.e. K-major for the dot."""
+    ``[TM, TK]`` W tile is parents-contiguous, i.e. K-major for the dot.
+    With ``GATHER_K`` the children are the batch's active ones only,
+    ``act[0:nact]`` (sorted, :func:`_ws_active_children`), programs past
+    them return; ``fd`` is written at those children only, which is all the
+    gather that follows reads."""
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
-    c0 = pid_c * TK
-    cb = c0 // CBS
-    cs0 = c0 % CBS
     offs_k = tl.arange(0, TK)
     offs_m = tl.arange(0, TM)
     offs_b = pid_b * BB + tl.arange(0, BB)
     mask_b = offs_b < B
+    if GATHER_K:
+        n_act = tl.load(nact_ptr)
+        if pid_c * TK >= n_act:
+            return
+        c = pid_c * TK + offs_k
+        mask_k = c < n_act
+        c = tl.load(act_ptr + c, mask=mask_k, other=0)
+    else:
+        c = pid_c * TK + offs_k
+        mask_k = offs_k < TK
 
-    w_cols = w_ptr + w_start + cb * (CBS * BS) + cs0 * BS
+    w_cols = w_ptr + w_start + c.to(tl.int64)[None, :] * BS
     acc = tl.zeros([BB, TK], dtype=tl.float32)
     for h0 in range(0, H_out, TM):
         pb = h0 // BS
         w0 = h0 % BS
-        w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS)
-                    + offs_k[None, :] * BS + (w0 + offs_m)[:, None])
+        w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None],
+                    mask=mask_k[None, :], other=0.0)
         g = tl.load(gd_ptr + offs_b[:, None] * H_out + (h0 + offs_m)[None, :],
                     mask=mask_b[:, None], other=0.0)
         acc += tl.dot(g, w, input_precision=PREC)
-    tl.store(fd_ptr + offs_b[:, None] * H_in + (c0 + offs_k)[None, :], acc,
-             mask=mask_b[:, None])
+    tl.store(fd_ptr + offs_b[:, None] * H_in + c[None, :], acc,
+             mask=mask_b[:, None] & mask_k[None, :])
 
 
 @triton.jit(do_not_specialize=["v_stride", "out_stride"])

@@ -40,9 +40,13 @@ def _pass(pc, data, flows_memory=0.0, negate=False):
     return ll, pc.param_flows.detach().clone(), emit
 
 
-def _set(monkeypatch, mode, prec="ieee"):
+def _set(monkeypatch, mode, prec="ieee", active_children=None):
+    """``active_children``: force the WS kernels on (True) / off (False) the
+    batch's active children (``_WS_GATHER_MIN_W``), or leave the default."""
     monkeypatch.setattr(sio, "_WS_MODE", mode)
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
+    if active_children is not None:
+        monkeypatch.setattr(sio, "_WS_GATHER_MIN_W", 0 if active_children else 1 << 62)
 
 
 def _assert_flows_close(got, ref, rtol, what):
@@ -68,6 +72,7 @@ def _count_ws_calls(monkeypatch):
     return calls
 
 
+@pytest.mark.parametrize("active_children", [False, True])
 @pytest.mark.parametrize("prec", ["ieee", "tf32"])
 @pytest.mark.parametrize("H,V,T,bs,density,B", [
     (64, 20, 6, 16, 0.3, 3),       # B < batch tile
@@ -76,7 +81,7 @@ def _count_ws_calls(monkeypatch):
     (128, 40, 7, 16, 0.2, 70),     # B > 64: two batch slices per row block
     (4096, 50, 4, 1024, 0.05, 130),  # 128-wide batch tiles (8 warps)
 ])
-def test_ws_matches_gather(monkeypatch, prec, H, V, T, bs, density, B):
+def test_ws_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, active_children):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     pc = _build(H, V, T, bs, density)
@@ -86,7 +91,7 @@ def test_ws_matches_gather(monkeypatch, prec, H, V, T, bs, density, B):
     ll_ref, pf_ref, emit_ref = _pass(pc, data)
 
     calls = _count_ws_calls(monkeypatch)
-    _set(monkeypatch, "always", prec)
+    _set(monkeypatch, "always", prec, active_children)
     ll, pf, emit = _pass(pc, data)
     assert calls["fwd"] == T - 1 and calls["bwd"] == T - 1
 
@@ -98,11 +103,13 @@ def test_ws_matches_gather(monkeypatch, prec, H, V, T, bs, density, B):
     assert abs(pf.sum().item() - pf_ref.sum().item()) <= 1e-3 * pf_ref.sum().item()
 
 
-def test_ws_mixed_dispatch_and_stash_reuse(monkeypatch):
+@pytest.mark.parametrize("active_children", [False, True])
+def test_ws_mixed_dispatch_and_stash_reuse(monkeypatch, active_children):
     """Alternate WS / gather per call so a step's forward and backward take
-    different paths, then run a second pass where other slots use the gather
-    kernels: stale stash columns of the first pass must not leak into the
-    second pass's deferred flows."""
+    different paths (a WS backward after a gather forward builds its own
+    active-children union), then run a second pass where other slots use the
+    gather kernels: stale stash columns of the first pass must not leak into
+    the second pass's deferred flows."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     H, V, T, bs = 128, 40, 9, 32
@@ -114,7 +121,7 @@ def test_ws_mixed_dispatch_and_stash_reuse(monkeypatch):
     ref1 = _pass(pc, d1)
     ref2 = _pass(pc, d2)
 
-    _set(monkeypatch, "auto")
+    _set(monkeypatch, "auto", active_children=active_children)
     counter = {"n": 0}
 
     def alternating(self, blk_idx, block, sv_in, sv_out, params, need_stash=False,
@@ -295,10 +302,10 @@ def test_ws_falls_back_when_buffers_dont_fit(monkeypatch, starved):
     if starved == "w_copy":
         real_scratch = sio._ws_scratch
 
-        def oom_on_w(name, shape, device):
+        def oom_on_w(name, shape, device, *args):
             if name == "w_rn":
                 raise torch.cuda.OutOfMemoryError("simulated")
-            return real_scratch(name, shape, device)
+            return real_scratch(name, shape, device, *args)
 
         monkeypatch.setattr(sio, "_ws_scratch", oom_on_w)
         prec, expect_fwd = "tf32", 0

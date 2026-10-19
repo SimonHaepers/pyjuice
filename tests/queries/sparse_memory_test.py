@@ -63,7 +63,7 @@ def test_chunked_mixed_dispatch_and_accumulation(monkeypatch):
     from tests.queries.sparse_io_ws_test import (
         test_ws_mixed_dispatch_and_stash_reuse, test_ws_flow_accumulation_and_negate)
     monkeypatch.setattr(sio, '_WS_STASH_BYTES', 1)  # floor of one batch slot
-    test_ws_mixed_dispatch_and_stash_reuse(monkeypatch)
+    test_ws_mixed_dispatch_and_stash_reuse(monkeypatch, active_children=None)
     # Restore dispatch patched by the first regression before running another.
     monkeypatch.undo()
     monkeypatch.setattr(sio, '_WS_STASH_BYTES', 1)
