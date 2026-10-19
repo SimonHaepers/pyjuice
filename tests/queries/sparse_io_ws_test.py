@@ -117,7 +117,8 @@ def test_ws_mixed_dispatch_and_stash_reuse(monkeypatch):
     _set(monkeypatch, "auto")
     counter = {"n": 0}
 
-    def alternating(self, blk_idx, block, sv_in, sv_out, params, need_stash=False):
+    def alternating(self, blk_idx, block, sv_in, sv_out, params, need_stash=False,
+                    static_ctx=None):
         counter["n"] += 1
         return self._ws_slots[blk_idx] is not None and counter["n"] % 2 == 0
 
@@ -211,6 +212,69 @@ def test_ws_auto_skips_small_circuits(monkeypatch):
     _set(monkeypatch, "auto")
     _pass(pc, torch.randint(0, 400, (64, 4), device="cuda:0"))
     assert calls == {"fwd": 0, "bwd": 0}
+
+
+def _skewed_csc(H, V, n_dense, tail_nnz, seed):
+    """Support where ``n_dense`` tokens are emitted by every latent and the
+    others by ``tail_nnz`` latents each: the vocabulary-average column is
+    short while a batch of the frequent tokens brings every row."""
+    g = torch.Generator().manual_seed(seed)
+    cols = [torch.arange(H) if v < n_dense
+            else torch.randperm(H, generator=g)[:tail_nnz].sort().values
+            for v in range(V)]
+    indptr = torch.zeros(V + 1, dtype=torch.long)
+    indptr[1:] = torch.cumsum(torch.tensor([c.numel() for c in cols]), 0)
+    return indptr, torch.cat(cols)
+
+
+@pytest.mark.parametrize("skewed", [True, False])
+def test_ws_graph_dispatch_uses_expected_support(monkeypatch, skewed):
+    """The CUDA-graph forward, and the backward after its replay, cannot read
+    the batch's column lengths on the host. They must size the batch by the
+    support a token brings in practice (``SparseCategorical.expected_col_nnz``)
+    rather than by the vocabulary-average column: two tokens emitted by every
+    latent plus a long tail of rare ones give a tiny average column, yet every
+    batch is dense, so both passes must take WS (``auto``) — and a uniformly
+    sparse support of the same size must stay on the gather kernels."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    H, V, T, B = 1024, 400, 5, 16
+    if skewed:
+        indptr, indices = _skewed_csc(H, V, n_dense=2, tail_nnz=2, seed=5)
+        x = torch.randint(0, 2, (B, T), device="cuda:0")
+    else:
+        indptr, indices, _, _ = random_emission_csc(H, V, 0.01, seed=5)
+        x = torch.randint(0, V, (B, T), device="cuda:0")
+    torch.manual_seed(5)
+    ns = SparseHMM(T, H, V, indptr, indices, block_size=1024)
+    ns.init_parameters()
+    pc = juice.TensorCircuit(ns, verbose=False).to(torch.device("cuda:0"))
+    assert all(g.eligible for g in pc._sparse_io_ws_groups)
+
+    _set(monkeypatch, "never")
+    ll_ref, pf_ref, emit_ref = _pass(pc, x)
+
+    calls = _count_ws_calls(monkeypatch)
+    _set(monkeypatch, "auto")
+    ll = pc(x, record_cudagraph=True).detach().clone()
+    pc.backward(x, compute_param_flows=True, flows_memory=0.0)
+    emit = torch.cat([layer.param_flows.detach().reshape(-1).clone()
+                      for layer in pc.input_layer_group])
+    pf = pc.param_flows.detach().clone()
+
+    layer = next(l for lg in pc.inner_layer_groups for l in lg if type(l) is sio.SparseIOSumLayer)
+    est = layer._ws_static_pairs(0, B, pc._sparse_graph_fwd) / B
+    if skewed:
+        # Every token observed here has an H-row column: the model-level
+        # estimate must be of that order, and both passes on WS.
+        assert est > 0.5 * H * H, est
+        assert calls["fwd"] > 0 and calls["bwd"] == T - 1
+    else:
+        assert est < 400, est
+        assert calls == {"fwd": 0, "bwd": 0}
+    torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
+    _assert_flows_close(pf, pf_ref, 1e-4, "transition param flows")
+    _assert_flows_close(emit, emit_ref, 1e-4, "emission param flows")
 
 
 @pytest.mark.parametrize("starved", ["w_copy", "stash"])

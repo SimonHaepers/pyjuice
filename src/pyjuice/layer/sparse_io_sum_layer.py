@@ -454,9 +454,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
     def _ws_use_static(self, blk_idx: int, sparse_prod: SparseProdLayer, ns_idx: int,
                        params: torch.Tensor, static_ctx) -> bool:
         """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
-        column sizes: the cost guard uses the distribution's average support
-        (all rows for a masked variable). The answer is memoised for
-        consistent warmup and capture dispatch."""
+        column sizes: the cost guard uses the model's expected supports
+        (:meth:`_ws_static_pairs`). The answer is memoised for consistent
+        warmup and capture dispatch."""
         key = (id(self), blk_idx)
         use = static_ctx.ws_decisions.get(key)
         if use is not None:
@@ -467,21 +467,39 @@ class SparseIOSumLayer(SparseInputSumLayer):
             group = ws[0]
             use = True
             if _WS_MODE != "always":
-                in_ns = sparse_prod.nodes[ns_idx]
-                in_dist = in_ns.sparse_input_ns.dist
-                out_dist = self._output_sparsity_dists[blk_idx]
-                # Distribution-level average, independent of the capture tokens.
-                out_var = self._output_sparsity_var_ids[blk_idx]
-                avg_in = (in_dist._num_nodes if static_ctx.is_masked(in_ns.var_id)
-                          else in_dist._nnz / in_dist.num_cats)
-                avg_out = (out_dist._num_nodes if static_ctx.is_masked(out_var)
-                           else out_dist._nnz / out_dist.num_cats)
-                pairs = static_ctx.B * avg_in * avg_out
+                pairs = self._ws_static_pairs(blk_idx, static_ctx.B, static_ctx)
                 use = (static_ctx.B >= _WS_MIN_BATCH
                        and pairs * _WS_COST_RATIO >= group.H_out * group.H_in)
             use = use and group.ensure_ready(params, static_ctx.B, need_stash=False)
         static_ctx.ws_decisions[key] = use
         return use
+
+    def _ws_static_pairs(self, blk_idx: int, B: int, static_ctx) -> float:
+        """Expected active ``(sample, in, out)`` pairs per step of a batch
+        whose column lengths live on the device (CUDA-graph forward, backward
+        after a replay), from the model rather than from the tokens of any
+        particular batch, so a graph's dispatch does not depend on what it
+        was captured on: the expected column length of each side's
+        distribution (:meth:`SparseCategorical.expected_col_nnz`, weighted by
+        the input side's emission probabilities, which this layer can reach),
+        all rows for a variable the profile masks."""
+        prod, ns_idx = self._sparse_input_refs[blk_idx]
+        in_ns = prod.nodes[ns_idx]
+        emit_ns = in_ns.sparse_input_ns
+        in_dist = emit_ns.dist
+        out_dist = self._output_sparsity_dists[blk_idx]
+        out_var = self._output_sparsity_var_ids[blk_idx]
+        if static_ctx is not None and static_ctx.is_masked(in_ns.var_id):
+            avg_in = in_dist._num_nodes
+        else:
+            base = emit_ns._param_range[0]
+            values = prod._sparse_input_layers[ns_idx].params[base:base + in_dist._nnz]
+            avg_in = in_dist.expected_col_nnz(values)
+        if static_ctx is not None and static_ctx.is_masked(out_var):
+            avg_out = out_dist._num_nodes
+        else:
+            avg_out = out_dist.expected_col_nnz()
+        return B * avg_in * avg_out
 
     def graph_columns(self):
         return list(zip(self._output_sparsity_dists, self._output_sparsity_var_ids))
@@ -593,8 +611,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_flow_in.values.zero_()
                 continue
 
-            if sv_in.is_batched and self._ws_use(blk_idx, block, sv_in, sv_out,
-                                                 params, need_stash=compute_pflows):
+            if sv_in.is_batched and self._ws_use(blk_idx, block, sv_in, sv_out, params,
+                                                 need_stash=compute_pflows,
+                                                 static_ctx=kwargs.get("static_ctx")):
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
@@ -672,15 +691,17 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
     def _ws_use(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                 sv_out: SparseNodeValues, params: torch.Tensor,
-                need_stash: bool = False) -> bool:
+                need_stash: bool = False, static_ctx=None) -> bool:
         """Take the WS kernels for this batched block? (see ``_WS_MODE``)
 
         ``"auto"`` asks two cheap questions: is the batch at least
         ``_WS_MIN_BATCH`` samples (below that the gather kernels win), and is
         the circuit big enough that one pass over W beats gathering the active
-        pairs (``_WS_COST_RATIO``). Then :meth:`_WSGroup.ensure_ready` has the
-        last word, so a group whose buffers do not fit stays on the gather
-        kernels instead of failing the run.
+        pairs (``_WS_COST_RATIO``) — the batch's own pairs, or the model's
+        expected pairs (:meth:`_ws_static_pairs`) for static containers, whose
+        column lengths are on the device. Then :meth:`_WSGroup.ensure_ready`
+        has the last word, so a group whose buffers do not fit stays on the
+        gather kernels instead of failing the run.
         """
         ws = self._ws_slots[blk_idx]
         if ws is None or _WS_MODE == "never":
@@ -692,12 +713,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             if sv_in.batch_size < _WS_MIN_BATCH:
                 return False
             if sv_in.static or sv_out.static:
-                prod, ns_idx = self._sparse_input_refs[blk_idx]
-                in_dist = prod.nodes[ns_idx].sparse_input_ns.dist
-                out_dist = self._output_sparsity_dists[blk_idx]
-                avg_in = in_dist._nnz / in_dist.num_cats
-                avg_out = out_dist._nnz / out_dist.num_cats
-                pairs = sv_in.batch_size * avg_in * avg_out
+                pairs = self._ws_static_pairs(blk_idx, sv_in.batch_size, static_ctx)
             else:
                 pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
             if pairs * _WS_COST_RATIO < group.H_out * group.H_in:

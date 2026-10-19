@@ -129,8 +129,47 @@ class SparseCategorical(Distribution):
         self._csr_cols = csr_cols
         self._csr_to_csc = csr_to_csc
         self._max_nnz_per_row = max(max_nnz_per_row, 1)
+        self._expected_col_nnz = None
 
         return torch.zeros(max(nnz, 1), dtype = torch.float32)
+
+    def expected_col_nnz(self, values: Optional[torch.Tensor] = None) -> float:
+        """Expected length of the active column of a token drawn from this
+        distribution — the support a typical batch brings. The plain column
+        average ``nnz / num_cats`` understates it by one to two orders of
+        magnitude on trained models (wikitext chains, H=32k: 329 vs ~17k
+        active rows per observed token): the long tail of rare tokens has
+        short columns, the frequent tokens long ones.
+
+        With ``values`` (the CSC probabilities, on any device) each token is
+        weighted by its column mass ``sum_h P(x | h)``, the token distribution
+        under a uniform latent — within 0.6-1.2x of the measured value on the
+        trained wikitext chains. Without, each column is weighted by its own
+        length (``sum nnz^2 / sum nnz``: a token emitted by many latents is a
+        frequent one), 1.3-3x low on those chains. The result is cached; a
+        weighted estimate replaces a structural one. Used by
+        :class:`SparseIOSumLayer` to size batches whose column lengths live on
+        the device (CUDA-graph forward, backward after a replay)."""
+        cached = getattr(self, "_expected_col_nnz", None)
+        if cached is not None and (values is None or cached[0]):
+            return cached[1]
+        assert self._csc_indptr is not None, "Sparsity pattern not set."
+        indptr = getattr(self, "_csc_indptr_cpu", None)
+        if indptr is None:
+            indptr = self._csc_indptr.cpu()
+        nnz = torch.diff(indptr).double()
+        weights = nnz
+        weighted = False
+        if values is not None and self._nnz > 0 and values.numel() == self._nnz:
+            mass = torch.zeros(self._nnz + 1, dtype = torch.float64)
+            mass[1:] = torch.cumsum(values.detach().reshape(-1).cpu().double(), dim = 0)
+            mass = mass[indptr[1:]] - mass[indptr[:-1]]
+            if mass.sum().item() > 0:
+                weights, weighted = mass, True
+        total = weights.sum().item()
+        est = (weights * nnz).sum().item() / total if total > 0 else 0.0
+        self._expected_col_nnz = (weighted, est)
+        return est
 
     # --- Distribution protocol ----------------------------------------
 

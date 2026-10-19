@@ -251,3 +251,32 @@ if __name__ == "__main__":
     test_sparse_categorical_partition_fn()
     test_build_sparse_pattern_batched()
     print("all sparse_categorical tests passed")
+
+
+def test_expected_col_nnz():
+    """The expected active-column length of a drawn token: by column mass when
+    the CSC values are given (a token emitted with high probability by many
+    latents is frequent), by column length alone otherwise — never the plain
+    column average, which the long tail of short columns drags down."""
+    dist = dists.SparseCategorical(num_cats = 4)
+    # columns: 0 -> rows {0,1,2}, 1 -> {0}, 2 -> {}, 3 -> {1}
+    csc_indptr = torch.tensor([0, 3, 4, 4, 5])
+    csc_indices = torch.tensor([0, 1, 2, 0, 1])
+    dist.set_meta_parameters(num_nodes = 3, csc_indptr = csc_indptr, csc_indices = csc_indices)
+
+    nnz = torch.tensor([3.0, 1.0, 0.0, 1.0])
+    assert nnz.mean().item() == 1.25                      # the plain average
+    structural = ((nnz ** 2).sum() / nnz.sum()).item()    # 11 / 5
+    assert dist.expected_col_nnz() == pytest.approx(structural)
+
+    # Column masses 0.3, 0.6, 0, 0.9 -> weighted mean (0.3*3 + 0.6 + 0.9) / 1.8
+    values = torch.tensor([0.1, 0.1, 0.1, 0.6, 0.9])
+    weighted = dist.expected_col_nnz(values.cuda() if torch.cuda.is_available() else values)
+    assert weighted == pytest.approx((0.9 + 0.6 + 0.9) / 1.8)
+    # The weighted estimate replaces the structural one and is kept.
+    assert dist.expected_col_nnz() == pytest.approx(weighted)
+    assert dist.expected_col_nnz(values * 2) == pytest.approx(weighted)
+    # All-zero values (the placeholder before set_params) fall back.
+    fresh = dists.SparseCategorical(num_cats = 4)
+    fresh.set_meta_parameters(num_nodes = 3, csc_indptr = csc_indptr, csc_indices = csc_indices)
+    assert fresh.expected_col_nnz(torch.zeros(5)) == pytest.approx(structural)
