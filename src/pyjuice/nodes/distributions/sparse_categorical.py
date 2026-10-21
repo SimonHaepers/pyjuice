@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -11,6 +13,23 @@ from .distributions import Distribution
 
 
 LOG_EPS = -23.0258509299  # log(1e-10), used for (row, col) positions outside the sparsity pattern
+
+
+B1_TILE = 32
+"""Parent tile of the single-sample sparse-IO forward (its ``TILE_M``)."""
+B1_STREAM_FRAC = float(os.environ.get("PYJUICE_SPARSE_IO_B1_STREAM_FRAC", "0.25"))
+"""Single-sample sparse-IO forward: a parent tile of ``B1_TILE`` consecutive
+states is streamed whole (contiguous, vectorised loads, masked after the load)
+when at least this fraction of its states is active for the step's token, the
+other active states are gathered one by one. ``0``: stream every tile that has
+an active state (output-dense); above ``1``: gather everything (the kernel's
+original path). Calibrated 2026-10-21 on the wikitext chains with sorted states
+(``pyjuice.transformations.reorder_states``): 0.25 keeps the fetched bytes within
+2 % of the pure gather and cuts the load instructions to 15-25 %."""
+
+
+def b1_hybrid_enabled() -> bool:
+    return 0.0 <= B1_STREAM_FRAC <= 1.0
 
 
 class SparseCategorical(Distribution):
@@ -130,8 +149,74 @@ class SparseCategorical(Distribution):
         self._csr_to_csc = csr_to_csc
         self._max_nnz_per_row = max(max_nnz_per_row, 1)
         self._expected_col_nnz = None
+        self._b1_desc = None
 
         return torch.zeros(max(nnz, 1), dtype = torch.float32)
+
+    def b1_descriptors(self, device: torch.device, tile: int = None, stream_frac: float = None) -> dict:
+        """Per-column stream / gather descriptors of the single-sample sparse-IO
+        forward (``_sparse_io_sum_forward_single_kernel``): a parent tile of
+        ``tile`` consecutive states with at least ``stream_frac * tile`` active
+        states is *dense* (streamed whole, masked after the load), its other
+        active states are *sparse* (gathered). Int32 tensors on ``device``,
+        cached per ``(tile, stream_frac)``; column ``num_cats`` is the all-rows
+        column of a marginalised variable:
+
+        * ``dense_indptr [V+2]`` / ``dense_tiles``: the dense tiles' first state;
+        * ``sparse_indptr [V+2]`` / ``sparse_rows``: the gathered states, in
+          column order;
+        * ``slot [nnz + H]``: the partial-sum slot of every CSC position (and of
+          the all-rows column after ``nnz``): dense tile ``d``, lane ``j`` ->
+          ``d * tile + j``; sparse rank ``r`` -> ``(n_dense + r // tile) * tile +
+          r % tile``. The epilogue reads a position's result through it.
+        """
+        tile = B1_TILE if tile is None else int(tile)
+        stream_frac = B1_STREAM_FRAC if stream_frac is None else float(stream_frac)
+        key = (tile, stream_frac)
+        cached = getattr(self, "_b1_desc", None)
+        if cached is not None and cached["key"] == key:
+            if cached["slot"].device != device:
+                cached = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in cached.items()}
+                self._b1_desc = cached
+            return cached
+        H, V = int(self._num_nodes), int(self.num_cats)
+        indptr = self._csc_indptr.cpu()
+        rows = self._csc_indices.cpu()
+        nnz = int(rows.numel())
+        ntiles = -(-H // tile)
+        thr = 1 if stream_frac <= 0 else (tile + 1 if stream_frac > 1 else max(1, -(-int(round(stream_frac * tile * 1e6)) // 10 ** 6)))
+        col = torch.repeat_interleave(torch.arange(V), torch.diff(indptr))
+        t = rows // tile
+        key_ct = col * ntiles + t                                   # non-decreasing (CSC columns are sorted)
+        uniq, inverse, counts = torch.unique_consecutive(key_ct, return_inverse=True, return_counts=True)
+        dense_u = counts >= thr                                     # per (column, tile)
+        dense_nz = dense_u[inverse]                                 # per nnz
+        u_col = uniq // ntiles
+        dense_counts = torch.bincount(u_col[dense_u], minlength=V)
+        dense_indptr = torch.zeros(V + 2, dtype=torch.long)
+        dense_indptr[1:V + 1] = torch.cumsum(dense_counts, 0)
+        dense_indptr[V + 1] = dense_indptr[V] + ntiles
+        dense_tiles = torch.cat([(uniq[dense_u] % ntiles) * tile, torch.arange(ntiles) * tile])
+        rank_u = torch.cumsum(dense_u.long(), 0) - 1 - dense_indptr[u_col]   # dense tile rank within its column
+        sparse_nz = ~dense_nz
+        sparse_counts = torch.bincount(col[sparse_nz], minlength=V)
+        sparse_indptr = torch.zeros(V + 2, dtype=torch.long)
+        sparse_indptr[1:V + 1] = torch.cumsum(sparse_counts, 0)
+        sparse_indptr[V + 1] = sparse_indptr[V]
+        sparse_rows = rows[sparse_nz]
+        slot = torch.empty(nnz + H, dtype=torch.long)
+        slot[:nnz][dense_nz] = rank_u[inverse][dense_nz] * tile + rows[dense_nz] % tile
+        r = torch.cumsum(sparse_nz.long(), 0) - 1 - sparse_indptr[col]
+        slot[:nnz][sparse_nz] = (dense_counts[col][sparse_nz] + r[sparse_nz] // tile) * tile + r[sparse_nz] % tile
+        slot[nnz:] = torch.arange(H)
+        out = {"key": key, "tile": tile, "thr": thr,
+               "dense_indptr": dense_indptr.to(torch.int32), "dense_tiles": dense_tiles.to(torch.int32),
+               "sparse_indptr": sparse_indptr.to(torch.int32), "sparse_rows": sparse_rows.to(torch.int32),
+               "slot": slot.to(torch.int32),
+               "dense_indptr_list": dense_indptr.tolist(), "sparse_indptr_list": sparse_indptr.tolist()}
+        out = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in out.items()}
+        self._b1_desc = out
+        return out
 
     def expected_col_nnz(self, values: Optional[torch.Tensor] = None) -> float:
         """Expected length of the active column of a token drawn from this
@@ -258,6 +343,9 @@ class SparseCategorical(Distribution):
             self._csr_indptr = self._csr_indptr.to(device)
             self._csr_cols = self._csr_cols.to(device)
             self._csr_to_csc = self._csr_to_csc.to(device)
+        desc = getattr(self, "_b1_desc", None)
+        if desc is not None:
+            self._b1_desc = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in desc.items()}
 
     # --- Unused template kernels (required to not compile the default path) ---
 
@@ -451,7 +539,7 @@ class SparseCategorical(Distribution):
                 col_start=col_start, total_nnz=0,
                 indices=empty_long,
                 values=values,
-                num_rows=num_rows,
+                num_rows=num_rows, col_id=v,
             )
 
         indices = self._csc_indices.narrow(0, col_start, total_nnz)
@@ -461,7 +549,7 @@ class SparseCategorical(Distribution):
             values = torch.empty(total_nnz, dtype=torch.float32, device=device)
         return SparseNodeValues(
             col_start=col_start, total_nnz=total_nnz,
-            indices=indices, values=values, num_rows=num_rows,
+            indices=indices, values=values, num_rows=num_rows, col_id=v,
         )
 
     def _build_batched_pattern(self, data: torch.Tensor, var_id: int,

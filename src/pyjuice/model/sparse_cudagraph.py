@@ -48,6 +48,7 @@ import triton.language as tl
 
 from pyjuice.layer import SparseNodeValues
 from pyjuice.layer.sparse_io_sum_layer import _WS_SCRATCH
+from pyjuice.nodes.distributions.sparse_categorical import b1_hybrid_enabled
 
 
 _PATTERN_BLOCK_B = 128
@@ -91,7 +92,9 @@ def graph_unsupported_reason(pc) -> Optional[str]:
 
 @triton.jit(do_not_specialize=["B", "num_cats"])
 def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_ptr,
-                           B, num_cats, missing_ptr, nnz_total, num_rows, BLOCK_B: tl.constexpr):
+                           B, num_cats, missing_ptr, nnz_total, num_rows,
+                           dd_ptr, sd_ptr, desc_ptr,
+                           BLOCK_B: tl.constexpr, WITH_DESC: tl.constexpr):
     """``col_starts[slot, b] = indptr[tok]``, ``nnz[slot, b] = indptr[tok + 1] -
     indptr[tok]`` with ``tok = data[var, b]``, for the ``(var, slot)`` pairs of
     one dist. Grid ``(num pairs, cdiv(B, BLOCK_B))``. An out-of-range token
@@ -111,6 +114,21 @@ def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_
     c0 = tl.where(missing, nnz_total, c0)
     tl.store(cs_ptr + slot * B + offs_b, c0.to(tl.int32), mask=mask)
     tl.store(nnz_ptr + slot * B + offs_b, n.to(tl.int32), mask=mask)
+    if WITH_DESC:
+        # B=1: the stream / gather descriptors of the column (the all-rows
+        # column ``num_cats`` for a marginalised variable; nothing for an
+        # out-of-range token).
+        tdesc = tl.where(missing, num_cats, tok)
+        d0 = tl.load(dd_ptr + tdesc, mask=mask, other=0)
+        d1 = tl.load(dd_ptr + tdesc + 1, mask=mask, other=0)
+        s0 = tl.load(sd_ptr + tdesc, mask=mask, other=0)
+        s1 = tl.load(sd_ptr + tdesc + 1, mask=mask, other=0)
+        valid = missing | ok
+        first = mask & (offs_b == 0)
+        tl.store(desc_ptr + slot * 4 + 0, d0, mask=first)
+        tl.store(desc_ptr + slot * 4 + 1, tl.where(valid, d1 - d0, 0), mask=first)
+        tl.store(desc_ptr + slot * 4 + 2, s0, mask=first)
+        tl.store(desc_ptr + slot * 4 + 3, tl.where(valid, s1 - s0, 0), mask=first)
 
 
 class SparseGraphState:
@@ -164,14 +182,20 @@ class SparseGraphState:
         self._cs_rows = [self.col_starts[i] for i in range(n_slots)]
         self._nnz_rows = [self.nnz[i] for i in range(n_slots)]
         self._launches = []
+        # B=1: per-slot stream / gather descriptors of the single-sample
+        # sparse-IO forward (``SparseCategorical.b1_descriptors``).
+        self.b1_desc = (torch.zeros(n_slots, 4, dtype=torch.int32, device=device)
+                        if B == 1 and b1_hybrid_enabled() else None)
         for dist, cols in per_dist.values():
             assert dist._csc_indptr.device == device, (
                 "SparseCategorical CSC pattern is not on the circuit's device.")
             assert dist._nnz < 2 ** 31, "CSC nnz exceeds the int32 col_starts range."
+            desc = dist.b1_descriptors(device) if self.b1_desc is not None else None
             self._launches.append((
                 dist,
                 torch.tensor([v for v, _ in cols], dtype=torch.int32, device=device),
                 torch.tensor([s for _, s in cols], dtype=torch.int32, device=device),
+                desc,
             ))
 
         # The running maxima of all layers (``[rows, B]`` each, filled by
@@ -229,7 +253,7 @@ class SparseGraphState:
             col_start=0, total_nnz=K, indices=self._indices[id(dist)],
             values=values_ws[:self.B * K].view(self.B, K), num_rows=num_rows,
             batch_size=self.B, col_starts=self._cs_rows[s], nnz=self._nnz_rows[s],
-            static=True,
+            static=True, b1_desc=self.b1_desc[s] if self.b1_desc is not None else None,
         )
 
     def is_masked(self, var_id: int) -> bool:
@@ -259,12 +283,15 @@ class SparseGraphState:
         self.compute_patterns()
 
     def compute_patterns(self) -> None:
-        for dist, var_ids, slots in self._launches:
+        for dist, var_ids, slots, desc in self._launches:
             grid = (var_ids.numel(), triton.cdiv(self.B, _PATTERN_BLOCK_B))
             _static_pattern_kernel[grid](
                 self.col_starts, self.nnz, self.data, dist._csc_indptr, var_ids, slots,
                 self.B, dist.num_cats, self.missing, dist._nnz, dist._num_nodes,
-                BLOCK_B=_PATTERN_BLOCK_B,
+                desc["dense_indptr"] if desc is not None else self.nnz,
+                desc["sparse_indptr"] if desc is not None else self.nnz,
+                self.b1_desc if desc is not None else self.nnz,
+                BLOCK_B=_PATTERN_BLOCK_B, WITH_DESC=desc is not None,
             )
 
     # ------------------------------------------------------------------ #

@@ -61,6 +61,13 @@ class SparseNodeValues:
                                    per-sample column lengths.
       nnz_list   list | None    — B>1 only: host copy of ``nnz`` for empty
                                    checks, grid sizing and tests.
+      col_id     int            — B=1 only: the observed token (column id) the
+                                   pattern was built for, -1 if unknown; keys
+                                   the single-sample forward's stream / gather
+                                   descriptors (``SparseCategorical.b1_descriptors``).
+      b1_desc    Tensor | None  — static B=1 only: int32 ``[4]`` device view
+                                   (dense start, dense count, sparse start,
+                                   sparse count) of the same descriptors.
       static     bool           — device-described pattern of a CUDA-graph
                                    forward (any B, incl. 1): the batched
                                    layout, with ``col_starts`` / ``nnz``
@@ -82,6 +89,8 @@ class SparseNodeValues:
     nnz: Optional[torch.Tensor] = None
     nnz_list: Optional[List[int]] = None
     static: bool = False
+    col_id: int = -1
+    b1_desc: Optional[torch.Tensor] = None
 
     @property
     def device(self) -> torch.device:
@@ -103,6 +112,7 @@ class SparseNodeValues:
             max_val=max_val,
             batch_size=self.batch_size, col_starts=self.col_starts,
             nnz=self.nnz, nnz_list=self.nnz_list, static=self.static,
+            col_id=self.col_id, b1_desc=self.b1_desc,
         )
 
     def scatter_to_dense(self, out: torch.Tensor, out_base: int,

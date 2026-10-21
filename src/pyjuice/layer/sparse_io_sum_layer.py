@@ -11,6 +11,7 @@ import triton
 import triton.language as tl
 
 from pyjuice.nodes import SumNodes
+from pyjuice.nodes.distributions import sparse_categorical as _scat
 from .sparse_input_sum_layer import SparseInputSumLayer
 from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
@@ -499,13 +500,31 @@ class SparseIOSumLayer(SparseInputSumLayer):
         otherwise the kernel writes one partial sum per work item and the
         epilogue reduces them."""
         _, _, pid_start, _, _, NB_ch, BS, CBS = block
-        TILE_M, BLOCK_K = 32, _FWD_BLOCK_K
+        TILE_M, BLOCK_K = _scat.B1_TILE, _FWD_BLOCK_K
         static = sv_in.static
         assert static == sv_out.static and (not static or static_ctx is not None)
-        n_m = triton.cdiv(sv_out.total_nnz, TILE_M)        # a bound for static containers
+        # Stream / gather descriptors of the output column (see
+        # ``SparseCategorical.b1_descriptors``): dense parent tiles are streamed
+        # whole, the remaining active parents gathered. Eager: looked up by the
+        # token; static: the per-step ``[4]`` device view the graph computed.
+        desc = None
+        if _scat.b1_hybrid_enabled() and (sv_out.b1_desc is not None or sv_out.col_id >= 0):
+            desc = self._output_sparsity_dists[blk_idx].b1_descriptors(params.device)
+        hybrid = desc is not None
+        if hybrid and not static:
+            v = sv_out.col_id
+            d0, d1 = desc["dense_indptr_list"][v], desc["dense_indptr_list"][v + 1]
+            s0, s1 = desc["sparse_indptr_list"][v], desc["sparse_indptr_list"][v + 1]
+            n_dense, n_sparse = d1 - d0, s1 - s0
+            k_out_eff = n_dense * TILE_M + n_sparse
+        else:
+            d0 = s0 = n_dense = n_sparse = 0
+            # a bound: every dense tile adds at most TILE_M - 1 inactive lanes
+            k_out_eff = sv_out.total_nnz + (sv_out.num_rows if hybrid else 0)
+        n_m = triton.cdiv(k_out_eff, TILE_M)                # a bound for static containers
         k_tiles = triton.cdiv(sv_in.total_nnz, BLOCK_K)
         n_prog = max(1, min(n_m * k_tiles, _FWD_SINGLE_PROGRAMS_PER_SM * _num_sms(params.device)))
-        direct = not static and _single_forward_splits(k_tiles, n_m, n_prog)[0] == 1
+        direct = not static and not hybrid and _single_forward_splits(k_tiles, n_m, n_prog)[0] == 1
         if direct:
             partials = sv_out.values                       # unused
         else:
@@ -514,6 +533,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 partials = static_ctx.buffer((id(self), "fwd_partials", blk_idx), (n,))
             else:
                 partials = _ws_scratch("fwd_partials", (n,), params.device)
+        dummy = sv_in.values
         _sparse_io_sum_forward_single_kernel[(n_prog,)](
             values_out_ptr=sv_out.values,
             partials_ptr=partials,
@@ -522,10 +542,15 @@ class SparseIOSumLayer(SparseInputSumLayer):
             in_values_ptr=sv_in.values,
             max_val_ptr=max_val,
             out_indices_ptr=sv_out.indices,
-            in_col_starts_ptr=sv_in.col_starts if static else sv_in.values,  # unused unless static
-            in_nnz_ptr=sv_in.nnz if static else sv_in.values,
-            out_col_starts_ptr=sv_out.col_starts if static else sv_in.values,
-            out_nnz_ptr=sv_out.nnz if static else sv_in.values,
+            in_col_starts_ptr=sv_in.col_starts if static else dummy,  # unused unless static
+            in_nnz_ptr=sv_in.nnz if static else dummy,
+            out_col_starts_ptr=sv_out.col_starts if static else dummy,
+            out_nnz_ptr=sv_out.nnz if static else dummy,
+            dense_tiles_ptr=desc["dense_tiles"] if hybrid else dummy,
+            sparse_rows_ptr=desc["sparse_rows"] if hybrid else dummy,
+            desc_ptr=sv_out.b1_desc if (hybrid and static) else dummy,
+            dense_start=d0, n_dense=n_dense, sparse_start=s0, n_sparse=n_sparse,
+            num_rows=sv_out.num_rows,
             pid_start=pid_start,
             K_in=sv_in.total_nnz,
             K_out=sv_out.total_nnz,
@@ -537,6 +562,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             BLOCK_K=BLOCK_K,
             DEVICE_SIZES=static,
             DIRECT=direct,
+            HYBRID=hybrid,
         )
         if not direct:
             BLOCK = 256
@@ -544,8 +570,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 values_out_ptr=sv_out.values,
                 partials_ptr=partials,
                 max_val_ptr=max_val,
-                in_nnz_ptr=sv_in.nnz if static else sv_in.values,
-                out_nnz_ptr=sv_out.nnz if static else sv_in.values,
+                in_nnz_ptr=sv_in.nnz if static else dummy,
+                out_nnz_ptr=sv_out.nnz if static else dummy,
+                out_col_starts_ptr=sv_out.col_starts if static else dummy,
+                slot_ptr=desc["slot"] if hybrid else dummy,
+                desc_ptr=sv_out.b1_desc if (hybrid and static) else dummy,
+                col_start=sv_out.col_start,
+                n_dense=n_dense, n_sparse=n_sparse,
                 K_in=sv_in.total_nnz,
                 K_out=sv_out.total_nnz,
                 n_prog=n_prog,
@@ -553,6 +584,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 BLOCK_K=BLOCK_K,
                 BLOCK=BLOCK,
                 DEVICE_SIZES=static,
+                HYBRID=hybrid,
             )
 
     def _forward_static(self, params: torch.Tensor, static_ctx) -> None:
@@ -1397,11 +1429,13 @@ def _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M: tl.constexpr,
 
 
 @triton.jit(
-    do_not_specialize=["pid_start", "K_in", "K_out", "n_prog"],
+    do_not_specialize=["pid_start", "K_in", "K_out", "n_prog", "dense_start", "n_dense",
+                       "sparse_start", "n_sparse", "num_rows"],
     do_not_specialize_on_alignment=[
         "values_out_ptr", "partials_ptr",
         "in_indices_ptr", "in_values_ptr", "max_val_ptr", "out_indices_ptr",
         "in_col_starts_ptr", "in_nnz_ptr", "out_col_starts_ptr", "out_nnz_ptr",
+        "dense_tiles_ptr", "sparse_rows_ptr", "desc_ptr",
     ],
 )
 def _sparse_io_sum_forward_single_kernel(
@@ -1411,10 +1445,12 @@ def _sparse_io_sum_forward_single_kernel(
     out_indices_ptr,
     in_col_starts_ptr, in_nnz_ptr,
     out_col_starts_ptr, out_nnz_ptr,
+    dense_tiles_ptr, sparse_rows_ptr, desc_ptr,
+    dense_start, n_dense, sparse_start, n_sparse, num_rows,
     pid_start, K_in, K_out, n_prog,
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
-    DEVICE_SIZES: tl.constexpr, DIRECT: tl.constexpr,
+    DEVICE_SIZES: tl.constexpr, DIRECT: tl.constexpr, HYBRID: tl.constexpr,
 ):
     """Single-sample forward of one SparseIOSumLayer block, grid ``(n_prog,)``.
     The work items are the (parent tile, child range) pairs of a split-K
@@ -1437,6 +1473,16 @@ def _sparse_io_sum_forward_single_kernel(
     ``DEVICE_SIZES``: the static B=1 containers of a CUDA-graph forward, whose
     column offsets / sizes live on the device; ``K_in`` / ``K_out`` then only
     bound the grid and the split adapts to the column lengths at replay.
+
+    ``HYBRID`` (``SparseCategorical.b1_descriptors``): the parent tiles are the
+    output column's ``n_dense`` dense tiles (``dense_tiles[dense_start + d]``:
+    TILE_M consecutive parents, streamed as contiguous runs and masked after
+    the load) followed by ``cdiv(n_sparse, TILE_M)`` tiles of its gathered
+    parents (``sparse_rows[sparse_start + r]``); the split rule runs on
+    ``n_dense * TILE_M + n_sparse``. Every item writes its partial sums to the
+    slot ``m_tile * TILE_M + lane``; the epilogue maps every output position
+    to its slot through ``slot[col_start + p]``. Never ``DIRECT``. In
+    ``DEVICE_SIZES`` mode the four counts come from ``desc_ptr``.
     """
     pid = tl.program_id(0)
     if DEVICE_SIZES:
@@ -1449,7 +1495,25 @@ def _sparse_io_sum_forward_single_kernel(
         k_out = K_out
         in_idx_ptr = in_indices_ptr
         out_idx_ptr = out_indices_ptr
-    n_m, n_s, ct = _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M, BLOCK_K)
+    if HYBRID:
+        if DEVICE_SIZES:
+            d_start = tl.load(desc_ptr + 0)
+            nd = tl.load(desc_ptr + 1)
+            s_start = tl.load(desc_ptr + 2)
+            ns = tl.load(desc_ptr + 3)
+        else:
+            d_start = dense_start
+            nd = n_dense
+            s_start = sparse_start
+            ns = n_sparse
+        k_out_eff = nd * TILE_M + ns
+    else:
+        d_start = 0
+        nd = 0
+        s_start = 0
+        ns = 0
+        k_out_eff = k_out
+    n_m, n_s, ct = _single_forward_splits_dev(k_in, k_out_eff, n_prog, TILE_M, BLOCK_K)
     max_val = tl.load(max_val_ptr)                              # scalar
     max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
 
@@ -1458,54 +1522,83 @@ def _sparse_io_sum_forward_single_kernel(
         w = pid + i * n_prog
         m_tile = w // n_s
         s = w - m_tile * n_s
-        offs_m = m_tile * TILE_M + tl.arange(0, TILE_M)         # [TILE_M]
-        mask_m = offs_m < k_out
-        h_m = tl.load(out_idx_ptr + offs_m, mask=mask_m, other=0)
-        pblock_m = h_m // BS
-        within_m = h_m % BS
         k_lo = s * (ct * BLOCK_K)
         k_hi = tl.minimum(k_lo + ct * BLOCK_K, k_in)
-
-        acc = tl.zeros([TILE_M, BLOCK_K], dtype=tl.float32)
-        for k0 in range(k_lo, k_hi, BLOCK_K):
-            offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
-            mask_k = offs_k < k_hi
-            child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
-            log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
-                               other=-float("inf"))
-            v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
-            cblock = child_ids // CBS
-            cslot = child_ids % CBS
-            W_ptr_off = (
-                pid_start
-                + (pblock_m[:, None] * NB_ch + cblock[None, :]) * CBS * BS
-                + cslot[None, :] * BS
-                + within_m[:, None]
-            )
-            W = tl.load(mparams_ptr + W_ptr_off, mask=mask_m[:, None] & mask_k[None, :],
-                        other=0.0).to(tl.float32)
-            acc += W * v_k[None, :]
-        partial = tl.sum(acc, axis=1)                           # [TILE_M]
-        if DIRECT:
-            tl.store(values_out_ptr + offs_m, tl.log(partial) + max_val, mask=mask_m)
+        if HYBRID and m_tile < nd:
+            # dense tile: TILE_M consecutive parents, contiguous W rows
+            t0 = tl.multiple_of(tl.load(dense_tiles_ptr + d_start + m_tile), TILE_M)
+            h_m = t0 + tl.arange(0, TILE_M)
+            mask_m = h_m < num_rows
+            partial = _single_item_accumulate(
+                mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
+            tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M), partial)
         else:
-            tl.store(partials_ptr + s * (n_m * TILE_M) + offs_m, partial, mask=mask_m)
+            if HYBRID:
+                offs_r = (m_tile - nd) * TILE_M + tl.arange(0, TILE_M)
+                mask_m = offs_r < ns
+                h_m = tl.load(sparse_rows_ptr + s_start + offs_r, mask=mask_m, other=0)
+            else:
+                offs_r = m_tile * TILE_M + tl.arange(0, TILE_M)   # [TILE_M]
+                mask_m = offs_r < k_out
+                h_m = tl.load(out_idx_ptr + offs_r, mask=mask_m, other=0)
+            partial = _single_item_accumulate(
+                mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
+            if DIRECT:
+                tl.store(values_out_ptr + offs_r, tl.log(partial) + max_val, mask=mask_m)
+            else:
+                tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M),
+                         partial, mask=mask_m)
+
+
+@triton.jit
+def _single_item_accumulate(mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                            pid_start, NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+                            TILE_M: tl.constexpr, BLOCK_K: tl.constexpr):
+    """``partial[m] = sum_{k in [k_lo, k_hi)} W[h_m[m], child_k] * exp(log_in[k] - max_val)``
+    for one (parent tile, child range) work item of the single-sample forward."""
+    pblock_m = h_m // BS
+    within_m = h_m % BS
+    acc = tl.zeros([TILE_M, BLOCK_K], dtype=tl.float32)
+    for k0 in range(k_lo, k_hi, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
+        mask_k = offs_k < k_hi
+        child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
+        log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
+                           other=-float("inf"))
+        v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
+        cblock = child_ids // CBS
+        cslot = child_ids % CBS
+        W_ptr_off = (
+            pid_start
+            + (pblock_m[:, None] * NB_ch + cblock[None, :]) * CBS * BS
+            + cslot[None, :] * BS
+            + within_m[:, None]
+        )
+        W = tl.load(mparams_ptr + W_ptr_off, mask=mask_m[:, None] & mask_k[None, :],
+                    other=0.0).to(tl.float32)
+        acc += W * v_k[None, :]
+    return tl.sum(acc, axis=1)                              # [TILE_M]
 
 
 @triton.jit(
-    do_not_specialize=["K_in", "K_out", "n_prog"],
+    do_not_specialize=["K_in", "K_out", "n_prog", "col_start", "n_dense", "n_sparse"],
     do_not_specialize_on_alignment=["values_out_ptr", "partials_ptr", "max_val_ptr",
-                                    "in_nnz_ptr", "out_nnz_ptr"],
+                                    "in_nnz_ptr", "out_nnz_ptr", "out_col_starts_ptr",
+                                    "slot_ptr", "desc_ptr"],
 )
 def _sparse_io_sum_forward_single_epilogue_kernel(
     values_out_ptr, partials_ptr, max_val_ptr, in_nnz_ptr, out_nnz_ptr,
+    out_col_starts_ptr, slot_ptr, desc_ptr, col_start, n_dense, n_sparse,
     K_in, K_out, n_prog,
     TILE_M: tl.constexpr, BLOCK_K: tl.constexpr, BLOCK: tl.constexpr,
-    DEVICE_SIZES: tl.constexpr,
+    DEVICE_SIZES: tl.constexpr, HYBRID: tl.constexpr,
 ):
-    """``values_out[m] = log(Σ_s partials[s * n_m * TILE_M + m]) + max_val``
+    """``values_out[m] = log(Σ_s partials[s * n_m * TILE_M + slot(m)]) + max_val``
     over the splits of :func:`_sparse_io_sum_forward_single_kernel` (same
-    rule, same sizes), ``-inf`` for an empty input column. Grid
+    rule, same sizes), ``-inf`` for an empty input column; ``slot(m) = m``, or
+    ``slot[col_start + m]`` of the descriptors when ``HYBRID``. Grid
     ``(cdiv(K_out, BLOCK),)``."""
     if DEVICE_SIZES:
         k_in = tl.load(in_nnz_ptr)
@@ -1513,12 +1606,26 @@ def _sparse_io_sum_forward_single_epilogue_kernel(
     else:
         k_in = K_in
         k_out = K_out
-    n_m, n_s, _ = _single_forward_splits_dev(k_in, k_out, n_prog, TILE_M, BLOCK_K)
+    if HYBRID:
+        if DEVICE_SIZES:
+            k_out_eff = tl.load(desc_ptr + 1) * TILE_M + tl.load(desc_ptr + 3)
+            c0 = tl.load(out_col_starts_ptr)
+        else:
+            k_out_eff = n_dense * TILE_M + n_sparse
+            c0 = col_start
+    else:
+        k_out_eff = k_out
+        c0 = 0
+    n_m, n_s, _ = _single_forward_splits_dev(k_in, k_out_eff, n_prog, TILE_M, BLOCK_K)
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = offs < k_out
+    if HYBRID:
+        slots = tl.load(slot_ptr + c0 + offs, mask=mask, other=0)
+    else:
+        slots = offs
     acc = tl.zeros([BLOCK], dtype=tl.float32)
     for s in range(0, n_s):
-        acc += tl.load(partials_ptr + s * (n_m * TILE_M) + offs, mask=mask, other=0.0)
+        acc += tl.load(partials_ptr + s * (n_m * TILE_M) + slots, mask=mask, other=0.0)
     max_val = tl.load(max_val_ptr)
     max_val = tl.where(max_val == -float("inf"), 0.0, max_val)
     res = tl.where(k_in == 0, -float("inf"), tl.log(acc) + max_val)
