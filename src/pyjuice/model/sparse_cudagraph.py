@@ -124,11 +124,14 @@ def _static_pattern_kernel(cs_ptr, nnz_ptr, data_ptr, indptr_ptr, var_ptr, slot_
         s0 = tl.load(sd_ptr + tdesc, mask=mask, other=0)
         s1 = tl.load(sd_ptr + tdesc + 1, mask=mask, other=0)
         valid = missing | ok
+        # lane b = 0 of this program (B == 1, so it is the only sample)
         first = mask & (offs_b == 0)
-        tl.store(desc_ptr + slot * 4 + 0, d0, mask=first)
-        tl.store(desc_ptr + slot * 4 + 1, tl.where(valid, d1 - d0, 0), mask=first)
-        tl.store(desc_ptr + slot * 4 + 2, s0, mask=first)
-        tl.store(desc_ptr + slot * 4 + 3, tl.where(valid, s1 - s0, 0), mask=first)
+        nd = tl.where(valid, d1 - d0, 0)
+        ns = tl.where(valid, s1 - s0, 0)
+        tl.store(desc_ptr + slot * 4 + 0, tl.sum(tl.where(first, d0, 0), axis=0))
+        tl.store(desc_ptr + slot * 4 + 1, tl.sum(tl.where(first, nd, 0), axis=0))
+        tl.store(desc_ptr + slot * 4 + 2, tl.sum(tl.where(first, s0, 0), axis=0))
+        tl.store(desc_ptr + slot * 4 + 3, tl.sum(tl.where(first, ns, 0), axis=0))
 
 
 class SparseGraphState:
