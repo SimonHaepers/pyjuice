@@ -13,7 +13,29 @@ import pyjuice.nodes.distributions.sparse_categorical as scat
 from pyjuice.structures import SparseHMM
 from pyjuice.transformations import reorder_states
 
-from sparse_state_order_test import _random_csc, _tokens
+
+def _random_csc(H: int, V: int, density: float, seed: int):
+    """Random CSC emission pattern with per-row coverage (same as the
+    state-order test; pytest's importlib mode keeps test modules apart)."""
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    n = int(density * H * V) + H
+    rows = torch.cat([torch.randint(0, H, (n,), generator=g), torch.arange(H)])
+    cols = torch.cat([torch.randint(0, V, (n,), generator=g), torch.randint(0, V, (H,), generator=g)])
+    linear = torch.unique(rows * V + cols)
+    rows_d, cols_d = linear // V, linear % V
+    order = torch.argsort(cols_d * H + rows_d)
+    indices = rows_d[order].contiguous()
+    indptr = torch.zeros(V + 1, dtype=torch.long)
+    indptr[1:] = torch.cumsum(torch.bincount(cols_d[order], minlength=V), 0)
+    values = torch.rand(indices.numel(), generator=g) + 0.05
+    return indptr, indices, values
+
+
+def _tokens(indptr: torch.Tensor, B: int, T: int, seed: int) -> torch.Tensor:
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    nonempty = torch.nonzero(torch.diff(indptr) > 0).reshape(-1)
+    return nonempty[torch.randint(0, nonempty.numel(), (B, T), generator=g)]
+
 
 
 def _chain(T, H, V, bs, seed, density=0.12):
