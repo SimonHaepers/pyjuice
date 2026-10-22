@@ -17,15 +17,21 @@ LOG_EPS = -23.0258509299  # log(1e-10), used for (row, col) positions outside th
 
 B1_TILE = 32
 """Parent tile of the single-sample sparse-IO forward (its ``TILE_M``)."""
-B1_STREAM_FRAC = float(os.environ.get("PYJUICE_SPARSE_IO_B1_STREAM_FRAC", "0.25"))
-"""Single-sample sparse-IO forward: a parent tile of ``B1_TILE`` consecutive
-states is streamed whole (contiguous, vectorised loads, masked after the load)
+B1_STREAM_FRAC = float(os.environ.get("PYJUICE_SPARSE_IO_B1_STREAM_FRAC", "2"))
+"""Single-sample sparse-IO forward, experimental: a parent tile of ``B1_TILE``
+consecutive states is streamed whole (contiguous loads, masked after the load)
 when at least this fraction of its states is active for the step's token, the
 other active states are gathered one by one. ``0``: stream every tile that has
-an active state (output-dense); above ``1``: gather everything (the kernel's
-original path). Calibrated 2026-10-21 on the wikitext chains with sorted states
-(``pyjuice.transformations.reorder_states``): 0.25 keeps the fetched bytes within
-2 % of the pure gather and cuts the load instructions to 15-25 %."""
+an active state (output-dense); above ``1`` (the default): gather everything.
+Off by default because it lost on the trained wikitext chains with sorted
+states (``pyjuice.transformations.reorder_states``, 2026-10-22, B=1 forward per
+sequence): 8k d0.01 1.63 ms at 0.25 / 0.5 vs 1.48 for the gather, 16k d0.1
+6.1-6.9 ms vs 5.1 (all-streamed 20 ms). The kernel's cost is the serial chain
+of index load, address and weight load per (parent tile, child chunk) item,
+so the extra tiles of the streamed layout cost more than their contiguous loads
+save; a streamed item would have to cover several tiles (wider TILE_M) to pay.
+The sector analysis behind it (bytes within 2 %, loads 15-25 %) is in
+prune-pc ``scripts/bench/analyze_sector_efficiency.py``."""
 
 
 def b1_hybrid_enabled() -> bool:
