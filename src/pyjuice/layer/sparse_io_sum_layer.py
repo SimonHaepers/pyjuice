@@ -1527,37 +1527,62 @@ def _sparse_io_sum_forward_single_kernel(
         s = w - m_tile * n_s
         k_lo = s * (ct * BLOCK_K)
         k_hi = tl.minimum(k_lo + ct * BLOCK_K, k_in)
-        if HYBRID and m_tile < nd:
-            # dense tile: TILE_M consecutive parents, contiguous W rows
-            t0 = tl.multiple_of(tl.load(dense_tiles_ptr + d_start + m_tile), TILE_M)
-            if ALIGNED:
-                partial = _single_item_accumulate_dense(
-                    mparams_ptr, in_idx_ptr, in_values_ptr, t0, k_lo, k_hi, max_val,
-                    pid_start, num_rows, NB_ch, BS, CBS, TILE_M, BLOCK_K, ROWS_MASK)
+        if HYBRID:
+            if m_tile < nd:
+                # dense tile: TILE_M consecutive parents, contiguous W rows
+                t0 = tl.multiple_of(tl.load(dense_tiles_ptr + d_start + m_tile), TILE_M)
+                if ALIGNED:
+                    partial = _single_item_accumulate_dense(
+                        mparams_ptr, in_idx_ptr, in_values_ptr, t0, k_lo, k_hi, max_val,
+                        pid_start, num_rows, NB_ch, BS, CBS, TILE_M, BLOCK_K, ROWS_MASK)
+                else:
+                    h_m = t0 + tl.arange(0, TILE_M)
+                    mask_m = h_m < num_rows
+                    partial = _single_item_accumulate(
+                        mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                        pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
+                tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M), partial)
             else:
-                h_m = t0 + tl.arange(0, TILE_M)
-                mask_m = h_m < num_rows
-                partial = _single_item_accumulate(
-                    mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
-                    pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
-            tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M), partial)
-        else:
-            if HYBRID:
                 offs_r = (m_tile - nd) * TILE_M + tl.arange(0, TILE_M)
                 mask_m = offs_r < ns
                 h_m = tl.load(sparse_rows_ptr + s_start + offs_r, mask=mask_m, other=0)
-            else:
-                offs_r = m_tile * TILE_M + tl.arange(0, TILE_M)   # [TILE_M]
-                mask_m = offs_r < k_out
-                h_m = tl.load(out_idx_ptr + offs_r, mask=mask_m, other=0)
-            partial = _single_item_accumulate(
-                mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
-                pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
-            if DIRECT:
-                tl.store(values_out_ptr + offs_r, tl.log(partial) + max_val, mask=mask_m)
-            else:
+                partial = _single_item_accumulate(
+                    mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                    pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
                 tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M),
                          partial, mask=mask_m)
+        else:
+            # the original gather path, kept inline so the compiled kernel is unchanged
+            offs_m = m_tile * TILE_M + tl.arange(0, TILE_M)         # [TILE_M]
+            mask_m = offs_m < k_out
+            h_m = tl.load(out_idx_ptr + offs_m, mask=mask_m, other=0)
+            pblock_m = h_m // BS
+            within_m = h_m % BS
+
+            acc = tl.zeros([TILE_M, BLOCK_K], dtype=tl.float32)
+            for k0 in range(k_lo, k_hi, BLOCK_K):
+                offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
+                mask_k = offs_k < k_hi
+                child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
+                log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k,
+                                   other=-float("inf"))
+                v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
+                cblock = child_ids // CBS
+                cslot = child_ids % CBS
+                W_ptr_off = (
+                    pid_start
+                    + (pblock_m[:, None] * NB_ch + cblock[None, :]) * CBS * BS
+                    + cslot[None, :] * BS
+                    + within_m[:, None]
+                )
+                W = tl.load(mparams_ptr + W_ptr_off, mask=mask_m[:, None] & mask_k[None, :],
+                            other=0.0).to(tl.float32)
+                acc += W * v_k[None, :]
+            partial = tl.sum(acc, axis=1)                           # [TILE_M]
+            if DIRECT:
+                tl.store(values_out_ptr + offs_m, tl.log(partial) + max_val, mask=mask_m)
+            else:
+                tl.store(partials_ptr + s * (n_m * TILE_M) + offs_m, partial, mask=mask_m)
 
 
 @triton.jit
