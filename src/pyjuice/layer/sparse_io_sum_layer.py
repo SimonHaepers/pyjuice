@@ -563,6 +563,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
             DEVICE_SIZES=static,
             DIRECT=direct,
             HYBRID=hybrid,
+            ALIGNED=BS % TILE_M == 0,
+            ROWS_MASK=sv_out.num_rows % TILE_M != 0,
         )
         if not direct:
             BLOCK = 256
@@ -1451,6 +1453,7 @@ def _sparse_io_sum_forward_single_kernel(
     NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
     TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
     DEVICE_SIZES: tl.constexpr, DIRECT: tl.constexpr, HYBRID: tl.constexpr,
+    ALIGNED: tl.constexpr, ROWS_MASK: tl.constexpr,
 ):
     """Single-sample forward of one SparseIOSumLayer block, grid ``(n_prog,)``.
     The work items are the (parent tile, child range) pairs of a split-K
@@ -1527,11 +1530,16 @@ def _sparse_io_sum_forward_single_kernel(
         if HYBRID and m_tile < nd:
             # dense tile: TILE_M consecutive parents, contiguous W rows
             t0 = tl.multiple_of(tl.load(dense_tiles_ptr + d_start + m_tile), TILE_M)
-            h_m = t0 + tl.arange(0, TILE_M)
-            mask_m = h_m < num_rows
-            partial = _single_item_accumulate(
-                mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
-                pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
+            if ALIGNED:
+                partial = _single_item_accumulate_dense(
+                    mparams_ptr, in_idx_ptr, in_values_ptr, t0, k_lo, k_hi, max_val,
+                    pid_start, num_rows, NB_ch, BS, CBS, TILE_M, BLOCK_K, ROWS_MASK)
+            else:
+                h_m = t0 + tl.arange(0, TILE_M)
+                mask_m = h_m < num_rows
+                partial = _single_item_accumulate(
+                    mparams_ptr, in_idx_ptr, in_values_ptr, h_m, mask_m, k_lo, k_hi, max_val,
+                    pid_start, NB_ch, BS, CBS, TILE_M, BLOCK_K)
             tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M), partial)
         else:
             if HYBRID:
@@ -1550,6 +1558,36 @@ def _sparse_io_sum_forward_single_kernel(
             else:
                 tl.store(partials_ptr + s * (n_m * TILE_M) + m_tile * TILE_M + tl.arange(0, TILE_M),
                          partial, mask=mask_m)
+
+
+@triton.jit
+def _single_item_accumulate_dense(mparams_ptr, in_idx_ptr, in_values_ptr, t0, k_lo, k_hi, max_val,
+                                  pid_start, num_rows, NB_ch: tl.constexpr, BS: tl.constexpr,
+                                  CBS: tl.constexpr, TILE_M: tl.constexpr, BLOCK_K: tl.constexpr,
+                                  ROWS_MASK: tl.constexpr):
+    """:func:`_single_item_accumulate` for a dense tile of TILE_M consecutive
+    parents inside one parent block (``BS % TILE_M == 0``): one parent block
+    for the whole tile, one column base per child, one lane offset per parent,
+    so the loads are contiguous vectors and the address arithmetic is one add
+    per element. ``ROWS_MASK``: the last tile may run past ``num_rows``."""
+    pblock = t0 // BS
+    within = t0 % BS + tl.arange(0, TILE_M)                 # [TILE_M], contiguous
+    row_base = mparams_ptr + pid_start + pblock.to(tl.int64) * (NB_ch * CBS * BS)
+    acc = tl.zeros([TILE_M, BLOCK_K], dtype=tl.float32)
+    for k0 in range(k_lo, k_hi, BLOCK_K):
+        offs_k = k0 + tl.arange(0, BLOCK_K)                 # [BLOCK_K]
+        mask_k = offs_k < k_hi
+        child_ids = tl.load(in_idx_ptr + offs_k, mask=mask_k, other=0)
+        log_vals = tl.load(in_values_ptr + offs_k, mask=mask_k, other=-float("inf"))
+        v_k = tl.where(mask_k, tl.exp(log_vals - max_val), 0.0)
+        col = (child_ids // CBS) * (CBS * BS) + (child_ids % CBS) * BS     # [BLOCK_K]
+        if ROWS_MASK:
+            mask = mask_k[None, :] & ((t0 + tl.arange(0, TILE_M)) < num_rows)[:, None]
+        else:
+            mask = mask_k[None, :] & (tl.arange(0, TILE_M) >= 0)[:, None]
+        W = tl.load(row_base + col[None, :] + within[:, None], mask=mask, other=0.0).to(tl.float32)
+        acc += W * v_k[None, :]
+    return tl.sum(acc, axis=1)                              # [TILE_M]
 
 
 @triton.jit
