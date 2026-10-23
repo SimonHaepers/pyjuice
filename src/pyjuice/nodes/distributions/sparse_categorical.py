@@ -286,15 +286,10 @@ class SparseCategorical(Distribution):
         n_tiles = max(1, -(-H // tile))
         nnz = torch.diff(indptr)
         if self._nnz > 0:
-            # rows are sorted within every column: distinct tiles of a column =
-            # 1 + the tile changes between consecutive entries of the column
-            t = indices // tile
-            change = torch.zeros(self._nnz, dtype = torch.long)
-            change[1:] = (t[1:] != t[:-1]).long()
-            change[indptr[:-1][nnz > 0]] = 0          # no change at a column's first entry
-            csum = torch.zeros(self._nnz + 1, dtype = torch.long)
-            csum[1:] = torch.cumsum(change, dim = 0)
-            tiles = (csum[indptr[1:]] - csum[indptr[:-1]] + (nnz > 0).long()).double()
+            # distinct (column, tile) pairs; rows need not be sorted within a column
+            col_of = torch.repeat_interleave(torch.arange(V), nnz)
+            keys = torch.unique(col_of * n_tiles + indices // tile)
+            tiles = torch.bincount(keys // n_tiles, minlength = V).double()
         else:
             tiles = torch.zeros(V, dtype = torch.float64)
         weights = nnz.double()

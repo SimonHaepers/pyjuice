@@ -733,7 +733,19 @@ class SparseIOSumLayer(SparseInputSumLayer):
         out_var = self._output_sparsity_var_ids[blk_idx]
         if static_ctx is not None and static_ctx.is_masked(out_var):
             return 1.0
-        return self._output_sparsity_dists[blk_idx].expected_col_tiles(TM)
+        out_dist = self._output_sparsity_dists[blk_idx]
+        # weigh the tokens by their emission mass when the output column's
+        # distribution is this block's input one (the tied emission of a
+        # homogeneous chain), as :meth:`_ws_static_support` does for the input
+        # side; the length-weighted estimate is 20-30 % low on the trained
+        # wikitext chains (0.17 vs 0.21 at 8k d0.01, 0.32 vs 0.45 at 8k d0.1)
+        prod, ns_idx = self._sparse_input_refs[blk_idx]
+        emit_ns = prod.nodes[ns_idx].sparse_input_ns
+        values = None
+        if emit_ns.dist is out_dist:
+            base = emit_ns._param_range[0]
+            values = prod._sparse_input_layers[ns_idx].params[base:base + out_dist._nnz]
+        return out_dist.expected_col_tiles(TM, values)
 
     def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
         """``(TM, TK, BB, num_warps, num_stages)`` of the tiles pass for this
