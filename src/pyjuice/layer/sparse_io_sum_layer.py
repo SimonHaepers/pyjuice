@@ -148,12 +148,15 @@ _WS_UNION_EXP = 0.7
 """The expected union of ``B`` samples' input supports is modelled as that of
 ``B ** _WS_UNION_EXP`` independent columns of the expected length: the
 frequent tokens' supports overlap heavily (fits 0.56..0.84 on the chains)."""
-_WS_MMA_COST_PER_SAMPLE = 0.012
+_WS_MMA_COST_PER_SAMPLE = 0.0067
 """Tensor-core work of a W element per sample relative to streaming it: the
-WS passes stop being memory-bound from ``1 / _WS_MMA_COST_PER_SAMPLE`` (~80)
-samples on and their cost then grows with B (105 TFLOP/s tf32 measured at
-B=128). Without it a 99 %-sparse H=4096 chain went to WS from B~300 and
-trained 2-3x slower than on the gather kernels at B=8192 (2026-10-16)."""
+WS passes stop being memory-bound from ``1 / _WS_MMA_COST_PER_SAMPLE`` (~150)
+samples on and their cost then grows with B. Without it a 99 %-sparse H=4096
+chain went to WS from B~300 and trained 2-3x slower than on the gather
+kernels at B=8192 (2026-10-16). Was 0.012 (105 TFLOP/s at B=128);
+recalibrated 2026-10-23 on the full pass's measured scaling, 2.0 / 3.5 /
+6.9 / 13.6x its B=64 time at B=256 / 512 / 1024 / 2048 on the 8k chains and
+2.2 / 4.2x at 16k (140 TFLOP/s at B >= 512)."""
 
 _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
@@ -210,30 +213,39 @@ _WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "0") != "
 touches it. Off by default: the data-dependent branch stops Triton from
 pipelining the loop's loads (8k d0.01: 3.4x slower per iteration, 2026-10-23
 kernel map), and with 64-sample blocks a block touches ~95 % of the tiles."""
-_WS_TILES_MMA_COST_PER_SAMPLE = 0.02
+_WS_TILES_MMA_COST_PER_SAMPLE = 0.008
 """Cost model (:func:`_ws_dispatch`): tensor-core work of one W element of a
 visited tile row per (padded) sample of the block, relative to streaming the
 element in the full pass — the full pass's ``_WS_MMA_COST_PER_SAMPLE`` with
 the gathered rows' lower efficiency and the L2 re-reads of the W tiles by
-the blocks of a tile folded in. Calibrated 2026-10-23 on 8k d0.01 with the
-default shape: measured tiles / full forward 1.27 / 1.21 / 0.73 / 0.55 /
-0.53 at B=64 / 256 / 512 / 1024 / 2048, modelled 2.6 / 1.1 / 0.88 / 0.79 /
-0.75 (the decisions agree: full up to 256, tiles from 512; the backward
-mirrors them)."""
-_WS_TILES_LIST_SPREAD = (0.4, 2.4)
+the blocks of a tile folded in. Fitted 2026-10-23 with ``_WS_TILES_WAVE_COST``
+on the forced kernel maps of the four 8k / 16k chains at B=64..2048 (16
+points, 15 decisions right; the miss is 8k d0.1 at B=512, a 4 % loss):
+measured tiles / full 1.16 / 1.09 / 0.66 / 0.50 / 0.48 on 8k d0.01, 1.29 /
+0.83 / 0.65 on 16k d0.01 (B=64..512), 1.21 / 1.18 / 1.04 / 0.87 / 0.79 on
+8k d0.1 and 1.34 / 1.03 / 0.91 on 16k d0.1."""
+_WS_TILES_WAVE_COST = 0.013
+"""The pass's time floor, per W element of one wave of full programs
+(``SMs x BB`` rows of a tile row; the programs run one per SM at the default
+shape): with fewer programs than SMs, or one wave with half-empty lists, the
+step costs a wave whatever the padded work (8k d0.01: 42 ms per batch at
+B=256 and 44 at B=512 for 1.4x the work)."""
+_WS_TILES_LIST_SPREAD = (0.5, 2.0)
 """The lengths of the per-tile sample lists spread around their mean (a tile
 is touched by 10-50 % of the batch on the trained chains when the mean is
 20 %); the padding to ``BB`` is averaged over a geometric range of this
 spread rather than taken at the mean."""
 
-def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int) -> float:
+def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int,
+                   n_tiles: Optional[int] = None, n_sm: int = 132) -> float:
     """Cost model of the tiles passes (:func:`_ws_fwd_tiles_kernel`,
-    :func:`_ws_bwd_flow_tiles_kernel`) in streamed W elements: the larger of
-    one HBM pass over the tiles the batch touches (the pass is memory-bound
-    at small batches like the full one) and the tensor-core work of the
-    padded tile lists — per tile ``ceil(rows / BB) * BB`` rows of ``H``
-    elements, with the list lengths spread around their mean ``f_tiles *
-    B`` (:data:`_WS_TILES_LIST_SPREAD`)."""
+    :func:`_ws_bwd_flow_tiles_kernel`) in streamed W elements: the largest
+    of one HBM pass over the tiles the batch touches (the pass is
+    memory-bound at small batches like the full one), one wave of ``n_sm``
+    programs over the ``n_tiles`` listed tiles (:data:`_WS_TILES_WAVE_COST`)
+    and the tensor-core work of the padded tile lists — per tile ``ceil(rows
+    / BB) * BB`` rows of ``H`` elements, with the list lengths spread around
+    their mean ``f_tiles * B`` (:data:`_WS_TILES_LIST_SPREAD`)."""
     if f_tiles <= 0.0:
         return math.inf
     mean = B * f_tiles                                     # expected samples per tile
@@ -245,12 +257,14 @@ def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int) -> float:
         padded += math.ceil(rows / BB) * BB
     padded /= n
     u = 1.0 - (1.0 - min(f_tiles, 1.0)) ** (B ** _WS_UNION_EXP)
-    return n_w * max(u, padded * _WS_TILES_MMA_COST_PER_SAMPLE)
+    wave = n_sm * BB / n_tiles * _WS_TILES_WAVE_COST if n_tiles else 0.0
+    return n_w * max(u, wave, padded * _WS_TILES_MMA_COST_PER_SAMPLE)
 
 
 def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
                  backward: bool, f_tiles: Optional[float] = None,
-                 BB: Optional[int] = None) -> Optional[str]:
+                 BB: Optional[int] = None, n_tiles: Optional[int] = None,
+                 n_sm: int = 132) -> Optional[str]:
     """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
     kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
     over the rows of W^T of the batch's active children, compacted on the
@@ -258,7 +272,8 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     every sample's active parent tiles in the forward,
     :func:`_ws_fwd_tiles_kernel`, active child tiles in the backward,
     :func:`_ws_bwd_flow_tiles_kernel`, when ``f_tiles``, the expected fraction
-    of those tiles a sample touches, is given) — the
+    of those tiles a sample touches, is given; ``n_tiles`` the tiles of
+    the listed side, ``n_sm`` the device's SMs) — the
     cheapest by the cost model above for ``B`` samples with ``pairs`` active
     ``(sample, in, out)`` pairs per step and ``k_in`` active children per
     sample (the batch's own counts, or the model's expectation for a CUDA
@@ -279,7 +294,8 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
         c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
     c_full = W
     tiles_ok = f_tiles is not None and _WS_TILES_MODE != "never"
-    c_tiles = _ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB) if tiles_ok else math.inf
+    c_tiles = (_ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB, n_tiles, n_sm)
+               if tiles_ok else math.inf)
     if tiles_ok and _WS_TILES_MODE == "always":
         ws, c_ws = "tiles", c_tiles
     elif _WS_ACTIVE_MODE == "always":       # forced, whatever the batch
@@ -747,10 +763,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
             group = ws[0]
             B = static_ctx.B
             avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
+            TM, _TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
             use = _ws_dispatch(B, group.H_in, group.H_out, B * avg_in * avg_out, avg_in,
                                backward=False,
                                f_tiles=self._ws_tiles_fraction(blk_idx, static_ctx),
-                               BB=self._ws_tiles_shapes(blk_idx, B, params.device)[2])
+                               BB=BB, n_tiles=group.H_out // TM if TM else None,
+                               n_sm=_num_sms(params.device))
             if use is not None and not group.ensure_ready(params, B, need_stash=False):
                 use = None
         static_ctx.ws_decisions[key] = use
@@ -1069,8 +1087,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # children of the backward) comes from the model: the batch's tile
         # counts live on the device
         f_tiles = self._ws_tiles_fraction(blk_idx, static_ctx, backward=self._ws_in_backward)
+        TM, TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
+        if TM is None:
+            n_tiles = None
+        else:
+            n_tiles = group.H_in // TK if self._ws_in_backward else group.H_out // TM
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
-                           f_tiles=f_tiles, BB=self._ws_tiles_shapes(blk_idx, B, params.device)[2])
+                           f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device))
         if use is not None and not group.ensure_ready(params, B, need_stash):
             use = None
         return use

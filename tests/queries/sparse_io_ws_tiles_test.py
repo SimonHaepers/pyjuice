@@ -261,27 +261,29 @@ def test_tiles_on_forest(monkeypatch, B):
 
 
 def test_tiles_dispatch_cost_model():
-    """The cost model takes the tiles passes where a sample touches a small
-    fraction of the tiles and the batch is large enough for the full pass to
-    be tensor-core bound (the trained 8k d0.01 chain: 36 % of the 64-row
-    tiles per sample, measured crossover between B=256 and 512); the full
-    pass stays at small batches (memory-bound: one W pass is the floor) and
-    when a sample touches most tiles; a backward takes it under the same
-    rule (its own child-tile fraction). Pure host logic, no GPU."""
+    """The cost model (fitted 2026-10-23 on the forced kernel maps of the
+    four 8k / 16k chains) takes the tiles passes where they measured faster
+    than the full pass: from B=512 on 8k d0.01 (36 % of the 64-row tiles per
+    sample), from B=256 on 16k d0.01 (43 %), from B=1024 on 8k d0.1 (61 %),
+    from B=512 on 16k d0.1 (61 %); the full pass stays at small batches
+    (memory-bound, and one wave of programs is the pass's floor) and when a
+    sample touches most tiles; a backward takes it under the same rule (its
+    own child-tile fraction). Pure host logic, no GPU."""
     d = sio._ws_dispatch
-    H, k, f, BB = 8192, 508, 0.36, 128                       # 8192_d0.01, sorted states
-    assert [d(B, H, H, B * k * k, k, False, f_tiles=f, BB=BB) for B in (16, 64, 256, 512, 1024, 2048)] == \
-        [None, "full", "full", "tiles", "tiles", "tiles"]
-    assert d(1024, H, H, 1024 * k * k, k, True, f_tiles=f, BB=BB) == "tiles"
-    assert d(256, H, H, 256 * k * k, k, True, f_tiles=f, BB=BB) == "full"
-    assert d(1024, H, H, 1024 * k * k, k, True) == "full"    # no tile fraction: not a candidate
-    H, k = 16384, 995                                         # 16384_d0.01
-    assert d(512, H, H, 512 * k * k, k, False, f_tiles=0.4, BB=BB) == "tiles"
-    assert d(1024, 8192, 8192, 1024 * 3000 * 3000, 3000, False, f_tiles=0.95, BB=BB) == "full"
-    # modelled tiles / full at the default shape, against the 2026-10-23 measurements
-    full = lambda B: 8192.0 ** 2 * max(1.0, sio._WS_MMA_COST_PER_SAMPLE * B)
-    ratios = [sio._ws_tiles_cost(B, 8192.0 ** 2, f, BB) / full(B) for B in (64, 256, 512, 1024, 2048)]
-    assert ratios[0] > 1 and ratios[1] > 1 and all(r < 1 for r in ratios[2:]), ratios
+    BB = 128
+    cases = [   # (H, k, f_tiles(64), expected decision per B)
+        (8192, 508, 0.361, {16: None, 64: "full", 256: "full", 512: "tiles", 1024: "tiles", 2048: "tiles"}),
+        (16384, 1592, 0.425, {64: "full", 256: "tiles", 512: "tiles"}),
+        (8192, 1382, 0.611, {64: "full", 256: "full", 1024: "tiles", 2048: "tiles"}),
+        (16384, 3196, 0.606, {64: "full", 256: "full", 512: "tiles"}),
+    ]
+    for H, k, f, expect in cases:
+        got = {B: d(B, H, H, B * k * k, k, False, f_tiles=f, BB=BB, n_tiles=H // 64) for B in expect}
+        assert got == expect, (H, f, got)
+    assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, True, f_tiles=0.361, BB=BB, n_tiles=128) == "tiles"
+    assert d(256, 8192, 8192, 256 * 508 * 508, 508, True, f_tiles=0.361, BB=BB, n_tiles=128) == "full"
+    assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, True) == "full"   # no tile fraction: not a candidate
+    assert d(1024, 8192, 8192, 1024 * 3000 * 3000, 3000, False, f_tiles=0.95, BB=BB, n_tiles=128) == "full"
 
 
 def test_expected_col_tiles():
