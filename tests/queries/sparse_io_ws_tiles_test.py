@@ -1,11 +1,13 @@
-"""Weight-stationary pass over the per-sample active parent tiles of
-:class:`SparseIOSumLayer` (``"tiles"``, ``_ws_fwd_tiles_kernel``): for every
-parent tile the samples that have an active parent in it are gathered into
-the batch tile, the children walked with their child-tile bits. It must give
-the gather path's log-likelihoods at every batch size, eagerly and under a
+"""Weight-stationary passes over the per-sample active tiles of
+:class:`SparseIOSumLayer` (``"tiles"``): the forward over the parent tiles
+(``_ws_fwd_tiles_kernel``: for every parent tile the samples that have an
+active parent in it are gathered into the batch tile, the children walked
+with their child-tile bits) and the element-flow backward over the child
+tiles (``_ws_bwd_flow_tiles_kernel``, the mirror). They must give the gather
+path's log-likelihoods and flows at every batch size, eagerly and under a
 CUDA graph, on tile-aligned and unaligned state counts, with masked
-variables, on a circuit that is not a chain, and the cost model must take it
-where it is cheaper than the full pass.
+variables, on a circuit that is not a chain, and the cost model must take
+them where they are cheaper than the full pass.
 """
 from __future__ import annotations
 
@@ -80,7 +82,7 @@ def _set(monkeypatch, mode, prec="ieee", tiles=None, **shapes):
 
 
 def _count(monkeypatch):
-    calls = {"fwd": 0, "tiles": 0, "bwd": 0}
+    calls = {"fwd": 0, "tiles": 0, "bwd": 0, "bwd_tiles": 0}
     fwd, bwd = sio.SparseIOSumLayer._ws_forward_block, sio.SparseIOSumLayer._ws_backward_block
 
     def counted_fwd(self, *a, **k):
@@ -90,6 +92,7 @@ def _count(monkeypatch):
 
     def counted_bwd(self, *a, **k):
         calls["bwd"] += 1
+        calls["bwd_tiles"] += bool(k.get("tiles"))
         return bwd(self, *a, **k)
 
     monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_forward_block", counted_fwd)
@@ -97,10 +100,16 @@ def _count(monkeypatch):
     return calls
 
 
+def _emit_flows(pc):
+    return torch.cat([layer.param_flows.detach().reshape(-1).clone() for layer in pc.input_layer_group])
+
+
 def _pass(pc, data):
+    """LL, transition param flows (deferred GEMM of the stash) and emission
+    param flows (through the element flows of the backward)."""
     ll = pc(data, apply_cudagraph=False).detach().clone()
     pc.backward(data, compute_param_flows=True, flows_memory=0.0)
-    return ll, pc.param_flows.detach().clone()
+    return ll, pc.param_flows.detach().clone(), _emit_flows(pc)
 
 
 def _assert_flows_close(got, ref, rtol, what):
@@ -123,29 +132,36 @@ def test_tiles_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, BB):
     data = torch.randint(0, V, (B, T), device=DEV)
 
     _set(monkeypatch, "never")
-    ll_ref, pf_ref = _pass(pc, data)
+    ll_ref, pf_ref, emit_ref = _pass(pc, data)
 
     calls = _count(monkeypatch)
     _set(monkeypatch, "always", prec, tiles=True, BB=BB)
-    ll, pf = _pass(pc, data)
-    assert calls["fwd"] == T - 1 and calls["tiles"] == T - 1 and calls["bwd"] == T - 1
+    ll, pf, emit = _pass(pc, data)
+    assert calls["fwd"] == T - 1 and calls["tiles"] == T - 1
+    assert calls["bwd"] == T - 1 and calls["bwd_tiles"] == T - 1
     torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=_TOL[prec])
-    _assert_flows_close(pf, pf_ref, 1e-4 if prec == "ieee" else 3e-3, "transition param flows")
+    rtol = 1e-4 if prec == "ieee" else 3e-3
+    _assert_flows_close(pf, pf_ref, rtol, "transition param flows")
+    _assert_flows_close(emit, emit_ref, rtol, "emission param flows")
+    assert abs(pf.sum().item() - pf_ref.sum().item()) <= 1e-3 * pf_ref.sum().item()
 
 
-@pytest.mark.parametrize("skip_k", [True, False])
+@pytest.mark.parametrize("skip_k,row_mask", [(False, True), (False, False), (True, True)])
 @pytest.mark.parametrize("shapes", [dict(TM=32, TK=32, BB=64), dict(TM=64, TK=64, BB=32),
-                                    dict(TM=128, TK=16, BB=16)])
-def test_tiles_shapes(monkeypatch, shapes, skip_k):
-    """Every tile shape (clipped to the PC blocks) and the child-tile skip
-    give the same result."""
+                                    dict(TM=128, TK=16, BB=16), dict(TM=16, TK=16, BB=16)])
+def test_tiles_shapes(monkeypatch, shapes, skip_k, row_mask):
+    """Every tile shape (clipped to the PC blocks), the row mask and the
+    tile skip give the same result (TK=16 on H=256: 16 tiles, one bit word;
+    TM=16: 16 tiles)."""
     pc = _build(256, 60, 5, 128, 0.1, seed=2)
     data = torch.randint(0, 60, (40, 5), device=DEV)
     _set(monkeypatch, "never")
-    ref = pc(data, apply_cudagraph=False).detach().clone()
-    _set(monkeypatch, "always", "ieee", tiles=True, SKIP_K=skip_k, **shapes)
-    got = pc(data, apply_cudagraph=False).detach().clone()
-    torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-4)
+    ref = _pass(pc, data)
+    _set(monkeypatch, "always", "ieee", tiles=True, SKIP_K=skip_k, ROW_MASK=row_mask, **shapes)
+    got = _pass(pc, data)
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
 
 
 def test_tiles_empty_columns(monkeypatch):
@@ -192,13 +208,14 @@ def test_tiles_graph_replay_matches_eager(monkeypatch, H, V, T, bs, density, B):
     for x, ref in zip(batches, refs):
         got = pc(x).detach().clone()
         torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-4)
-    # the eager backward after a replay (WS or gather) still agrees
+    # the eager backward after a replay (WS tiles) still agrees
     _set(monkeypatch, "never")
-    ll_ref, pf_ref = _pass(pc, batches[1])
+    ll_ref, pf_ref, emit_ref = _pass(pc, batches[1])
     _set(monkeypatch, "always", "ieee", tiles=True, BB=16)
     pc(batches[1])
     pc.backward(batches[1], compute_param_flows=True, flows_memory=0.0)
     _assert_flows_close(pc.param_flows.detach(), pf_ref, 1e-4, "transition param flows")
+    _assert_flows_close(_emit_flows(pc), emit_ref, 1e-4, "emission param flows")
 
 
 def test_tiles_masked_variables(monkeypatch):
@@ -232,13 +249,14 @@ def test_tiles_on_forest(monkeypatch, B):
     refs = [_pass(pc, x) for x in batches]
     calls = _count(monkeypatch)
     _set(monkeypatch, "always", "ieee", tiles=True, BB=16)
-    for x, (ll_ref, pf_ref) in zip(batches, refs):
-        ll, pf = _pass(pc, x)
+    for x, (ll_ref, pf_ref, emit_ref) in zip(batches, refs):
+        ll, pf, emit = _pass(pc, x)
         torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
         _assert_flows_close(pf, pf_ref, 1e-4, "sum param flows")
-    assert calls["tiles"] > 0
+        _assert_flows_close(emit, emit_ref, 1e-4, "emission param flows")
+    assert calls["tiles"] > 0 and calls["bwd_tiles"] > 0
     pc(batches[0], record_cudagraph=True)
-    for x, (ll_ref, _) in zip(batches, refs):
+    for x, (ll_ref, _, _) in zip(batches, refs):
         torch.testing.assert_close(pc(x).detach(), ll_ref, rtol=0.0, atol=1e-4)
 
 
@@ -248,12 +266,14 @@ def test_tiles_dispatch_cost_model():
     pass to be tensor-core bound (the trained 8k / 16k d0.01 chains: ~20 %
     of the 32-row tiles per sample); the full pass stays at small batches
     (memory-bound: one W pass is the floor) and when a sample touches most
-    tiles; the backward never takes it. Pure host logic, no GPU."""
+    tiles; a backward takes it under the same rule (its own child-tile
+    fraction). Pure host logic, no GPU."""
     d = sio._ws_dispatch
     H, k = 8192, 440                                      # 8192_d0.01, sorted states
     assert [d(B, H, H, B * k * k, k, False, f_tiles=0.2, BB=64) for B in (16, 64, 256, 1024)] == \
         [None, "full", "tiles", "tiles"]
-    assert d(1024, H, H, 1024 * k * k, k, True, f_tiles=0.2, BB=64) == "full"
+    assert d(1024, H, H, 1024 * k * k, k, True, f_tiles=0.2, BB=64) == "tiles"
+    assert d(1024, H, H, 1024 * k * k, k, True) == "full"
     H, k = 16384, 995                                     # 16384_d0.01
     assert d(512, H, H, 512 * k * k, k, False, f_tiles=0.22, BB=64) == "tiles"
     assert d(512, H, H, 512 * k * k, k, False) == "full"  # no tile fraction: not a candidate

@@ -174,8 +174,9 @@ GEMM materialises at a time (256 MB fp32)."""
 # tile no sample of the block touches. MMA work ~ B * (parent tiles per sample)
 # * H_in, 4-6x below the full pass on the 8k/16k d0.01 chains.
 _WS_TILES_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES", "auto")
-"""``"auto"`` — the cost model may pick the tiles pass; ``"always"`` — WS
-forwards take it whenever eligible (tests / A-B runs; it beats
+"""``"auto"`` — the cost model may pick the tiles passes (forward over the
+parent tiles, backward element flows over the child tiles); ``"always"`` —
+WS blocks take them whenever eligible (tests / A-B runs; it beats
 ``_WS_ACTIVE_MODE == "always"``); ``"never"`` — excluded."""
 _WS_TILES_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TM", "32"))
 """Parent tile (rows of W per program; the granularity of the per-sample
@@ -187,9 +188,16 @@ activation row chunk of ``TK * 4`` bytes per sample and tile)."""
 _WS_TILES_BB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_BB", "64"))
 """Samples per program (the MMA batch tile; >= 16). A parent tile's list is
 padded to a multiple of it."""
-_WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "1") != "0"
+_WS_TILES_ROW_MASK = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_ROW_MASK", "1") != "0"
+"""Load a sample's activation row of a child tile only when the sample has
+an active child in it (its tile bits, held in registers for the program's
+samples); off, every listed sample's row is loaded (zeros outside its
+support)."""
+_WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "0") != "0"
 """Skip a child tile (its W tile load and the MMA) when no sample of the block
-touches it."""
+touches it. Off by default: the data-dependent branch stops Triton from
+pipelining the loop's loads (8k d0.01: 3.4x slower per iteration, 2026-10-23
+kernel map), and with 64-sample blocks a block touches ~95 % of the tiles."""
 _WS_TILES_MMA_COST_PER_SAMPLE = 0.016
 """Cost model (:func:`_ws_dispatch`): tensor-core work of one W element of a
 visited tile per sample of the block, relative to streaming the element in
@@ -220,10 +228,11 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
     kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
     over the rows of W^T of the batch's active children, compacted on the
-    device each step by :func:`_ws_active_children`) or, forward only,
-    ``"tiles"`` (WS over every sample's active parent tiles,
-    :func:`_ws_fwd_tiles_kernel`, when ``f_tiles``, the expected fraction of
-    the ``_WS_TILES_TM``-row parent tiles a sample touches, is given) — the
+    device each step by :func:`_ws_active_children`) or ``"tiles"`` (WS over
+    every sample's active parent tiles in the forward,
+    :func:`_ws_fwd_tiles_kernel`, active child tiles in the backward,
+    :func:`_ws_bwd_flow_tiles_kernel`, when ``f_tiles``, the expected fraction
+    of those tiles a sample touches, is given) — the
     cheapest by the cost model above for ``B`` samples with ``pairs`` active
     ``(sample, in, out)`` pairs per step and ``k_in`` active children per
     sample (the batch's own counts, or the model's expectation for a CUDA
@@ -243,7 +252,7 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
         c_gather = pairs * (_WS_GATHER_PAIR_COST if B >= 16 else _WS_GATHER_PAIR_COST_SMALL)
         c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
     c_full = W
-    tiles_ok = f_tiles is not None and not backward and _WS_TILES_MODE != "never"
+    tiles_ok = f_tiles is not None and _WS_TILES_MODE != "never"
     c_tiles = _ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB) if tiles_ok else math.inf
     if tiles_ok and _WS_TILES_MODE == "always":
         ws, c_ws = "tiles", c_tiles
@@ -368,7 +377,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # ``None`` keeps the block on the gather kernels.
         self._ws_slots: List[Optional[Tuple["_WSGroup", int]]] = [None] * len(self.nodes)
         # Set by :meth:`backward` while it dispatches its blocks: the tiles
-        # pass (:func:`_ws_fwd_tiles_kernel`) is forward-only.
+        # pass of a backward is priced on the child tiles, not the parent ones.
         self._ws_in_backward = False
 
     def __repr__(self) -> str:
@@ -721,15 +730,25 @@ class SparseIOSumLayer(SparseInputSumLayer):
         static_ctx.ws_decisions[key] = use
         return use
 
-    def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None) -> Optional[float]:
-        """Expected fraction of the parent tiles of the tiles pass a sample
-        touches (:meth:`SparseCategorical.expected_col_tiles` of the output
-        column's distribution, every tile for a variable the profile masks),
-        ``None`` when the block cannot take the pass."""
-        group, _ = self._ws_slots[blk_idx]
-        TM = self._ws_tiles_shapes(blk_idx, 1, None)[0]
+    def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None,
+                           backward: bool = False) -> Optional[float]:
+        """Expected fraction of the tiles of the tiles pass a sample touches
+        (:meth:`SparseCategorical.expected_col_tiles`): the ``TM``-row parent
+        tiles of the output column in the forward, the ``TK``-row child tiles
+        of the input column in the backward; every tile for a variable the
+        profile masks; ``None`` when the block cannot take the pass."""
+        TM, TK = self._ws_tiles_shapes(blk_idx, 1, None)[:2]
         if TM is None:
             return None
+        prod, ns_idx = self._sparse_input_refs[blk_idx]
+        in_ns = prod.nodes[ns_idx]
+        emit_ns = in_ns.sparse_input_ns
+        base = emit_ns._param_range[0]
+        in_values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
+        if backward:
+            if static_ctx is not None and static_ctx.is_masked(in_ns.var_id):
+                return 1.0
+            return emit_ns.dist.expected_col_tiles(TK, in_values)
         out_var = self._output_sparsity_var_ids[blk_idx]
         if static_ctx is not None and static_ctx.is_masked(out_var):
             return 1.0
@@ -739,12 +758,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # homogeneous chain), as :meth:`_ws_static_support` does for the input
         # side; the length-weighted estimate is 20-30 % low on the trained
         # wikitext chains (0.17 vs 0.21 at 8k d0.01, 0.32 vs 0.45 at 8k d0.1)
-        prod, ns_idx = self._sparse_input_refs[blk_idx]
-        emit_ns = prod.nodes[ns_idx].sparse_input_ns
-        values = None
-        if emit_ns.dist is out_dist:
-            base = emit_ns._param_range[0]
-            values = prod._sparse_input_layers[ns_idx].params[base:base + out_dist._nnz]
+        values = in_values if emit_ns.dist is out_dist else None
         return out_dist.expected_col_tiles(TM, values)
 
     def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
@@ -919,7 +933,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
-                    active_children=ws == "active",
+                    active_children=ws == "active", tiles=ws == "tiles",
                 )
             elif sv_in.is_batched:
                 BLOCK_B = _BWD_BATCHED_BLOCK_B
@@ -1020,10 +1034,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
         else:
             pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
             k_in = sum(sv_in.nnz_list) / max(B, 1)    # total_nnz is the longest column
-        # the tiles pass is forward-only; its expected parent-tile fraction
-        # comes from the model (the batch's tile counts live on the device)
-        f_tiles = (None if need_stash or self._ws_in_backward
-                   else self._ws_tiles_fraction(blk_idx, static_ctx))
+        # the tiles passes' expected tile fraction (parents of the forward,
+        # children of the backward) comes from the model: the batch's tile
+        # counts live on the device
+        f_tiles = self._ws_tiles_fraction(blk_idx, static_ctx, backward=self._ws_in_backward)
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
                            f_tiles=f_tiles, BB=self._ws_tiles_shapes(blk_idx, B, params.device)[2])
         if use is not None and not group.ensure_ready(params, B, need_stash):
@@ -1060,13 +1074,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if tiles:
             TM, TK, BB, warps, stages = self._ws_tiles_shapes(blk_idx, B, device)
             assert TM is not None
-            lists, counts = _ws_parent_tile_lists(sv_out, H_out, TM, device)
-            bits, n_words = _ws_child_tile_bits(sv_in, H_in, TK, device)
+            lists, counts = _ws_tile_lists(sv_out, H_out, TM, device)
+            bits, n_words = _ws_tile_bits(sv_in, H_in, TK, device)
             _ws_fwd_tiles_kernel[(triton.cdiv(B, BB), H_out // TM)](
                 yd, w, xd, max_val, sv_in.nnz, lists, counts, bits, w_start, B, H_in, H_out,
-                n_words,
-                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
-                PREC="tf32" if rnd else "ieee", SKIP_K=_WS_TILES_SKIP_K,
+                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB, NW=n_words,
+                PREC="tf32" if rnd else "ieee", ROW_MASK=_WS_TILES_ROW_MASK,
+                SKIP_K=_WS_TILES_SKIP_K,
                 num_warps=warps, num_stages=stages,
             )
         else:
@@ -1092,11 +1106,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
                            sv_out: SparseNodeValues, sv_flow_out: SparseNodeValues,
                            sv_flow_in: SparseNodeValues, params: torch.Tensor,
                            param_flows: Optional[torch.Tensor],
-                           negate_pflows: bool, active_children: bool = False) -> None:
+                           negate_pflows: bool, active_children: bool = False,
+                           tiles: bool = False) -> None:
         """Element flows through :func:`_ws_bwd_flow_kernel` (over all
-        children, or with ``active_children`` only the batch's); the parameter
-        flows are only *stashed* here (densified ``G`` / ``X`` factors in
-        this block's slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
+        children, or with ``active_children`` only the batch's) or, with
+        ``tiles``, :func:`_ws_bwd_flow_tiles_kernel` (every child tile with
+        the samples that have an active child in it); the parameter flows are
+        only *stashed* here (densified ``G`` / ``X`` factors in this block's
+        slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
 
         With ``gs[b, h] = nflow[b, h] * exp(max_b - nmars[b, h])`` and
         ``x[b, c] = exp(in[b, c] - max_b)`` (zero off-support):
@@ -1137,18 +1154,31 @@ class SparseIOSumLayer(SparseInputSumLayer):
             )
 
         fd = _ws_scratch("f", (B, H_in), device)
-        TK, BB, warps, stages = _ws_tiles(H_in, B, CBS, 128, device)
-        TM = min(32, BS)
-        if active_children:
-            active, n_active = _ws_active_children(sv_in, H_in, device)
+        if tiles:
+            TM, TK, BB, warps, stages = self._ws_tiles_shapes(blk_idx, B, device)
+            assert TM is not None
+            lists, counts = _ws_tile_lists(sv_in, H_in, TK, device)
+            bits, n_words = _ws_tile_bits(sv_out, H_out, TM, device)
+            _ws_bwd_flow_tiles_kernel[(triton.cdiv(B, BB), H_in // TK)](
+                fd, w, gd, lists, counts, bits, w_start, B, H_in, H_out,
+                NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB, NW=n_words,
+                PREC="tf32" if rnd else "ieee", ROW_MASK=_WS_TILES_ROW_MASK,
+                SKIP_K=_WS_TILES_SKIP_K,
+                num_warps=warps, num_stages=stages,
+            )
         else:
-            active = n_active = sv_in.nnz                  # unused
-        _ws_bwd_flow_kernel[(triton.cdiv(B, BB), H_in // TK)](
-            fd, w, gd, active, n_active, w_start, B, H_in, H_out,
-            NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB,
-            PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
-            num_warps=warps, num_stages=stages,
-        )
+            TK, BB, warps, stages = _ws_tiles(H_in, B, CBS, 128, device)
+            TM = min(32, BS)
+            if active_children:
+                active, n_active = _ws_active_children(sv_in, H_in, device)
+            else:
+                active = n_active = sv_in.nnz                  # unused
+            _ws_bwd_flow_kernel[(triton.cdiv(B, BB), H_in // TK)](
+                fd, w, gd, active, n_active, w_start, B, H_in, H_out,
+                NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB,
+                PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
+                num_warps=warps, num_stages=stages,
+            )
 
         _ws_gather_flow_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
             sv_flow_in.values, fd, sv_in.indices, sv_in.values, max_val,
@@ -1210,21 +1240,22 @@ def _ws_active_children(sv_in: SparseNodeValues, H_in: int,
     return active, pos[H_in - 1:]
 
 
-def _ws_parent_tile_lists(sv_out: SparseNodeValues, H_out: int, TM: int,
-                          device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(lists, counts)`` of the tiles pass: for every ``TM``-row parent tile
-    ``m`` the samples with an active parent in it, ``lists[m, 0:counts[m]]``
-    (int32, batch order, ``lists`` is ``[n_tiles, B]``). Per-sample flags,
-    then one program per tile scans the batch (prefix sum) and compacts;
-    graph-capturable, no host sync."""
-    B = sv_out.batch_size
-    n_tiles = H_out // TM
-    flags = _ws_scratch("pt_flags", (B, n_tiles), device, torch.int32)
-    lists = _ws_scratch("pt_lists", (n_tiles, B), device, torch.int32)
-    counts = _ws_scratch("pt_counts", (n_tiles,), device, torch.int32)
+def _ws_tile_lists(sv: SparseNodeValues, H: int, T: int,
+                   device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(lists, counts)`` of the tiles passes: for every ``T``-row tile ``m``
+    of the ``H`` rows of the batched column ``sv`` the samples with an active
+    row in it, ``lists[m, 0:counts[m]]`` (int32, batch order, ``lists`` is
+    ``[n_tiles, B]``): the parents of the forward, the children of the
+    backward. Per-sample flags, then one program per tile scans the batch
+    (prefix sum) and compacts; graph-capturable, no host sync."""
+    B = sv.batch_size
+    n_tiles = H // T
+    flags = _ws_scratch("tl_flags", (B, n_tiles), device, torch.int32)
+    lists = _ws_scratch("tl_lists", (n_tiles, B), device, torch.int32)
+    counts = _ws_scratch("tl_counts", (n_tiles,), device, torch.int32)
     flags.zero_()
-    _ws_tile_mark_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
-        flags, sv_out.indices, sv_out.col_starts, sv_out.nnz, n_tiles, TM, BLOCK=_WS_VEC,
+    _ws_tile_mark_kernel[(triton.cdiv(sv.total_nnz, _WS_VEC), B)](
+        flags, sv.indices, sv.col_starts, sv.nnz, n_tiles, T, BLOCK=_WS_VEC,
     )
     _ws_tile_lists_kernel[(n_tiles,)](
         lists, counts, flags, B, n_tiles, BLOCK_B=max(16, triton.next_power_of_2(B)),
@@ -1233,18 +1264,19 @@ def _ws_parent_tile_lists(sv_out: SparseNodeValues, H_out: int, TM: int,
     return lists, counts
 
 
-def _ws_child_tile_bits(sv_in: SparseNodeValues, H_in: int, TK: int,
-                        device: torch.device) -> Tuple[torch.Tensor, int]:
-    """``(bits, n_words)``: per sample the ``TK``-column child tiles it has an
-    active child in, as bits of ``n_words`` int32 words (``bits[b, t // 32]
-    >> (t % 32) & 1``). Graph-capturable."""
-    B = sv_in.batch_size
-    n_tiles = H_in // TK
-    n_words = triton.cdiv(n_tiles, 32)
-    bits = _ws_scratch("ct_bits", (B, n_words), device, torch.int32)
+def _ws_tile_bits(sv: SparseNodeValues, H: int, T: int,
+                  device: torch.device) -> Tuple[torch.Tensor, int]:
+    """``(bits, n_words)``: per sample the ``T``-row tiles of ``sv`` it has an
+    active row in, as bits of ``n_words`` (a power of two) int32 words
+    (``bits[b, t // 32] >> (t % 32) & 1``): the children of the forward, the
+    parents of the backward. Graph-capturable."""
+    B = sv.batch_size
+    n_tiles = H // T
+    n_words = triton.next_power_of_2(triton.cdiv(n_tiles, 32))   # a tl.arange extent in the kernels
+    bits = _ws_scratch("tl_bits", (B, n_words), device, torch.int32)
     bits.zero_()
-    _ws_tile_bits_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
-        bits, sv_in.indices, sv_in.col_starts, sv_in.nnz, n_words, TK, BLOCK=_WS_VEC,
+    _ws_tile_bits_kernel[(triton.cdiv(sv.total_nnz, _WS_VEC), B)](
+        bits, sv.indices, sv.col_starts, sv.nnz, n_words, T, BLOCK=_WS_VEC,
     )
     return bits, n_words
 
@@ -2238,24 +2270,27 @@ def _ws_tile_bits_kernel(bits_ptr, idx_ptr, cs_ptr, nnz_ptr, n_words, TK, BLOCK:
     tl.atomic_or(bits_ptr + b.to(tl.int64) * n_words + t // 32, one << (t % 32), mask=mask)
 
 
-@triton.jit(do_not_specialize=["w_start", "B", "n_words"])
+@triton.jit(do_not_specialize=["w_start", "B"])
 def _ws_fwd_tiles_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, lists_ptr, counts_ptr, bits_ptr,
-                         w_start, B, H_in, H_out, n_words,
+                         w_start, B, H_in, H_out,
                          NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                         TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
-                         PREC: tl.constexpr, SKIP_K: tl.constexpr):
+                         TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr, NW: tl.constexpr,
+                         PREC: tl.constexpr, ROW_MASK: tl.constexpr, SKIP_K: tl.constexpr):
     """Weight-stationary forward over every sample's active parent tiles.
     Grid ``(cdiv(B, BB), H_out // TM)``: program = (block of BB samples of
     the parent tile's list, parent tile ``m``); programs past the list's
     length return at once. As :func:`_ws_fwd_kernel`, the program walks the
     children TK at a time against the W tile ``[TK, TM]``, but its batch rows
-    are the gathered samples ``lists[m, blk*BB : ...]``: an activation row is
-    loaded only when the sample has an active child in the tile (its
-    child-tile bits, ``bits[b, t // 32] >> (t % 32)``; the other rows are
-    zero anyway), and with ``SKIP_K`` a child tile no sample of the block
-    touches is skipped altogether. Writes ``yd[b, m-tile]`` for the block's
-    samples only — every active parent of a sample lies in a tile whose list
-    holds the sample, which is all the gather that follows reads."""
+    are the gathered samples ``lists[m, blk*BB : ...]``, and with ``ROW_MASK``
+    an activation row is loaded only when the sample has an active child in
+    the tile (its child-tile bits, ``NW`` words per sample held in registers,
+    so the mask never waits for a load; the other rows are zero anyway). The
+    children are walked word by word of the bits, 32 tiles per word. With
+    ``SKIP_K`` a child tile no sample of the block touches is skipped (a
+    branch that costs the loop its pipelining). Writes ``yd[b, m-tile]`` for
+    the block's samples only — every active parent of a sample lies in a
+    tile whose list holds the sample, which is all the gather that follows
+    reads."""
     blk = tl.program_id(0)
     pid_m = tl.program_id(1)
     n = tl.load(counts_ptr + pid_m)
@@ -2270,28 +2305,40 @@ def _ws_fwd_tiles_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, lists_ptr, cou
     w0 = h0 % BS
     offs_m = tl.arange(0, TM)
     offs_k = tl.arange(0, TK)
+    offs_w = tl.arange(0, NW)
     w_rows = w_ptr + w_start + pb.to(tl.int64) * (NB_ch * CBS * BS) + w0
     x_rows = xd_ptr + ids64[:, None] * H_in
-    bit_rows = bits_ptr + ids64 * n_words
+    words = tl.load(bits_ptr + ids64[:, None] * NW + offs_w[None, :], mask=mask_b[:, None], other=0)
+    n_tiles = H_in // TK
 
     acc = tl.zeros([BB, TM], dtype=tl.float32)
-    for k0 in range(0, H_in, TK):
-        t = k0 // TK
-        word = tl.load(bit_rows + t // 32, mask=mask_b, other=0)
-        touch = mask_b & (((word >> (t % 32)) & 1) != 0)
+    for wi in range(0, NW):
+        # the block's bits of the 32 child tiles of word wi, one int per sample
+        w_sel = tl.sum(tl.where(offs_w[None, :] == wi, words, 0), axis=1)
+        any_bit = tl.sum(w_sel, 0)
+        n_j = tl.minimum(32, n_tiles - wi * 32)
         if SKIP_K:
-            if tl.sum(touch.to(tl.int32), 0) > 0:
+            if any_bit != 0:
+                for j in range(0, n_j):
+                    touch = mask_b & (((w_sel >> j) & 1) != 0)
+                    k0 = (wi * 32 + j) * TK
+                    cb = k0 // CBS
+                    cs0 = k0 % CBS
+                    wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
+                    x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
+                    acc += tl.dot(x, wt, input_precision=PREC)
+        else:
+            for j in range(0, n_j):
+                if ROW_MASK:
+                    touch = mask_b & (((w_sel >> j) & 1) != 0)
+                else:
+                    touch = mask_b
+                k0 = (wi * 32 + j) * TK
                 cb = k0 // CBS
                 cs0 = k0 % CBS
                 wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
                 x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
                 acc += tl.dot(x, wt, input_precision=PREC)
-        else:
-            cb = k0 // CBS
-            cs0 = k0 % CBS
-            wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
-            x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
-            acc += tl.dot(x, wt, input_precision=PREC)
 
     mx = tl.maximum(tl.load(max_ptr + ids, mask=mask_b, other=0.0), -1e30)
     kin = tl.load(kin_ptr + ids, mask=mask_b, other=0)
@@ -2369,6 +2416,68 @@ def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, act_ptr, nact_ptr, w_start, B, H_
         acc += tl.dot(g, w, input_precision=PREC)
     tl.store(fd_ptr + offs_b[:, None] * H_in + c[None, :], acc,
              mask=mask_b[:, None] & mask_k[None, :])
+
+
+@triton.jit(do_not_specialize=["w_start", "B"])
+def _ws_bwd_flow_tiles_kernel(fd_ptr, w_ptr, gd_ptr, lists_ptr, counts_ptr, bits_ptr,
+                              w_start, B, H_in, H_out,
+                              NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+                              TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr, NW: tl.constexpr,
+                              PREC: tl.constexpr, ROW_MASK: tl.constexpr, SKIP_K: tl.constexpr):
+    """Weight-stationary element-flow backward over every sample's active
+    child tiles — the mirror of :func:`_ws_fwd_tiles_kernel`. Grid
+    ``(cdiv(B, BB), H_in // TK)``: program = (block of BB samples of the
+    child tile's list, child tile ``k``); it walks the parents TM at a time,
+    word by word of the parent-tile bits, ``fd[b, c] = sum_h gd[b, h] * W[h,
+    c]``, loading a sample's ``gd`` row only for the parent tiles it has an
+    active parent in. ``fd`` is written at the block's samples and this
+    tile's children only, which is all the gather that follows reads."""
+    blk = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    n = tl.load(counts_ptr + pid_c)
+    if blk * BB >= n:
+        return
+    offs_b = blk * BB + tl.arange(0, BB)
+    mask_b = offs_b < n
+    ids = tl.load(lists_ptr + pid_c.to(tl.int64) * B + offs_b, mask=mask_b, other=0)
+    ids64 = ids.to(tl.int64)
+    offs_k = tl.arange(0, TK)
+    offs_m = tl.arange(0, TM)
+    offs_w = tl.arange(0, NW)
+    c = pid_c * TK + offs_k
+    w_cols = w_ptr + w_start + c.to(tl.int64)[None, :] * BS
+    g_rows = gd_ptr + ids64[:, None] * H_out
+    words = tl.load(bits_ptr + ids64[:, None] * NW + offs_w[None, :], mask=mask_b[:, None], other=0)
+    n_tiles = H_out // TM
+
+    acc = tl.zeros([BB, TK], dtype=tl.float32)
+    for wi in range(0, NW):
+        w_sel = tl.sum(tl.where(offs_w[None, :] == wi, words, 0), axis=1)
+        any_bit = tl.sum(w_sel, 0)
+        n_j = tl.minimum(32, n_tiles - wi * 32)
+        if SKIP_K:
+            if any_bit != 0:
+                for j in range(0, n_j):
+                    touch = mask_b & (((w_sel >> j) & 1) != 0)
+                    h0 = (wi * 32 + j) * TM
+                    pb = h0 // BS
+                    w0 = h0 % BS
+                    w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None])
+                    g = tl.load(g_rows + (h0 + offs_m)[None, :], mask=touch[:, None], other=0.0)
+                    acc += tl.dot(g, w, input_precision=PREC)
+        else:
+            for j in range(0, n_j):
+                if ROW_MASK:
+                    touch = mask_b & (((w_sel >> j) & 1) != 0)
+                else:
+                    touch = mask_b
+                h0 = (wi * 32 + j) * TM
+                pb = h0 // BS
+                w0 = h0 % BS
+                w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None])
+                g = tl.load(g_rows + (h0 + offs_m)[None, :], mask=touch[:, None], other=0.0)
+                acc += tl.dot(g, w, input_precision=PREC)
+    tl.store(fd_ptr + ids64[:, None] * H_in + c[None, :], acc, mask=mask_b[:, None])
 
 
 @triton.jit(do_not_specialize=["v_stride", "out_stride"])
