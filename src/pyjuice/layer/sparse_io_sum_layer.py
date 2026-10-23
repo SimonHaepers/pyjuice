@@ -68,14 +68,17 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 # cores. Cost is one pass over W per step, independent of the support size —
 # or one pass over the rows of W^T of the batch's active children only (their
 # sorted union, compacted on the device each step), which is what the batch
-# can share, when that union is small (:func:`_ws_dispatch`).
+# can share, when that union is small (:func:`_ws_dispatch`). At training
+# batch sizes, where the full pass is tensor-core bound, the forward can
+# instead walk every parent tile with only the samples that have an active
+# parent in it (the "tiles" pass below, :func:`_ws_fwd_tiles_kernel`).
 #
 # Parameter flows of tied transitions (the homogeneous HMM chain) are deferred:
 # each step stashes its densified factors and bounded chunks feed GEMMs,
 # ``pflow += W * sum_t G_t^T X_t``, instead of B * K_in * K_out atomics per step.
 #
 # This is ON BY DEFAULT (``"auto"``): every batched block takes the cheapest of
-# gather / full W pass / active-children pass by the cost model of
+# gather / full W pass / active-children pass / tiles pass by the cost model of
 # :func:`_ws_dispatch`, calibrated on the trained wikitext chains; B=1
 # inference keeps the gather kernels, which are faster there. It costs one fp32
 # copy of W plus the stash, and :meth:`_WSGroup.ensure_ready` falls back to the
@@ -86,7 +89,7 @@ chunks to ``[BLOCK_P, BLOCK_B]``."""
 _WS_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS", "auto")
 """``"auto"`` (the default) — each batched block takes the cheapest of its
 kernel sets by the cost model of :func:`_ws_dispatch` (gather / full W pass /
-active-children pass; the block-diagonal layers go dense from
+active-children pass / tiles pass; the block-diagonal layers go dense from
 ``_WS_MIN_BATCH`` samples up); ``"always"`` — WS whenever eligible (tests /
 A-B runs; ``_WS_ACTIVE_MODE`` picks the pass); ``"never"`` — gather kernels
 only."""
@@ -156,16 +159,76 @@ _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
 GEMM materialises at a time (256 MB fp32)."""
 
+# Pass over the per-sample active parent tiles ("tiles", :func:`_ws_fwd_tiles_kernel`).
+#
+# At training batch sizes the full W pass is tensor-core bound (its cost grows
+# with B) although a sample's active pairs are 0.2-3 % of the dense
+# multiply-adds: with the sorted state order a sample touches 5-20 % of the
+# 32x32 tiles of W, but a batch's samples rarely share a bigram, so any block of
+# 16+ samples touches nearly every child tile (2026-10-23 analysis,
+# prune-pc ``scripts/bench/analyze_tile_groups.py``). What survives batching is
+# the parent side: for every parent tile the pass gathers exactly the samples
+# that have an active parent in it (lists built on the device each step) and
+# walks the children with that block, loading an activation row only for the
+# child tiles the sample touches (its child-tile bits) and skipping a child
+# tile no sample of the block touches. MMA work ~ B * (parent tiles per sample)
+# * H_in, 4-6x below the full pass on the 8k/16k d0.01 chains.
+_WS_TILES_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES", "auto")
+"""``"auto"`` — the cost model may pick the tiles pass; ``"always"`` — WS
+forwards take it whenever eligible (tests / A-B runs; it beats
+``_WS_ACTIVE_MODE == "always"``); ``"never"`` — excluded."""
+_WS_TILES_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TM", "32"))
+"""Parent tile (rows of W per program; the granularity of the per-sample
+parent lists). Smaller tiles follow the supports more closely, larger ones
+raise the MMA intensity."""
+_WS_TILES_TK = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TK", "32"))
+"""Child tile (the granularity of the per-sample child-tile bits; one
+activation row chunk of ``TK * 4`` bytes per sample and tile)."""
+_WS_TILES_BB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_BB", "64"))
+"""Samples per program (the MMA batch tile; >= 16). A parent tile's list is
+padded to a multiple of it."""
+_WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "1") != "0"
+"""Skip a child tile (its W tile load and the MMA) when no sample of the block
+touches it."""
+_WS_TILES_MMA_COST_PER_SAMPLE = 0.016
+"""Cost model (:func:`_ws_dispatch`): tensor-core work of one W element of a
+visited tile per sample of the block, relative to streaming the element in
+the full pass (the full pass's ``_WS_MMA_COST_PER_SAMPLE`` with the smaller
+tiles' lower intensity)."""
+_WS_TILES_L2_COST = 0.5
+"""Re-reading a W tile for another block of the same parent tile, per element,
+relative to streaming it once (the blocks of a parent tile are adjacent
+programs, so the re-reads are L2 hits)."""
+
+def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int) -> float:
+    """Cost model of the tiles pass (:func:`_ws_fwd_tiles_kernel`) in streamed
+    W elements: one HBM pass over the tiles the batch touches, plus per
+    sample and parent tile it touches the tensor-core work of the tile row
+    and the L2 re-read of the W tiles for its block, the block padded to
+    ``BB`` samples."""
+    if f_tiles <= 0.0:
+        return math.inf
+    rows = B * f_tiles                                     # expected samples per parent tile
+    pad = math.ceil(rows / BB) * BB / rows
+    u = 1.0 - (1.0 - min(f_tiles, 1.0)) ** (B ** _WS_UNION_EXP)
+    return n_w * (u + f_tiles * B * pad * (_WS_TILES_MMA_COST_PER_SAMPLE + _WS_TILES_L2_COST / BB))
+
+
 def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
-                 backward: bool) -> Optional[str]:
+                 backward: bool, f_tiles: Optional[float] = None,
+                 BB: Optional[int] = None) -> Optional[str]:
     """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
-    kernels), ``"full"`` (WS, one pass over W) or ``"active"`` (WS, one pass
+    kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
     over the rows of W^T of the batch's active children, compacted on the
-    device each step by :func:`_ws_active_children`) — the cheapest by the
-    cost model above for ``B`` samples with ``pairs`` active ``(sample, in,
-    out)`` pairs per step and ``k_in`` active children per sample (the batch's
-    own counts, or the model's expectation for a CUDA graph), under the
-    ``_WS_MODE`` / ``_WS_ACTIVE_MODE`` overrides."""
+    device each step by :func:`_ws_active_children`) or, forward only,
+    ``"tiles"`` (WS over every sample's active parent tiles,
+    :func:`_ws_fwd_tiles_kernel`, when ``f_tiles``, the expected fraction of
+    the ``_WS_TILES_TM``-row parent tiles a sample touches, is given) — the
+    cheapest by the cost model above for ``B`` samples with ``pairs`` active
+    ``(sample, in, out)`` pairs per step and ``k_in`` active children per
+    sample (the batch's own counts, or the model's expectation for a CUDA
+    graph), under the ``_WS_MODE`` / ``_WS_ACTIVE_MODE`` / ``_WS_TILES_MODE``
+    overrides."""
     if _WS_MODE == "never":
         return None
     # A W pass streams W (memory-bound) until the tensor-core work of the batch
@@ -180,12 +243,18 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
         c_gather = pairs * (_WS_GATHER_PAIR_COST if B >= 16 else _WS_GATHER_PAIR_COST_SMALL)
         c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
     c_full = W
-    if _WS_ACTIVE_MODE == "always":         # forced, whatever the batch
+    tiles_ok = f_tiles is not None and not backward and _WS_TILES_MODE != "never"
+    c_tiles = _ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB) if tiles_ok else math.inf
+    if tiles_ok and _WS_TILES_MODE == "always":
+        ws, c_ws = "tiles", c_tiles
+    elif _WS_ACTIVE_MODE == "always":       # forced, whatever the batch
         ws, c_ws = "active", u * W * (_WS_ACTIVE_COST_BWD if backward else _WS_ACTIVE_COST)
     elif _WS_ACTIVE_MODE == "never" or c_active >= c_full:
         ws, c_ws = "full", c_full
     else:
         ws, c_ws = "active", c_active
+    if c_tiles < c_ws:
+        ws, c_ws = "tiles", c_tiles
     if _WS_MODE == "always":
         return ws
     if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
@@ -298,6 +367,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # assigned by :func:`build_ws_groups` (TensorCircuit compile time).
         # ``None`` keeps the block on the gather kernels.
         self._ws_slots: List[Optional[Tuple["_WSGroup", int]]] = [None] * len(self.nodes)
+        # Set by :meth:`backward` while it dispatches its blocks: the tiles
+        # pass (:func:`_ws_fwd_tiles_kernel`) is forward-only.
+        self._ws_in_backward = False
 
     def __repr__(self) -> str:
         return (
@@ -441,7 +513,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws = self._ws_use(blk_idx, block, sv_in, sv_out, params) if sv_in.is_batched else None
             if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params,
-                                       active_children=ws == "active")
+                                       active_children=ws == "active", tiles=ws == "tiles")
             elif sv_in.is_batched:
                 assert sv_out.is_batched
                 self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
@@ -616,7 +688,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws = self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx)
             if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params,
-                                       active_children=ws == "active")
+                                       active_children=ws == "active", tiles=ws == "tiles")
             elif B == 1:
                 self._launch_single_forward(blk_idx, block, sv_in, sv_out, sv_in.max_val,
                                             params, static_ctx)
@@ -641,11 +713,45 @@ class SparseIOSumLayer(SparseInputSumLayer):
             B = static_ctx.B
             avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
             use = _ws_dispatch(B, group.H_in, group.H_out, B * avg_in * avg_out, avg_in,
-                               backward=False)
+                               backward=False,
+                               f_tiles=self._ws_tiles_fraction(blk_idx, static_ctx),
+                               BB=self._ws_tiles_shapes(blk_idx, B, params.device)[2])
             if use is not None and not group.ensure_ready(params, B, need_stash=False):
                 use = None
         static_ctx.ws_decisions[key] = use
         return use
+
+    def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None) -> Optional[float]:
+        """Expected fraction of the parent tiles of the tiles pass a sample
+        touches (:meth:`SparseCategorical.expected_col_tiles` of the output
+        column's distribution, every tile for a variable the profile masks),
+        ``None`` when the block cannot take the pass."""
+        group, _ = self._ws_slots[blk_idx]
+        TM = self._ws_tiles_shapes(blk_idx, 1, None)[0]
+        if TM is None:
+            return None
+        out_var = self._output_sparsity_var_ids[blk_idx]
+        if static_ctx is not None and static_ctx.is_masked(out_var):
+            return 1.0
+        return self._output_sparsity_dists[blk_idx].expected_col_tiles(TM)
+
+    def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
+        """``(TM, TK, BB, num_warps, num_stages)`` of the tiles pass for this
+        block: the configured tiles clipped to the PC block sizes (powers of
+        two >= 16 that divide them); ``(None, ...)`` when the block is not
+        eligible (a block size below 16)."""
+        group, _ = self._ws_slots[blk_idx]
+        BS, CBS = group.BS, group.CBS
+        if BS % 16 or CBS % 16:
+            return (None, None, None, None, None)
+        TM = min(_WS_TILES_TM, BS)
+        while BS % TM:
+            TM //= 2
+        TK = min(_WS_TILES_TK, CBS)
+        while CBS % TK:
+            TK //= 2
+        BB = max(16, _WS_TILES_BB)
+        return (TM, TK, BB, 8 if BB >= 128 else 4, 3 if BB >= 128 else 4)
 
     def _ws_static_pairs(self, blk_idx: int, B: int, static_ctx) -> float:
         """Expected active ``(sample, in, out)`` pairs per step of a batch of
@@ -790,9 +896,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_flow_in.values.zero_()
                 continue
 
-            ws = (self._ws_use(blk_idx, block, sv_in, sv_out, params, need_stash=compute_pflows,
-                               static_ctx=kwargs.get("static_ctx"))
-                  if sv_in.is_batched else None)
+            self._ws_in_backward = True
+            try:
+                ws = (self._ws_use(blk_idx, block, sv_in, sv_out, params, need_stash=compute_pflows,
+                                   static_ctx=kwargs.get("static_ctx"))
+                      if sv_in.is_batched else None)
+            finally:
+                self._ws_in_backward = False
             if ws:
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
@@ -898,18 +1008,26 @@ class SparseIOSumLayer(SparseInputSumLayer):
         else:
             pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
             k_in = sum(sv_in.nnz_list) / max(B, 1)    # total_nnz is the longest column
-        use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash)
+        # the tiles pass is forward-only; its expected parent-tile fraction
+        # comes from the model (the batch's tile counts live on the device)
+        f_tiles = (None if need_stash or self._ws_in_backward
+                   else self._ws_tiles_fraction(blk_idx, static_ctx))
+        use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
+                           f_tiles=f_tiles, BB=self._ws_tiles_shapes(blk_idx, B, params.device)[2])
         if use is not None and not group.ensure_ready(params, B, need_stash):
             use = None
         return use
 
     def _ws_forward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                           sv_out: SparseNodeValues, max_val: torch.Tensor,
-                          params: torch.Tensor, active_children: bool = False) -> None:
+                          params: torch.Tensor, active_children: bool = False,
+                          tiles: bool = False) -> None:
         """``sv_out = log(W @ exp(sv_in - max)) + max`` for the whole batch:
         densify the inputs, stream W once through :func:`_ws_fwd_kernel` (all
         of it, or with ``active_children`` only the rows of W^T of the batch's
-        active children), gather the active parents."""
+        active children) — or with ``tiles`` walk every parent tile with the
+        samples that have an active parent in it
+        (:func:`_ws_fwd_tiles_kernel`) — then gather the active parents."""
         group, _ = self._ws_slots[blk_idx]
         _, _, _, _, _NB, NB_ch, BS, CBS = block
         B = sv_in.batch_size
@@ -927,18 +1045,31 @@ class SparseIOSumLayer(SparseInputSumLayer):
         )
 
         yd = _ws_scratch("y", (B, H_out), device)
-        TM, BB, warps, stages = _ws_tiles(H_out, B, BS, 128, device)
-        TK = min(32, CBS)
-        if active_children:
-            active, n_active = _ws_active_children(sv_in, H_in, device)
+        if tiles:
+            TM, TK, BB, warps, stages = self._ws_tiles_shapes(blk_idx, B, device)
+            assert TM is not None
+            lists, counts = _ws_parent_tile_lists(sv_out, H_out, TM, device)
+            bits, n_words = _ws_child_tile_bits(sv_in, H_in, TK, device)
+            _ws_fwd_tiles_kernel[(triton.cdiv(B, BB), H_out // TM)](
+                yd, w, xd, max_val, sv_in.nnz, lists, counts, bits, w_start, B, H_in, H_out,
+                n_words,
+                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
+                PREC="tf32" if rnd else "ieee", SKIP_K=_WS_TILES_SKIP_K,
+                num_warps=warps, num_stages=stages,
+            )
         else:
-            active = n_active = sv_in.nnz                  # unused
-        _ws_fwd_kernel[(triton.cdiv(B, BB), H_out // TM)](
-            yd, w, xd, max_val, sv_in.nnz, active, n_active, w_start, B, H_in, H_out,
-            NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
-            PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
-            num_warps=warps, num_stages=stages,
-        )
+            TM, BB, warps, stages = _ws_tiles(H_out, B, BS, 128, device)
+            TK = min(32, CBS)
+            if active_children:
+                active, n_active = _ws_active_children(sv_in, H_in, device)
+            else:
+                active = n_active = sv_in.nnz                  # unused
+            _ws_fwd_kernel[(triton.cdiv(B, BB), H_out // TM)](
+                yd, w, xd, max_val, sv_in.nnz, active, n_active, w_start, B, H_in, H_out,
+                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
+                PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
+                num_warps=warps, num_stages=stages,
+            )
 
         _ws_gather_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
             sv_out.values, yd, sv_out.indices, sv_out.col_starts, sv_out.nnz,
@@ -1065,6 +1196,45 @@ def _ws_active_children(sv_in: SparseNodeValues, H_in: int,
         active, flags, pos, H_in, BLOCK=_WS_VEC,
     )
     return active, pos[H_in - 1:]
+
+
+def _ws_parent_tile_lists(sv_out: SparseNodeValues, H_out: int, TM: int,
+                          device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``(lists, counts)`` of the tiles pass: for every ``TM``-row parent tile
+    ``m`` the samples with an active parent in it, ``lists[m, 0:counts[m]]``
+    (int32, batch order, ``lists`` is ``[n_tiles, B]``). Per-sample flags,
+    then one program per tile scans the batch (prefix sum) and compacts;
+    graph-capturable, no host sync."""
+    B = sv_out.batch_size
+    n_tiles = H_out // TM
+    flags = _ws_scratch("pt_flags", (B, n_tiles), device, torch.int32)
+    lists = _ws_scratch("pt_lists", (n_tiles, B), device, torch.int32)
+    counts = _ws_scratch("pt_counts", (n_tiles,), device, torch.int32)
+    flags.zero_()
+    _ws_tile_mark_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
+        flags, sv_out.indices, sv_out.col_starts, sv_out.nnz, n_tiles, TM, BLOCK=_WS_VEC,
+    )
+    _ws_tile_lists_kernel[(n_tiles,)](
+        lists, counts, flags, B, n_tiles, BLOCK_B=max(16, triton.next_power_of_2(B)),
+        num_warps=8 if B > 2048 else 4,
+    )
+    return lists, counts
+
+
+def _ws_child_tile_bits(sv_in: SparseNodeValues, H_in: int, TK: int,
+                        device: torch.device) -> Tuple[torch.Tensor, int]:
+    """``(bits, n_words)``: per sample the ``TK``-column child tiles it has an
+    active child in, as bits of ``n_words`` int32 words (``bits[b, t // 32]
+    >> (t % 32) & 1``). Graph-capturable."""
+    B = sv_in.batch_size
+    n_tiles = H_in // TK
+    n_words = triton.cdiv(n_tiles, 32)
+    bits = _ws_scratch("ct_bits", (B, n_words), device, torch.int32)
+    bits.zero_()
+    _ws_tile_bits_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
+        bits, sv_in.indices, sv_in.col_starts, sv_in.nnz, n_words, TK, BLOCK=_WS_VEC,
+    )
+    return bits, n_words
 
 
 def _num_sms(device: torch.device) -> int:
@@ -2016,6 +2186,106 @@ def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, act_ptr, nact_ptr, w
     res = tl.where(kin[:, None] == 0, -float("inf"), res)
     tl.store(yd_ptr + offs_b[:, None] * H_out + (h0 + offs_m)[None, :], res,
              mask=mask_b[:, None])
+
+
+@triton.jit(do_not_specialize=["n_tiles", "TM"])
+def _ws_tile_mark_kernel(flags_ptr, idx_ptr, cs_ptr, nnz_ptr, n_tiles, TM, BLOCK: tl.constexpr):
+    """``flags[b, indices[col_starts[b] + k] // TM] = 1`` for ``k < nnz[b]``.
+    Grid ``(cdiv(max nnz, BLOCK), B)``."""
+    b = tl.program_id(1)
+    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = k < tl.load(nnz_ptr + b)
+    row = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
+    tl.store(flags_ptr + b.to(tl.int64) * n_tiles + row // TM, tl.full([BLOCK], 1, tl.int32), mask=mask)
+
+
+@triton.jit(do_not_specialize=["B", "n_tiles"])
+def _ws_tile_lists_kernel(lists_ptr, counts_ptr, flags_ptr, B, n_tiles, BLOCK_B: tl.constexpr):
+    """One program per parent tile ``m``: ``lists[m, j] = `` the ``j``-th
+    sample with ``flags[b, m]`` set (ascending ``b``), ``counts[m]`` their
+    number. Grid ``(n_tiles,)``."""
+    m = tl.program_id(0)
+    b = tl.arange(0, BLOCK_B)
+    mask = b < B
+    f = tl.load(flags_ptr + b.to(tl.int64) * n_tiles + m, mask=mask, other=0)
+    pos = tl.cumsum(f, 0)
+    tl.store(lists_ptr + m.to(tl.int64) * B + pos - 1, b, mask=mask & (f != 0))
+    tl.store(counts_ptr + m, tl.sum(f, 0))
+
+
+@triton.jit(do_not_specialize=["n_words", "TK"])
+def _ws_tile_bits_kernel(bits_ptr, idx_ptr, cs_ptr, nnz_ptr, n_words, TK, BLOCK: tl.constexpr):
+    """``bits[b, t // 32] |= 1 << (t % 32)`` for the child tile ``t =
+    indices[col_starts[b] + k] // TK`` of every ``k < nnz[b]``. Grid
+    ``(cdiv(max nnz, BLOCK), B)``."""
+    b = tl.program_id(1)
+    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = k < tl.load(nnz_ptr + b)
+    t = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0) // TK
+    one = tl.full([BLOCK], 1, tl.int32)
+    tl.atomic_or(bits_ptr + b.to(tl.int64) * n_words + t // 32, one << (t % 32), mask=mask)
+
+
+@triton.jit(do_not_specialize=["w_start", "B", "n_words"])
+def _ws_fwd_tiles_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, lists_ptr, counts_ptr, bits_ptr,
+                         w_start, B, H_in, H_out, n_words,
+                         NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
+                         TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
+                         PREC: tl.constexpr, SKIP_K: tl.constexpr):
+    """Weight-stationary forward over every sample's active parent tiles.
+    Grid ``(cdiv(B, BB), H_out // TM)``: program = (block of BB samples of
+    the parent tile's list, parent tile ``m``); programs past the list's
+    length return at once. As :func:`_ws_fwd_kernel`, the program walks the
+    children TK at a time against the W tile ``[TK, TM]``, but its batch rows
+    are the gathered samples ``lists[m, blk*BB : ...]``: an activation row is
+    loaded only when the sample has an active child in the tile (its
+    child-tile bits, ``bits[b, t // 32] >> (t % 32)``; the other rows are
+    zero anyway), and with ``SKIP_K`` a child tile no sample of the block
+    touches is skipped altogether. Writes ``yd[b, m-tile]`` for the block's
+    samples only — every active parent of a sample lies in a tile whose list
+    holds the sample, which is all the gather that follows reads."""
+    blk = tl.program_id(0)
+    pid_m = tl.program_id(1)
+    n = tl.load(counts_ptr + pid_m)
+    if blk * BB >= n:
+        return
+    offs_b = blk * BB + tl.arange(0, BB)
+    mask_b = offs_b < n
+    ids = tl.load(lists_ptr + pid_m.to(tl.int64) * B + offs_b, mask=mask_b, other=0)
+    ids64 = ids.to(tl.int64)
+    h0 = pid_m * TM
+    pb = h0 // BS
+    w0 = h0 % BS
+    offs_m = tl.arange(0, TM)
+    offs_k = tl.arange(0, TK)
+    w_rows = w_ptr + w_start + pb.to(tl.int64) * (NB_ch * CBS * BS) + w0
+    x_rows = xd_ptr + ids64[:, None] * H_in
+    bit_rows = bits_ptr + ids64 * n_words
+
+    acc = tl.zeros([BB, TM], dtype=tl.float32)
+    for k0 in range(0, H_in, TK):
+        t = k0 // TK
+        word = tl.load(bit_rows + t // 32, mask=mask_b, other=0)
+        touch = mask_b & (((word >> (t % 32)) & 1) != 0)
+        if SKIP_K:
+            if tl.sum(touch.to(tl.int32), 0) > 0:
+                cb = k0 // CBS
+                cs0 = k0 % CBS
+                wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
+                x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
+                acc += tl.dot(x, wt, input_precision=PREC)
+        else:
+            cb = k0 // CBS
+            cs0 = k0 % CBS
+            wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
+            x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
+            acc += tl.dot(x, wt, input_precision=PREC)
+
+    mx = tl.maximum(tl.load(max_ptr + ids, mask=mask_b, other=0.0), -1e30)
+    kin = tl.load(kin_ptr + ids, mask=mask_b, other=0)
+    res = tl.log(acc) + mx[:, None]
+    res = tl.where(kin[:, None] == 0, -float("inf"), res)
+    tl.store(yd_ptr + ids64[:, None] * H_out + (h0 + offs_m)[None, :], res, mask=mask_b[:, None])
 
 
 @triton.jit(do_not_specialize=["flow_stride", "mars_stride", "gt_ld", "gt_off"])
