@@ -178,48 +178,74 @@ _WS_TILES_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES", "auto")
 parent tiles, backward element flows over the child tiles); ``"always"`` —
 WS blocks take them whenever eligible (tests / A-B runs; it beats
 ``_WS_ACTIVE_MODE == "always"``); ``"never"`` — excluded."""
-_WS_TILES_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TM", "32"))
+# Tile shape, chosen on the 2026-10-23 sweep (8k d0.01, B=64..2048, 13 shapes,
+# prune-pc results/sparse_io_paths/2026-10-23_ws-tiles): the kernel's cost per
+# multiply-add falls with TM and BB (load elements per MAC ~ 1/TM + 1/BB)
+# while the MMA work grows with TM (parent tiles per sample: 32-row 27 %,
+# 64-row 36 %, 128-row 48 % of the tiles on that chain) and with the padding
+# of a tile's list to BB. 64 x 64 x 128 ran at ~100 TFLOP/s on 34 % of the
+# dense work (72 ms per T=128 batch at B=1024 vs 131 for the full pass and 69
+# for cuBLAS dense TF32; 138 vs 261 / 133 at B=2048); 32 x 32 x 64 took 87,
+# 128 x 32 x 64 109, and 64 x 64 x 64 (4 warps) 173 ms (register pressure).
+# The row mask cost 10 % instead of saving bytes: the activation panel sits in
+# L2 at these sizes.
+_WS_TILES_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TM", "64"))
 """Parent tile (rows of W per program; the granularity of the per-sample
-parent lists). Smaller tiles follow the supports more closely, larger ones
-raise the MMA intensity."""
-_WS_TILES_TK = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TK", "32"))
-"""Child tile (the granularity of the per-sample child-tile bits; one
-activation row chunk of ``TK * 4`` bytes per sample and tile)."""
-_WS_TILES_BB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_BB", "64"))
-"""Samples per program (the MMA batch tile; >= 16). A parent tile's list is
-padded to a multiple of it."""
-_WS_TILES_ROW_MASK = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_ROW_MASK", "1") != "0"
+parent lists of the forward and of the parent walk of the backward)."""
+_WS_TILES_TK = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TK", "64"))
+"""Child tile (the child walk of the forward, the per-sample child lists of
+the backward; one activation row chunk of ``TK * 4`` bytes per sample and
+tile). 128 needs more shared memory than an H100 has at 3 stages."""
+_WS_TILES_BB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_BB", "128"))
+"""Samples per program (the MMA batch tile; >= 16). A tile's list is padded
+to a multiple of it."""
+_WS_TILES_ROW_MASK = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_ROW_MASK", "0") != "0"
 """Load a sample's activation row of a child tile only when the sample has
 an active child in it (its tile bits, held in registers for the program's
-samples); off, every listed sample's row is loaded (zeros outside its
-support)."""
+samples); off (the default), every listed sample's row is loaded (zeros
+outside its support), which measured 10 % faster at 8k with the panel in
+L2. Worth trying when ``B * H * 4`` bytes exceed the L2 by far."""
 _WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "0") != "0"
 """Skip a child tile (its W tile load and the MMA) when no sample of the block
 touches it. Off by default: the data-dependent branch stops Triton from
 pipelining the loop's loads (8k d0.01: 3.4x slower per iteration, 2026-10-23
 kernel map), and with 64-sample blocks a block touches ~95 % of the tiles."""
-_WS_TILES_MMA_COST_PER_SAMPLE = 0.016
+_WS_TILES_MMA_COST_PER_SAMPLE = 0.02
 """Cost model (:func:`_ws_dispatch`): tensor-core work of one W element of a
-visited tile per sample of the block, relative to streaming the element in
-the full pass (the full pass's ``_WS_MMA_COST_PER_SAMPLE`` with the smaller
-tiles' lower intensity)."""
-_WS_TILES_L2_COST = 0.5
-"""Re-reading a W tile for another block of the same parent tile, per element,
-relative to streaming it once (the blocks of a parent tile are adjacent
-programs, so the re-reads are L2 hits)."""
+visited tile row per (padded) sample of the block, relative to streaming the
+element in the full pass — the full pass's ``_WS_MMA_COST_PER_SAMPLE`` with
+the gathered rows' lower efficiency and the L2 re-reads of the W tiles by
+the blocks of a tile folded in. Calibrated 2026-10-23 on 8k d0.01 with the
+default shape: measured tiles / full forward 1.27 / 1.21 / 0.73 / 0.55 /
+0.53 at B=64 / 256 / 512 / 1024 / 2048, modelled 2.6 / 1.1 / 0.88 / 0.79 /
+0.75 (the decisions agree: full up to 256, tiles from 512; the backward
+mirrors them)."""
+_WS_TILES_LIST_SPREAD = (0.4, 2.4)
+"""The lengths of the per-tile sample lists spread around their mean (a tile
+is touched by 10-50 % of the batch on the trained chains when the mean is
+20 %); the padding to ``BB`` is averaged over a geometric range of this
+spread rather than taken at the mean."""
 
 def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int) -> float:
-    """Cost model of the tiles pass (:func:`_ws_fwd_tiles_kernel`) in streamed
-    W elements: one HBM pass over the tiles the batch touches, plus per
-    sample and parent tile it touches the tensor-core work of the tile row
-    and the L2 re-read of the W tiles for its block, the block padded to
-    ``BB`` samples."""
+    """Cost model of the tiles passes (:func:`_ws_fwd_tiles_kernel`,
+    :func:`_ws_bwd_flow_tiles_kernel`) in streamed W elements: the larger of
+    one HBM pass over the tiles the batch touches (the pass is memory-bound
+    at small batches like the full one) and the tensor-core work of the
+    padded tile lists — per tile ``ceil(rows / BB) * BB`` rows of ``H``
+    elements, with the list lengths spread around their mean ``f_tiles *
+    B`` (:data:`_WS_TILES_LIST_SPREAD`)."""
     if f_tiles <= 0.0:
         return math.inf
-    rows = B * f_tiles                                     # expected samples per parent tile
-    pad = math.ceil(rows / BB) * BB / rows
+    mean = B * f_tiles                                     # expected samples per tile
+    lo, hi = _WS_TILES_LIST_SPREAD
+    n = 9
+    padded = 0.0
+    for i in range(n):
+        rows = mean * lo * (hi / lo) ** (i / (n - 1))
+        padded += math.ceil(rows / BB) * BB
+    padded /= n
     u = 1.0 - (1.0 - min(f_tiles, 1.0)) ** (B ** _WS_UNION_EXP)
-    return n_w * (u + f_tiles * B * pad * (_WS_TILES_MMA_COST_PER_SAMPLE + _WS_TILES_L2_COST / BB))
+    return n_w * max(u, padded * _WS_TILES_MMA_COST_PER_SAMPLE)
 
 
 def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
@@ -777,7 +803,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
         while CBS % TK:
             TK //= 2
         BB = max(16, _WS_TILES_BB)
-        return (TM, TK, BB, 8 if BB >= 128 else 4, 3 if BB >= 128 else 4)
+        # 8 warps from a 64 x 64 accumulator up (64 x 64 x 64 on 4 warps ran 2x
+        # slower than on 8: register pressure); 3 stages when a stage's two
+        # operand tiles reach 32 KB of shared memory
+        warps = 8 if BB * max(TM, TK) >= 64 * 64 else 4
+        stages = 3 if (TK * TM + BB * max(TM, TK)) * 4 >= 32 * 1024 else 4
+        return (TM, TK, BB, warps, stages)
 
     def _ws_static_pairs(self, blk_idx: int, B: int, static_ctx) -> float:
         """Expected active ``(sample, in, out)`` pairs per step of a batch of

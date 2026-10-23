@@ -261,24 +261,27 @@ def test_tiles_on_forest(monkeypatch, B):
 
 
 def test_tiles_dispatch_cost_model():
-    """The cost model takes the tiles pass where a sample touches a small
-    fraction of the parent tiles and the batch is large enough for the full
-    pass to be tensor-core bound (the trained 8k / 16k d0.01 chains: ~20 %
-    of the 32-row tiles per sample); the full pass stays at small batches
-    (memory-bound: one W pass is the floor) and when a sample touches most
-    tiles; a backward takes it under the same rule (its own child-tile
-    fraction). Pure host logic, no GPU."""
+    """The cost model takes the tiles passes where a sample touches a small
+    fraction of the tiles and the batch is large enough for the full pass to
+    be tensor-core bound (the trained 8k d0.01 chain: 36 % of the 64-row
+    tiles per sample, measured crossover between B=256 and 512); the full
+    pass stays at small batches (memory-bound: one W pass is the floor) and
+    when a sample touches most tiles; a backward takes it under the same
+    rule (its own child-tile fraction). Pure host logic, no GPU."""
     d = sio._ws_dispatch
-    H, k = 8192, 440                                      # 8192_d0.01, sorted states
-    assert [d(B, H, H, B * k * k, k, False, f_tiles=0.2, BB=64) for B in (16, 64, 256, 1024)] == \
-        [None, "full", "tiles", "tiles"]
-    assert d(1024, H, H, 1024 * k * k, k, True, f_tiles=0.2, BB=64) == "tiles"
-    assert d(1024, H, H, 1024 * k * k, k, True) == "full"
-    H, k = 16384, 995                                     # 16384_d0.01
-    assert d(512, H, H, 512 * k * k, k, False, f_tiles=0.22, BB=64) == "tiles"
-    assert d(512, H, H, 512 * k * k, k, False) == "full"  # no tile fraction: not a candidate
-    assert d(1024, 8192, 8192, 1024 * 3000 * 3000, 3000, False, f_tiles=0.95, BB=64) == "full"
-    assert sio._ws_tiles_cost(1024, 8192.0 * 8192, 0.2, 64) < 8192.0 * 8192 * 1024 * sio._WS_MMA_COST_PER_SAMPLE
+    H, k, f, BB = 8192, 508, 0.36, 128                       # 8192_d0.01, sorted states
+    assert [d(B, H, H, B * k * k, k, False, f_tiles=f, BB=BB) for B in (16, 64, 256, 512, 1024, 2048)] == \
+        [None, "full", "full", "tiles", "tiles", "tiles"]
+    assert d(1024, H, H, 1024 * k * k, k, True, f_tiles=f, BB=BB) == "tiles"
+    assert d(256, H, H, 256 * k * k, k, True, f_tiles=f, BB=BB) == "full"
+    assert d(1024, H, H, 1024 * k * k, k, True) == "full"    # no tile fraction: not a candidate
+    H, k = 16384, 995                                         # 16384_d0.01
+    assert d(512, H, H, 512 * k * k, k, False, f_tiles=0.4, BB=BB) == "tiles"
+    assert d(1024, 8192, 8192, 1024 * 3000 * 3000, 3000, False, f_tiles=0.95, BB=BB) == "full"
+    # modelled tiles / full at the default shape, against the 2026-10-23 measurements
+    full = lambda B: 8192.0 ** 2 * max(1.0, sio._WS_MMA_COST_PER_SAMPLE * B)
+    ratios = [sio._ws_tiles_cost(B, 8192.0 ** 2, f, BB) / full(B) for B in (64, 256, 512, 1024, 2048)]
+    assert ratios[0] > 1 and ratios[1] > 1 and all(r < 1 for r in ratios[2:]), ratios
 
 
 def test_expected_col_tiles():
