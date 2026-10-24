@@ -28,9 +28,16 @@ small tile), exact fp32, with W in shared memory:
   order of those atomic additions, and so the last bits of a result, varies
   between runs).
 
+The element-flow backward, ``flow_in[b, c] = x[b, c] * sum_h g[b, h] W[h, c]``
+over the sample's active parents, is the same kernel compiled with ``BWD``:
+tiles of children, ranges of parents (W slab boxes of 256 parents, which are
+contiguous in W, by the tile's children), lanes over the sample's parents
+packed as (slab offset, ``g``) by :data:`ws_slab_pack_g`.
+
 On 8k / 16k chains of density 0.01 this is 1.2-2x faster than the tiles pass
-from B=256 (2026-10-24 measurements); at density 0.1 the active pairs are ten
-times more and the tensor-core passes win. A first design that streamed the
+from B=256, forward and element-flow backward (2026-10-24 measurements); at
+density 0.1 the active pairs are ten times more and the tensor-core passes
+win. A first design that streamed the
 W of 32-row tiles through a ring of shared-memory chunks lost to it: the work
 per (sample, chunk) was a few dozen products against ~60 instructions of
 overhead.
@@ -49,7 +56,12 @@ SMEM_LIMIT = 227 * 1024
 
 _SLAB_SRC = r"""
 #define NT (NWARP * 32)
-#define NSPLIT ((H_IN + KS - 1) / KS)
+#define NSPLIT NSPLIT_OVERRIDE
+#if BWD
+#define SLAB_MAIN ws_slab_bwd
+#else
+#define SLAB_MAIN ws_slab_fwd
+#endif
 #define FULL 0xffffffffu
 
 __device__ __forceinline__ unsigned smem_addr(const void* p) {
@@ -115,6 +127,18 @@ ws_slab_lists(int2* __restrict__ ent, int* __restrict__ cnt, const long long* __
     ent[(long long)t * B + pos] = make_int2(b, (i << TMS) | (int)rows);
 }
 
+#if BWD
+// backward slab: the TMS rows (children) of a parent are BOXW floats apart
+#define QUARTER(wv, base, q) float4 wv; { const char* qp_ = (base) + 4 * (q) * BOXW * 4; \
+    wv.x = *reinterpret_cast<const float*>(qp_); wv.y = *reinterpret_cast<const float*>(qp_ + BOXW * 4); \
+    wv.z = *reinterpret_cast<const float*>(qp_ + 2 * BOXW * 4); wv.w = *reinterpret_cast<const float*>(qp_ + 3 * BOXW * 4); }
+#define WROW(base, r) (*reinterpret_cast<const float*>((base) + (r) * BOXW * 4))
+#else
+// forward slab: the TMS rows (parents) of a child are one contiguous row
+#define QUARTER(wv, base, q) const float4 wv = reinterpret_cast<const float4*>(base)[q];
+#define WROW(base, r) (reinterpret_cast<const float*>(base)[r])
+#endif
+
 #if TMS >= 4
 // 4-row quarters of a TMS-row tile with an active row
 __device__ __forceinline__ unsigned quarters(unsigned rows) {
@@ -139,7 +163,7 @@ __device__ __forceinline__ void slab_walk(float* a, const int2* __restrict__ pp,
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
                 if (!((QM >> q) & 1)) continue;
-                const float4 wv = reinterpret_cast<const float4*>(sb + v[u].x)[q];
+                QUARTER(wv, sb + v[u].x, q)
                 a[4 * q] = fmaf(x, wv.x, a[4 * q]);
                 a[4 * q + 1] = fmaf(x, wv.y, a[4 * q + 1]);
                 a[4 * q + 2] = fmaf(x, wv.z, a[4 * q + 2]);
@@ -161,7 +185,7 @@ __device__ __forceinline__ void slab_walk_any(float* a, const int2* __restrict__
             #pragma unroll
             for (int q = 0; q < TMS / 4; ++q) {
                 if (!((qm >> q) & 1)) continue;
-                const float4 wv = reinterpret_cast<const float4*>(sb + v[u].x)[q];
+                QUARTER(wv, sb + v[u].x, q)
                 a[4 * q] = fmaf(x, wv.x, a[4 * q]);
                 a[4 * q + 1] = fmaf(x, wv.y, a[4 * q + 1]);
                 a[4 * q + 2] = fmaf(x, wv.z, a[4 * q + 2]);
@@ -180,12 +204,40 @@ __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned pari
     } while (!ok);
 }
 
-// copy the W slab [KS children][TMS parents] of tile h0, children c0.., into
-// dst; `bar` completes when it has landed (TMA: thread 0; cp.async: every
-// thread)
-__device__ __forceinline__ void load_slab(float* dst, unsigned long long* bar, int h0, int c0,
+// copy the W slab of tile t0.. (TMS rows) and range k0.. (KS rows) into dst;
+// `bar` completes when it has landed (TMA: thread 0; cp.async: every thread).
+// Forward: tile = parents, range = children, layout [KS][TMS]. Backward:
+// tile = children, range = parents, layout [KS / BOXW][TMS][BOXW] (TMA boxes
+// of BOXW parents, which are contiguous in W, by the TMS children).
+__device__ __forceinline__ void load_slab(float* dst, unsigned long long* bar, int t0, int k0,
                                           const float* __restrict__ w, long long w_start,
                                           const TmaDesc* tmap, int tid) {
+#if BWD
+#if LOADER == 8
+    if (tid == 0) {
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
+                     :: "r"(smem_addr(bar)), "r"(KS * TMS * 4) : "memory");
+        for (int part = 0; part < KS / BOXW; ++part) {
+            const int p = k0 + part * BOXW;
+            asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes"
+                         " [%0], [%1, {%2, %3}], [%4];\n"
+                         :: "r"(smem_addr(dst + part * TMS * BOXW)), "l"(tmap), "r"(p % BS),
+                            "r"((p / BS) * H_IN + t0), "r"(smem_addr(bar)) : "memory");
+        }
+    }
+#else
+    for (int e = tid; e < KS * TMS; e += NT) {
+        const int part = e / (TMS * BOXW), rem = e - part * (TMS * BOXW);
+        const int r = rem / BOXW, p = k0 + part * BOXW + (rem - r * BOXW), c = t0 + r;
+        if (c < H_IN && p < H_OUT)
+            asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n"
+                         :: "r"(smem_addr(dst + e)),
+                            "l"(w + w_start + ((long long)(p / BS) * H_IN + c) * BS + (p % BS)) : "memory");
+    }
+    asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(smem_addr(bar)) : "memory");
+#endif
+#else
+    const int h0 = t0, c0 = k0;
 #if LOADER == 8
     if (tid == 0) {
         constexpr int BOXR = KS < 256 ? KS : 256;
@@ -209,6 +261,7 @@ __device__ __forceinline__ void load_slab(float* dst, unsigned long long* bar, i
     }
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" :: "r"(smem_addr(bar)) : "memory");
 #endif
+#endif
 }
 
 // CTA = (child range s of KS children, parent tile m of TMS rows): the tile's
@@ -219,11 +272,12 @@ __device__ __forceinline__ void load_slab(float* dst, unsigned long long* bar, i
 // sums the lanes and writes log(acc) + max (NSPLIT == 1) or adds the linear
 // partial to out_vals (finished by ws_slab_finalize). Exact fp32.
 extern "C" __global__ void __launch_bounds__(NT, MINB)
-ws_slab_fwd(float* __restrict__ out_vals, long long out_stride,
+SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
             const float* __restrict__ w, long long w_start,
             const int2* __restrict__ xp, int xp_stride, const int* __restrict__ cofs,
             const float* __restrict__ max_val, const int* __restrict__ in_nnz,
             const int2* __restrict__ ent, const int* __restrict__ cnt, int B,
+            const float* __restrict__ in_vals, long long in_stride,
             const __grid_constant__ TmaDesc tmap)
 {
     extern __shared__ __align__(128) float smem[];
@@ -295,7 +349,7 @@ ws_slab_fwd(float* __restrict__ out_vals, long long out_stride,
                 const float x = __int_as_float(v[u].y);
                 #pragma unroll
                 for (int r = 0; r < TMS; ++r)
-                    a[r] = fmaf(x, reinterpret_cast<const float*>(sb + v[u].x)[r], a[r]);
+                    a[r] = fmaf(x, WROW(sb + v[u].x, r), a[r]);
             }
         }
 #endif
@@ -318,11 +372,14 @@ ws_slab_fwd(float* __restrict__ out_vals, long long out_stride,
         // active rows of the tile ascend: row r's output is ps + rank(r)
         const int r = lane >> (5 - LOG_TMS);
         if ((lane & ((32 >> LOG_TMS) - 1)) == 0 && ((rows >> r) & 1)) {
-            float* dst = out_vals + (long long)b * out_stride + ps + __popc(rows & ((1u << r) - 1));
-#if NSPLIT == 1
-            *dst = in_nnz[b] == 0 ? __int_as_float(0xff800000) : logf(acc) + fmaxf(max_val[b], -1e30f);
-#else
+            const int k = ps + __popc(rows & ((1u << r) - 1));
+            float* dst = out_vals + (long long)b * out_stride + k;
+#if NSPLIT > 1
             atomicAdd(dst, acc);
+#elif BWD
+            *dst = expf(in_vals[(long long)b * in_stride + k] - fmaxf(max_val[b], -1e30f)) * acc;
+#else
+            *dst = in_nnz[b] == 0 ? __int_as_float(0xff800000) : logf(acc) + fmaxf(max_val[b], -1e30f);
 #endif
         }
         i = inext;
@@ -341,10 +398,59 @@ ws_slab_finalize(float* __restrict__ out_vals, long long out_stride, const int* 
     float* dst = out_vals + (long long)b * out_stride + k;
     *dst = in_nnz[b] == 0 ? __int_as_float(0xff800000) : logf(*dst) + fmaxf(max_val[b], -1e30f);
 }
+
+#if BWD
+// Backward, NSPLIT > 1: flow_in[b, k] = exp(in[b, k] - max_b) * (sum of the
+// partials), k < nnz_in[b]. Grid (cdiv(K_in, 256), B).
+extern "C" __global__ void __launch_bounds__(256)
+ws_slab_finalize_flow(float* __restrict__ flow, long long flow_stride, const int* __restrict__ in_nnz,
+                      const float* __restrict__ in_vals, long long in_stride,
+                      const float* __restrict__ max_val)
+{
+    const int b = blockIdx.y;
+    const int k = blockIdx.x * 256 + threadIdx.x;
+    if (k >= in_nnz[b]) return;
+    float* dst = flow + (long long)b * flow_stride + k;
+    *dst *= expf(in_vals[(long long)b * in_stride + k] - fmaxf(max_val[b], -1e30f));
+}
+
+// Backward, per step: xp[b, i] = (byte offset of parent h_i's row in its
+// range's slab, g_i) with g = nflow * exp(max_b - nmars) the parent's flow
+// scale (0 for a sample without children or a dead parent), for the output
+// column of sample b; cofs[b, s] = the first i with h_i >= s * KS. Grid
+// (cdiv(K_out + 1, 256), B).
+extern "C" __global__ void __launch_bounds__(256)
+ws_slab_pack_g(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cofs,
+               const long long* __restrict__ out_idx, const int* __restrict__ out_cs,
+               const int* __restrict__ out_nnz, const float* __restrict__ nflow, long long flow_stride,
+               const float* __restrict__ nmars, long long mars_stride,
+               const float* __restrict__ max_val, const int* __restrict__ in_nnz)
+{
+    const int b = blockIdx.y;
+    const int i = blockIdx.x * 256 + threadIdx.x;
+    const int n = out_nnz[b];
+    if (i > n) return;
+    const long long* op = out_idx + out_cs[b];
+    int* cb = cofs + (long long)b * (NSPLIT + 1);
+    const int kp = i == 0 ? -1 : (int)(op[i - 1] / KS);
+    const int h = i < n ? (int)op[i] : 0;
+    const int kc = i < n ? h / KS : NSPLIT;
+    for (int k = kp + 1; k <= kc; ++k) cb[k] = i;
+    if (i < n) {
+        const float nm = nmars[(long long)b * mars_stride + i];
+        float g = nflow[(long long)b * flow_stride + i] * expf(fmaxf(max_val[b], -1e30f) - nm);
+        if (in_nnz[b] == 0 || nm == __int_as_float(0xff800000)) g = 0.f;
+        const int hl = h % KS;
+        xp[(long long)b * xp_stride + i] = make_int2(((hl / BOXW) * TMS * BOXW + hl % BOXW) * 4, __float_as_int(g));
+    }
+}
+#endif
 """
 
 _SLAB_FWD_ARGS = ["ptr", "i64", "ptr", "i64", "ptr", "i32", "ptr", "ptr", "ptr",
-                  "ptr", "ptr", "i32", "tmap"]
+                  "ptr", "ptr", "i32", "ptr", "i64", "tmap"]
+_SLAB_FIN_FLOW_ARGS = ["ptr", "i64", "ptr", "ptr", "i64", "ptr"]
+_SLAB_PACK_G_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr", "ptr", "ptr", "i64", "ptr", "i64", "ptr", "ptr"]
 _SLAB_LIST_ARGS = ["ptr", "ptr", "ptr", "ptr", "ptr", "i32", "ptr", "i64"]
 _SLAB_FIN_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr"]
 _SLAB_KERNELS: Dict[tuple, tuple] = {}
@@ -382,20 +488,30 @@ def slab_smem(KS: int, TMS: int) -> int:
 
 
 def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
-                 loader: int, min_blocks: int) -> tuple:
-    """``(lists, pack, forward, finalize kernels, forward smem bytes)`` of a
-    block shape; compiled on first use (cubins cached on disk)."""
-    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks)
+                 loader: int, min_blocks: int, bwd: bool = False) -> tuple:
+    """``(lists, pack, main, finalize kernels, main smem bytes)`` of a block
+    shape: the forward (tiles of parents, ranges of children) or with
+    ``bwd`` the element-flow backward (tiles of children, ranges of
+    parents); compiled on first use (cubins cached on disk)."""
+    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd)
     hit = _SLAB_KERNELS.get(key)
     if hit is None:
         smem = slab_smem(KS, TMS)
+        n_split = -(-(H_out if bwd else H_in) // KS)
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
-                       NWARP=NWARP, LOADER=loader, MINB=min_blocks)
-        src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + _SLAB_SRC
-        hit = _SLAB_KERNELS[key] = (CudaKernel(src, "ws_slab_lists", _SLAB_LIST_ARGS),
-                                    CudaKernel(src, "ws_slab_pack", _PACK_ARGS),
-                                    CudaKernel(src, "ws_slab_fwd", _SLAB_FWD_ARGS, max_shared=smem),
-                                    CudaKernel(src, "ws_slab_finalize", _SLAB_FIN_ARGS), smem)
+                       NWARP=NWARP, LOADER=loader, MINB=min_blocks, BWD=int(bwd), BOXW=min(KS, 256))
+        src = ("".join(f"#define {k} {v}\n" for k, v in defines.items())
+               + f"#define NSPLIT_OVERRIDE {n_split}\n" + _SLAB_SRC)
+        main = CudaKernel(src, "ws_slab_bwd" if bwd else "ws_slab_fwd", _SLAB_FWD_ARGS, max_shared=smem)
+        if bwd:
+            hit = (CudaKernel(src, "ws_slab_lists", _SLAB_LIST_ARGS),
+                   CudaKernel(src, "ws_slab_pack_g", _SLAB_PACK_G_ARGS), main,
+                   CudaKernel(src, "ws_slab_finalize_flow", _SLAB_FIN_FLOW_ARGS), smem)
+        else:
+            hit = (CudaKernel(src, "ws_slab_lists", _SLAB_LIST_ARGS),
+                   CudaKernel(src, "ws_slab_pack", _PACK_ARGS), main,
+                   CudaKernel(src, "ws_slab_finalize", _SLAB_FIN_ARGS), smem)
+        _SLAB_KERNELS[key] = hit
     return hit
 
 
@@ -443,7 +559,60 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
           sv_in.col_starts, sv_in.nnz, max_val], device=device)
     fwd((nsplit, n_m), (NWARP * 32,),
         [out_vals, out_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
-         ent, cnt, B, tmap], shared_mem=smem, device=device)
+         ent, cnt, B, max_val, 0, tmap], shared_mem=smem, device=device)
     if nsplit > 1:
         fin((-(-sv_out.total_nnz // 256), B), (256,),
             [out_vals, out_vals.stride(0), sv_out.nnz, sv_in.nnz, max_val], device=device)
+
+
+def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in, sv_out,
+                     sv_flow_out, max_val: torch.Tensor, ent: torch.Tensor, cnt: torch.Tensor,
+                     xp: torch.Tensor, cofs: torch.Tensor, B: int, H_in: int, H_out: int, BS: int,
+                     TMS: int = 4, slab_bytes: int = 64 * 1024, NWARP: int = 16,
+                     min_blocks: int = 3) -> None:
+    """Element flows of one block: ``flow_vals[b, k] = exp(in[b, k] - max_b)
+    * sum_h g[b, h] W[h, c_k]`` over the sample's active parents ``h`` (``g =
+    nflow * exp(max_b - nmars)``), for every active child ``c_k`` — the slab
+    forward's mirror: tiles of ``TMS`` children, the parents in ranges whose
+    ``[KS, TMS]`` slab fits ``slab_bytes``. Scratch: ``ent`` (int32
+    ``[cdiv(H_in, TMS), 2 B]``), ``cnt`` (int32 ``[cdiv(H_in, TMS)]``), ``xp``
+    (int32 ``[B, >= 2 K_out]``), ``cofs`` (int32 ``[B, NSPLIT + 1]`` over the
+    parents). Graph-capturable, no host sync."""
+    assert TMS in (1, 2, 4, 8, 16)
+    KS, nsplit = slab_shape(H_out, TMS, slab_bytes)
+    assert sv_in.values.shape[-1] < 1 << (31 - TMS), "input columns too long for the list entries"
+    boxw = min(KS, 256)
+    n_t = -(-H_in // TMS)
+    aligned = (BS % boxw == 0 and (w.data_ptr() // 4 + w_start) % 4 == 0 and w.data_ptr() % 4 == 0)
+    loader = FORCE_LOADER if FORCE_LOADER in (1, 8) else (8 if aligned else 1)
+    assert loader == 1 or aligned
+    lists, pack, main, fin, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
+                                                bwd=True)
+    K = sv_out.total_nnz
+    assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
+    assert ent.shape[0] >= n_t and ent.stride(0) == 2 * B and cnt.numel() >= n_t
+    device = flow_vals.device
+    if loader == 8:
+        key = ("bwd", w.data_ptr(), w_start, H_in, H_out, BS, TMS, KS)
+        tmap = _TMAPS.get(key)
+        if tmap is None:
+            # W as [NB * H_in rows (block, child), BS parents], boxes of BOXW parents x TMS children
+            tmap = _TMAPS[key] = tensor_map_2d(w, w_start, H_out // BS * H_in, BS, BS,
+                                               TMS, boxw, swizzle=0)
+    else:
+        tmap = _NO_TMAP
+    cnt.zero_()
+    lists((-(-sv_in.total_nnz // 256), B), (256,),
+          [ent, cnt, sv_in.indices, sv_in.col_starts, sv_in.nnz, B, flow_vals, flow_vals.stride(0)],
+          device=device)
+    pack((-(-(K + 1) // 256), B), (256,),
+         [xp, xp.stride(0) // 2, cofs, sv_out.indices, sv_out.col_starts, sv_out.nnz,
+          sv_flow_out.values, sv_flow_out.values.stride(0), sv_out.values, sv_out.values.stride(0),
+          max_val, sv_in.nnz], device=device)
+    main((nsplit, n_t), (NWARP * 32,),
+         [flow_vals, flow_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
+          ent, cnt, B, sv_in.values, sv_in.values.stride(0), tmap], shared_mem=smem, device=device)
+    if nsplit > 1:
+        fin((-(-sv_in.total_nnz // 256), B), (256,),
+            [flow_vals, flow_vals.stride(0), sv_in.nnz, sv_in.values, sv_in.values.stride(0), max_val],
+            device=device)

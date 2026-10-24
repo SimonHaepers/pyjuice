@@ -247,11 +247,13 @@ spread rather than taken at the mean."""
 # active parent in the tile, fp32 FMAs on the CUDA cores, writing the packed
 # output directly.
 _WS_SPARSE_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE", "auto")
-"""``"auto"`` — the cost model may pick the sparse forward; ``"always"`` —
-WS forwards take it whenever eligible (tests / A-B runs; it beats
-``_WS_TILES_MODE == "always"``); ``"never"`` — excluded. Eligible: forward
-blocks whose input and output columns are sorted (the CSC rows ascend in
-every column, :meth:`SparseCategorical.columns_sorted`)."""
+"""``"auto"`` — the cost model may pick the sparse forward and element-flow
+backward; ``"always"`` — WS forwards and backwards take them whenever
+eligible (tests / A-B runs; it beats ``_WS_TILES_MODE == "always"``);
+``"never"`` — excluded. Eligible: blocks whose input and output columns are
+sorted (the CSC rows ascend in every column,
+:meth:`SparseCategorical.columns_sorted`). The parameter flows keep the
+deferred dense GEMM."""
 _WS_SPARSE_SLAB_TM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_TM", "auto")
 """Parent rows of a slab tile: ``"auto"`` — 4 or 8 by the cost model, or one
 of 1 / 2 / 4 / 8 / 16 (tests / A-B runs). 8-row tiles visit a sample's
@@ -286,24 +288,37 @@ measured times converted by the full and tiles passes' modelled costs: 14 of
 16 decisions right among full / tiles / sparse with 4 / 8-row tiles (misses:
 16k d0.01 B=64, sparse 8-row 3 % slower than the full pass; 8k d0.1 B=512,
 tiles 4 % slower than full); per-point error 0.7-1.3x."""
+_WS_SPARSE_COST_BWD: Dict[int, Tuple[float, float, float]] = {4: (0.94, 0.42, 35.0), 8: (0.57, 0.88, 38.0)}
+"""The same for the element-flow backward (the slab kernel's mirror: tiles of
+children, ranges of parents): the forward's costs scaled by 0.94, the
+geometric mean of measured / modelled kernel time on the 2026-10-24 EM runs
+of the four 8k / 16k chains (B=64..1024 / 64..512, times converted by the
+full and tiles element-flow kernels' modelled costs; per-point error
+0.74-1.30x). It takes the sparse backward at every density-0.01 point, where
+it measured fastest (9.8-25.7 ms per batch at 8k against 15-55 for the full
+or tiles kernel, 40-102 against 49-155 at 16k), and not at density 0.1."""
 
 
-def _ws_sparse_plan(B: int, H_in: int, H_out: int, k_in: float,
-                    f_sparse: Dict[int, float]) -> Tuple[float, int]:
-    """``(cost, tile height)`` of the cheapest sparse forward
+def _ws_sparse_plan(B: int, H_in: int, H_out: int, k: float, f_sparse: Dict[int, float],
+                    backward: bool = False) -> Tuple[float, int]:
+    """``(cost, tile height)`` of the cheapest sparse pass
     (:mod:`.sparse_io_cuda`) over the candidate heights in ``f_sparse``
-    (height -> expected fraction of its tiles a sample's output column
-    touches) for ``B`` samples with ``k_in`` children each, in streamed W
-    elements: one pass over W plus the child visits (every child of a sample,
-    once per tile it touches) plus the items (once per child range of the
-    tile), weighted by :data:`_WS_SPARSE_COST`."""
+    (height -> expected fraction of its tiles a sample touches) for ``B``
+    samples, in streamed W elements: one pass over W plus the visits (every
+    child of a sample in the forward, every parent in the backward — ``k``
+    per sample — once per tile it touches) plus the items (once per range of
+    the tile), weighted by :data:`_WS_SPARSE_COST` (forward: tiles of parents,
+    ranges of children) or :data:`_WS_SPARSE_COST_BWD` (element flows: tiles
+    of children, ranges of parents)."""
     n_w = float(H_in) * float(H_out)
+    H_t, H_r = (H_in, H_out) if backward else (H_out, H_in)
+    costs = _WS_SPARSE_COST_BWD if backward else _WS_SPARSE_COST
     best = (math.inf, 0)
     for tm, f in f_sparse.items():
-        c_w, c_visit, c_item = _WS_SPARSE_COST.get(tm, _WS_SPARSE_COST[4])
-        pairs = B * min(f, 1.0) * -(-H_out // tm)
-        _ks, n_split = _sio_cuda.slab_shape(H_in, tm, _WS_SPARSE_SLAB_BYTES)
-        cost = n_w * c_w + pairs * (min(k_in, H_in) * c_visit + n_split * c_item)
+        c_w, c_visit, c_item = costs.get(tm, costs[4])
+        pairs = B * min(f, 1.0) * -(-H_t // tm)
+        _ks, n_split = _sio_cuda.slab_shape(H_r, tm, _WS_SPARSE_SLAB_BYTES)
+        cost = n_w * c_w + pairs * (min(k, H_r) * c_visit + n_split * c_item)
         best = min(best, (cost, tm))
     return best
 
@@ -336,7 +351,8 @@ def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int,
 def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
                  backward: bool, f_tiles: Optional[float] = None,
                  BB: Optional[int] = None, n_tiles: Optional[int] = None,
-                 n_sm: int = 132, f_sparse: Optional[Dict[int, float]] = None) -> Optional[str]:
+                 n_sm: int = 132, f_sparse: Optional[Dict[int, float]] = None,
+                 sparse_k: Optional[float] = None, sparse_bwd: bool = False) -> Optional[str]:
     """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
     kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
     over the rows of W^T of the batch's active children, compacted on the
@@ -348,7 +364,8 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     the listed side, ``n_sm`` the device's SMs) or ``"sparse"`` (the
     forward over the nonzero products only, :mod:`.sparse_io_cuda`, when
     ``f_sparse`` maps its candidate tile heights to the expected fraction of
-    those parent tiles a sample touches; :func:`_ws_sparse_plan`) — the
+    those tiles a sample touches, ``sparse_k`` its visits per sample and
+    tile, ``sparse_bwd`` the element-flow backward; :func:`_ws_sparse_plan`) — the
     cheapest by the cost model above for ``B`` samples with ``pairs`` active
     ``(sample, in, out)`` pairs per step and ``k_in`` active children per
     sample (the batch's own counts, or the model's expectation for a CUDA
@@ -383,9 +400,10 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     if c_tiles < c_ws:
         ws, c_ws = "tiles", c_tiles
     # the sparse forward wins when forced, or on cost unless another pass is forced
-    sparse_ok = f_sparse is not None and not backward and _WS_SPARSE_MODE != "never"
+    sparse_ok = f_sparse is not None and _WS_SPARSE_MODE != "never"
     if sparse_ok:
-        c_sparse = _ws_sparse_plan(B, H_in, H_out, k_in, f_sparse)[0]
+        c_sparse = _ws_sparse_plan(B, H_in, H_out, k_in if sparse_k is None else sparse_k,
+                                   f_sparse, sparse_bwd)[0]
         if _WS_SPARSE_MODE == "always" or (not forced and B >= _WS_SPARSE_MIN_BATCH
                                             and c_sparse < c_ws):
             ws, c_ws = "sparse", c_sparse
@@ -505,6 +523,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # pass of a backward is priced on the child tiles, not the parent ones.
         self._ws_in_backward = False
         self._ws_sparse_tm: Dict[int, int] = {}       # block -> tile height of the sparse forward
+        self._ws_sparse_tm_bwd: Dict[int, int] = {}   # ... and of the sparse element-flow backward
 
     def __repr__(self) -> str:
         return (
@@ -899,24 +918,29 @@ class SparseIOSumLayer(SparseInputSumLayer):
         values = in_values if emit_ns.dist is out_dist else None
         return out_dist.expected_col_tiles(TM, values)
 
-    def _ws_sparse_fraction(self, blk_idx: int, static_ctx=None) -> Optional[Dict[int, float]]:
-        """The sparse forward's candidate tile heights (4 and 8, or the forced
-        ``_WS_SPARSE_SLAB_TM``) mapped to the expected fraction of those
-        parent tiles a sample's output column touches (as
-        :meth:`_ws_tiles_fraction`): the cost model's input; ``None`` when the
+    def _ws_sparse_fraction(self, blk_idx: int, static_ctx=None,
+                            backward: bool = False) -> Optional[Dict[int, float]]:
+        """The sparse pass's candidate tile heights (4 and 8, or the forced
+        ``_WS_SPARSE_SLAB_TM``) mapped to the expected fraction of those tiles
+        a sample touches (as :meth:`_ws_tiles_fraction`): parent tiles of the
+        output column in the forward, child tiles of the input column in the
+        element-flow backward; the cost model's input. ``None`` when the
         block cannot take the pass (a column whose rows do not ascend)."""
         prod, ns_idx = self._sparse_input_refs[blk_idx]
-        emit_ns = prod.nodes[ns_idx].sparse_input_ns
+        in_ns = prod.nodes[ns_idx]
+        emit_ns = in_ns.sparse_input_ns
         out_dist = self._output_sparsity_dists[blk_idx]
         if not (emit_ns.dist.columns_sorted() and out_dist.columns_sorted()):
             return None
         heights = (4, 8) if _WS_SPARSE_SLAB_TM == "auto" else (int(_WS_SPARSE_SLAB_TM),)
-        if static_ctx is not None and static_ctx.is_masked(self._output_sparsity_var_ids[blk_idx]):
+        var = in_ns.var_id if backward else self._output_sparsity_var_ids[blk_idx]
+        if static_ctx is not None and static_ctx.is_masked(var):
             return {tm: 1.0 for tm in heights}
-        values = None
-        if emit_ns.dist is out_dist:
-            base = emit_ns._param_range[0]
-            values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
+        base = emit_ns._param_range[0]
+        in_values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
+        if backward:
+            return {tm: emit_ns.dist.expected_col_tiles(tm, in_values) for tm in heights}
+        values = in_values if emit_ns.dist is out_dist else None
         return {tm: out_dist.expected_col_tiles(tm, values) for tm in heights}
 
     def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
@@ -1096,7 +1120,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
-                    active_children=ws == "active", tiles=ws == "tiles",
+                    active_children=ws == "active", tiles=ws == "tiles", sparse=ws == "sparse",
                 )
             elif sv_in.is_batched:
                 BLOCK_B = _BWD_BATCHED_BLOCK_B
@@ -1191,6 +1215,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if not group.eligible:
             return None
         B = sv_in.batch_size
+        avg_out = 0.0
         if sv_in.static or sv_out.static:
             avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
             pairs, k_in = B * avg_in * avg_out, avg_in
@@ -1206,14 +1231,21 @@ class SparseIOSumLayer(SparseInputSumLayer):
             n_tiles = None
         else:
             n_tiles = group.H_in // TK if self._ws_in_backward else group.H_out // TM
-        f_sparse = None if self._ws_in_backward else self._ws_sparse_fraction(blk_idx, static_ctx)
+        bwd = self._ws_in_backward
+        f_sparse = self._ws_sparse_fraction(blk_idx, static_ctx, backward=bwd)
+        if sv_in.static or sv_out.static:
+            k_out = avg_out
+        else:
+            k_out = sum(sv_out.nnz_list) / max(B, 1)
+        k_visit = k_out if bwd else k_in
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
                            f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device),
-                           f_sparse=f_sparse)
+                           f_sparse=f_sparse, sparse_k=k_visit, sparse_bwd=bwd)
         if use is not None and not group.ensure_ready(params, B, need_stash):
             use = None
         if use == "sparse":
-            self._ws_sparse_tm[blk_idx] = _ws_sparse_plan(B, group.H_in, group.H_out, k_in, f_sparse)[1]
+            tm = _ws_sparse_plan(B, group.H_in, group.H_out, k_visit, f_sparse, bwd)[1]
+            (self._ws_sparse_tm_bwd if bwd else self._ws_sparse_tm)[blk_idx] = tm
         return use
 
     def _ws_forward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
@@ -1299,11 +1331,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
                            sv_flow_in: SparseNodeValues, params: torch.Tensor,
                            param_flows: Optional[torch.Tensor],
                            negate_pflows: bool, active_children: bool = False,
-                           tiles: bool = False) -> None:
+                           tiles: bool = False, sparse: bool = False) -> None:
         """Element flows through :func:`_ws_bwd_flow_kernel` (over all
         children, or with ``active_children`` only the batch's) or, with
         ``tiles``, :func:`_ws_bwd_flow_tiles_kernel` (every child tile with
-        the samples that have an active child in it); the parameter flows are
+        the samples that have an active child in it) or, with ``sparse``, the
+        CUDA-core slab kernel of :mod:`.sparse_io_cuda` (tile height
+        ``self._ws_sparse_tm_bwd[blk_idx]``) over the active pairs only, which
+        writes the packed element flows directly; the parameter flows are
         only *stashed* here (densified ``G`` / ``X`` factors in this block's
         slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
 
@@ -1325,25 +1360,53 @@ class SparseIOSumLayer(SparseInputSumLayer):
         )
         w, w_start = group.weights(params)
 
-        gd = _ws_scratch("g", (B, H_out), device)
-        gd.zero_()
-        if param_flows is not None:
-            gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
+        if sparse:
+            gd = None
+            if param_flows is not None:            # the stash of the deferred param-flow GEMM only
+                gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
+                _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
+                    gt, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
+                    sv_in.nnz, sv_out.col_starts, sv_out.nnz,
+                    sv_flow_out.values.stride(0), sv_out.values.stride(0), H_out,
+                    gt.stride(0), col0,
+                    BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=True, WRITE_D=False,
+                )
         else:
-            gt, xt, col0 = gd, None, 0
-        _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
-            gd, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
-            sv_in.nnz, sv_out.col_starts, sv_out.nnz,
-            sv_flow_out.values.stride(0), sv_out.values.stride(0), H_out,
-            gt.stride(0), col0,
-            BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=param_flows is not None,
-        )
+            gd = _ws_scratch("g", (B, H_out), device)
+            gd.zero_()
+            if param_flows is not None:
+                gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
+            else:
+                gt, xt, col0 = gd, None, 0
+            _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
+                gd, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
+                sv_in.nnz, sv_out.col_starts, sv_out.nnz,
+                sv_flow_out.values.stride(0), sv_out.values.stride(0), H_out,
+                gt.stride(0), col0,
+                BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=param_flows is not None, WRITE_D=True,
+            )
         if param_flows is not None:
             _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
                 xt, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
                 sv_in.values.stride(0), 1, xt.stride(0), col0,
                 BLOCK=_WS_VEC, ROUND=rnd,
             )
+
+        if sparse:
+            TMS = self._ws_sparse_tm_bwd[blk_idx]
+            n_t = -(-H_in // TMS)
+            _KS, nsplit = _sio_cuda.slab_shape(H_out, TMS, _WS_SPARSE_SLAB_BYTES)
+            ent = _ws_scratch("sp_ent", (n_t, 2 * B), device, torch.int32)
+            cnt = _ws_scratch("sp_cnt", (n_t,), device, torch.int32)
+            xp = _ws_scratch("sp_xpack", (B, 2 * sv_out.total_nnz), device, torch.int32)
+            cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+            _sio_cuda.ws_slab_backward(
+                sv_flow_in.values, params, group.pid_start, sv_in, sv_out, sv_flow_out, max_val,
+                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS,
+                slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
+                min_blocks=_WS_SPARSE_SLAB_MINB,
+            )
+            return
 
         fd = _ws_scratch("f", (B, H_in), device)
         if tiles:
@@ -2542,10 +2605,11 @@ def _ws_fwd_tiles_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, lists_ptr, cou
 @triton.jit(do_not_specialize=["flow_stride", "mars_stride", "gt_ld", "gt_off"])
 def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr, kin_ptr,
                          cs_ptr, nnz_ptr, flow_stride, mars_stride, H_out, gt_ld, gt_off,
-                         BLOCK: tl.constexpr, ROUND: tl.constexpr, WRITE_T: tl.constexpr):
+                         BLOCK: tl.constexpr, ROUND: tl.constexpr, WRITE_T: tl.constexpr,
+                         WRITE_D: tl.constexpr):
     """Scatter ``gs = nflow * exp(max_b - nmars)`` (0 for samples without
     active inputs) of the batched output column into the pre-zeroed dense
-    ``gd[B, H_out]`` and, with ``WRITE_T``, into the transposed stash slot
+    ``gd[B, H_out]`` (with ``WRITE_D``) and, with ``WRITE_T``, into the transposed stash slot
     ``gt[h, gt_off + b]``. ``max_b`` is the input max the forward used, so
     ``gs * x = nflow * exp(in - nmars)`` exactly as the gather kernel's
     per-pair term."""
@@ -2561,7 +2625,8 @@ def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr,
     g = tl.where(dead, 0.0, g)
     if ROUND:
         g = _ws_round_tf32(g)
-    tl.store(gd_ptr + b * H_out + h, g, mask=mask)
+    if WRITE_D:
+        tl.store(gd_ptr + b * H_out + h, g, mask=mask)
     if WRITE_T:
         tl.store(gt_ptr + gt_off + h * gt_ld + b, g, mask=mask)
 

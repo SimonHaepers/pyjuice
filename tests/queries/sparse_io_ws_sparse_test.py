@@ -87,15 +87,21 @@ def _set(monkeypatch, mode, prec="ieee", sparse=None, **knobs):
 
 
 def _count(monkeypatch):
-    calls = {"fwd": 0, "sparse": 0}
-    fwd = sio.SparseIOSumLayer._ws_forward_block
+    calls = {"fwd": 0, "sparse": 0, "bwd": 0, "bwd_sparse": 0}
+    fwd, bwd = sio.SparseIOSumLayer._ws_forward_block, sio.SparseIOSumLayer._ws_backward_block
 
     def counted_fwd(self, *a, **k):
         calls["fwd"] += 1
         calls["sparse"] += bool(k.get("sparse"))
         return fwd(self, *a, **k)
 
+    def counted_bwd(self, *a, **k):
+        calls["bwd"] += 1
+        calls["bwd_sparse"] += bool(k.get("sparse"))
+        return bwd(self, *a, **k)
+
     monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_forward_block", counted_fwd)
+    monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_backward_block", counted_bwd)
     return calls
 
 
@@ -129,9 +135,9 @@ def _assert_flows_close(got, ref, rtol, what):
     (2048, 300, 4, 1024, 0.02, 300),
 ])
 def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
-    """The forward is exact fp32 in both precisions (it reads W itself, not
-    the tf32 copy) with either tile height; the backward takes its own
-    dispatch."""
+    """The forward and the element-flow backward are exact fp32 in both
+    precisions (they read W itself, not the tf32 copy) with either tile
+    height; the parameter flows keep the deferred (tf32 or ieee) GEMM."""
     pc = _build(H, V, T, bs, density)
     data = torch.randint(0, V, (B, T), device=DEV)
 
@@ -142,6 +148,7 @@ def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
     _set(monkeypatch, "always", prec, sparse=True, SLAB_TM=tm)
     ll, pf, emit = _pass(pc, data)
     assert calls["fwd"] == T - 1 and calls["sparse"] == T - 1
+    assert calls["bwd"] == T - 1 and calls["bwd_sparse"] == T - 1
     torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=_TOL[prec])
     rtol = 1e-4 if prec == "ieee" else 3e-3
     _assert_flows_close(pf, pf_ref, rtol, "transition param flows")
@@ -161,16 +168,22 @@ def test_sparse_knobs(monkeypatch, knobs, loader):
     """Every slab configuration gives the same result: tile heights 1 to 16
     (only the 4-row quarters with one of the sample's parents read), the
     children split into ranges whose partial sums add up in the output, TMA
-    and 4-byte ``cp.async`` copies of the slab; density 0.3 at H=256 puts up
-    to all rows of a tile in a sample."""
+    and 4-byte ``cp.async`` copies of the slab, forward and element-flow
+    backward (whose slab is parents x children, the parents split into
+    ranges likewise); density 0.3 at H=256 puts up to all rows of a tile in a
+    sample."""
     pc = _build(256, 60, 5, 128, 0.3, seed=2)
     data = torch.randint(0, 60, (40, 5), device=DEV)
     _set(monkeypatch, "never")
-    ref = pc(data, apply_cudagraph=False).detach().clone()
+    ref = _pass(pc, data)
     monkeypatch.setattr(sio_cuda, "FORCE_LOADER", loader)
+    calls = _count(monkeypatch)
     _set(monkeypatch, "always", "ieee", sparse=True, **knobs)
-    got = pc(data, apply_cudagraph=False).detach().clone()
-    torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-4)
+    got = _pass(pc, data)
+    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
 
 
 def test_sparse_empty_columns(monkeypatch):
@@ -260,7 +273,7 @@ def test_sparse_on_forest(monkeypatch, B):
         torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
         _assert_flows_close(pf, pf_ref, 1e-4, "sum param flows")
         _assert_flows_close(emit, emit_ref, 1e-4, "emission param flows")
-    assert calls["sparse"] > 0
+    assert calls["sparse"] > 0 and calls["bwd_sparse"] > 0
     pc(batches[0], record_cudagraph=True)
     for x, (ll_ref, _, _) in zip(batches, refs):
         torch.testing.assert_close(pc(x).detach(), ll_ref, rtol=0.0, atol=1e-4)
@@ -304,8 +317,10 @@ def test_sparse_dispatch_cost_model():
     on the density-0.01 chains from B=64 on — 8-row tiles up to B=512 and
     4-row tiles above on 8k d0.01 (where they measured faster), 8-row tiles on
     16k d0.01 — and leaves the density-0.1 chains to the full and tiles
-    passes, which were faster there; never in a backward, never without the
-    tile fractions, never below ``_WS_SPARSE_MIN_BATCH`` (outside the fit).
+    passes, which were faster there; never without the tile fractions, never
+    below ``_WS_SPARSE_MIN_BATCH`` (outside the fit). The element-flow
+    backward, priced on its own costs, makes the same decisions on these
+    chains (measured likewise).
     Model inputs are the trained chains' expected supports (mass-weighted,
     sorted states). Pure host logic, no GPU."""
     d = sio._ws_dispatch
@@ -323,9 +338,17 @@ def test_sparse_dispatch_cost_model():
             got = d(B, H, H, B * k * k, k, False, f_tiles=f64, BB=128, n_tiles=H // 64, f_sparse=fs)
             got_tm = sio._ws_sparse_plan(B, H, H, k, fs)[1] if got == "sparse" else 0
             assert (got, got_tm) == (use, tm), (H, k, B, got, got_tm)
+    # the element-flow backward with parameter flows (own costs, child tiles of the input column)
+    for H, k, f4, f8, f64, expect in cases:
+        fs = {4: f4, 8: f8}
+        for B, (use, tm) in expect.items():
+            if B < 64:
+                continue
+            got = d(B, H, H, B * k * k, k, True, f_tiles=f64, BB=128, n_tiles=H // 64,
+                    f_sparse=fs, sparse_k=k, sparse_bwd=True)
+            got_tm = sio._ws_sparse_plan(B, H, H, k, fs, True)[1] if got == "sparse" else 0
+            assert (got, got_tm) == (use, tm), ("backward", H, k, B, got, got_tm)
     fs = {4: 0.107, 8: 0.143}
-    assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, True, f_tiles=0.361, BB=128, n_tiles=128,
-             f_sparse=fs) == "tiles"                                       # backward: not a candidate
     assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, False, f_tiles=0.361, BB=128,
              n_tiles=128) == "tiles"                                       # no tile fractions
     # H=4096, density 0.2 (random): the active-children pass at B=4, not the sparse forward
