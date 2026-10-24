@@ -270,6 +270,10 @@ if os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"):
                              for t in (1, 2, 4, 8, 16)}
 _WS_SPARSE_SLAB_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_MINB", "3"))
 """CTAs per SM the compiler budgets registers for (``__launch_bounds__``)."""
+_WS_SPARSE_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_MIN_BATCH", "32"))
+"""Smallest batch ``"auto"`` considers the sparse forward at: the cost model
+below was fitted from B=64 on; smaller batches keep the passes calibrated
+there (gather, active children, full)."""
 _WS_SPARSE_COST: Dict[int, Tuple[float, float, float]] = {4: (1.0, 0.45, 37.0), 8: (0.6, 0.93, 40.0)}
 """Cost model of the sparse forward (:func:`_ws_sparse_plan`) by tile height,
 in streamed W elements of the full pass: per W element (the slabs come from
@@ -382,7 +386,8 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     sparse_ok = f_sparse is not None and not backward and _WS_SPARSE_MODE != "never"
     if sparse_ok:
         c_sparse = _ws_sparse_plan(B, H_in, H_out, k_in, f_sparse)[0]
-        if _WS_SPARSE_MODE == "always" or (not forced and c_sparse < c_ws):
+        if _WS_SPARSE_MODE == "always" or (not forced and B >= _WS_SPARSE_MIN_BATCH
+                                            and c_sparse < c_ws):
             ws, c_ws = "sparse", c_sparse
     if _WS_MODE == "always":
         return ws

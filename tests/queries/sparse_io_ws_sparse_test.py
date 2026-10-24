@@ -305,8 +305,9 @@ def test_sparse_dispatch_cost_model():
     4-row tiles above on 8k d0.01 (where they measured faster), 8-row tiles on
     16k d0.01 — and leaves the density-0.1 chains to the full and tiles
     passes, which were faster there; never in a backward, never without the
-    tile fractions. Model inputs are the trained chains' expected supports
-    (mass-weighted, sorted states). Pure host logic, no GPU."""
+    tile fractions, never below ``_WS_SPARSE_MIN_BATCH`` (outside the fit).
+    Model inputs are the trained chains' expected supports (mass-weighted,
+    sorted states). Pure host logic, no GPU."""
     d = sio._ws_dispatch
     cases = [   # (H, k_in, f(4), f(8), f(64), expected (decision, sparse tile height) per B)
         (8192, 508, 0.107, 0.143, 0.361, {16: (None, 0), 64: ("sparse", 8), 256: ("sparse", 8),
@@ -327,3 +328,6 @@ def test_sparse_dispatch_cost_model():
              f_sparse=fs) == "tiles"                                       # backward: not a candidate
     assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, False, f_tiles=0.361, BB=128,
              n_tiles=128) == "tiles"                                       # no tile fractions
+    # H=4096, density 0.2 (random): the active-children pass at B=4, not the sparse forward
+    assert d(4, 4096, 4096, 4 * 819 * 819, 819, False, f_tiles=1.0, BB=128, n_tiles=64,
+             f_sparse={4: 0.59, 8: 0.83}) == "active"
