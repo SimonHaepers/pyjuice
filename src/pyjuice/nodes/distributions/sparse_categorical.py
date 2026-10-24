@@ -156,6 +156,7 @@ class SparseCategorical(Distribution):
         self._max_nnz_per_row = max(max_nnz_per_row, 1)
         self._expected_col_nnz = None
         self._expected_col_tiles = None
+        self._columns_sorted = None
         self._b1_desc = None
 
         return torch.zeros(max(nnz, 1), dtype = torch.float32)
@@ -262,6 +263,25 @@ class SparseCategorical(Distribution):
         est = (weights * nnz).sum().item() / total if total > 0 else 0.0
         self._expected_col_nnz = (weighted, est)
         return est
+
+    def columns_sorted(self) -> bool:
+        """Whether the row ids ascend within every CSC column (cached). The
+        sparse-IO "sparse" pass walks the columns in order;
+        :func:`pyjuice.transformations.reorder_states` keeps them sorted."""
+        cached = getattr(self, "_columns_sorted", None)
+        if cached is None:
+            assert self._csc_indptr is not None, "Sparsity pattern not set."
+            indptr = self._csc_indptr.cpu()
+            indices = self._csc_indices.cpu()
+            if self._nnz > 1:
+                step = indices[1:] > indices[:-1]
+                # the first entry of a column follows another column's last one
+                step[indptr[1:-1][(indptr[1:-1] > 0) & (indptr[1:-1] < self._nnz)] - 1] = True
+                cached = bool(step.all())
+            else:
+                cached = True
+            self._columns_sorted = cached
+        return cached
 
     def expected_col_tiles(self, tile: int, values: Optional[torch.Tensor] = None) -> float:
         """Expected fraction of the ``tile``-row tiles of the latent axis that

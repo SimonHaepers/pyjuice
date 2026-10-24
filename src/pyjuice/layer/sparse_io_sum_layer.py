@@ -15,6 +15,7 @@ from pyjuice.nodes.distributions import sparse_categorical as _scat
 from .sparse_input_sum_layer import SparseInputSumLayer
 from .sparse_node_values import SparseNodeValues
 from .sparse_prod_layer import SparseProdLayer
+from . import sparse_io_cuda as _sio_cuda
 
 
 _FWD_BLOCK_K = 64
@@ -236,6 +237,73 @@ is touched by 10-50 % of the batch on the trained chains when the mean is
 20 %); the padding to ``BB`` is averaged over a geometric range of this
 spread rather than taken at the mean."""
 
+# Pass over the nonzero products only ("sparse", :mod:`pyjuice.layer.sparse_io_cuda`).
+#
+# The tiles pass still multiplies ~45 % of the dense product on the tensor
+# cores (8k d0.01, B=1024) because MMA rows need samples that share W tiles;
+# the useful pairs are 0.24 % of it. The CUDA C++ slab kernel cuts the parents
+# into tiles of 4 or 8 rows, keeps a tile's W slab (a range of the children)
+# in shared memory and walks the packed input column of every sample with an
+# active parent in the tile, fp32 FMAs on the CUDA cores, writing the packed
+# output directly.
+_WS_SPARSE_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE", "auto")
+"""``"auto"`` — the cost model may pick the sparse forward; ``"always"`` —
+WS forwards take it whenever eligible (tests / A-B runs; it beats
+``_WS_TILES_MODE == "always"``); ``"never"`` — excluded. Eligible: forward
+blocks whose input and output columns are sorted (the CSC rows ascend in
+every column, :meth:`SparseCategorical.columns_sorted`)."""
+_WS_SPARSE_SLAB_TM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_TM", "auto")
+"""Parent rows of a slab tile: ``"auto"`` — 4 or 8 by the cost model, or one
+of 1 / 2 / 4 / 8 / 16 (tests / A-B runs). 8-row tiles visit a sample's
+children a third less often (fewer tiles per sample) and read whole 32-byte
+sectors of W; 4-row tiles lose less to the per-sample work of a tile."""
+_WS_SPARSE_SLAB_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_KB", "64")) * 1024
+"""Shared memory of one slab: the children are split into ranges of that size
+(64 KB: three CTAs per SM; 2 ranges on an 8k chain with 4-row tiles)."""
+_WS_SPARSE_SLAB_NWARP: Dict[int, int] = {4: 16, 8: 12}
+"""Warps per CTA by tile height (16 for others); env
+``PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP`` overrides. Chosen 2026-10-24 on 8k /
+16k d0.01 (B=64..2048): occupancy-bound, the most warps whose registers fit
+three CTAs per SM without spills (40 / 56 registers)."""
+if os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"):
+    _WS_SPARSE_SLAB_NWARP = {t: int(os.environ["PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"])
+                             for t in (1, 2, 4, 8, 16)}
+_WS_SPARSE_SLAB_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_MINB", "3"))
+"""CTAs per SM the compiler budgets registers for (``__launch_bounds__``)."""
+_WS_SPARSE_COST: Dict[int, Tuple[float, float, float]] = {4: (1.0, 0.45, 37.0), 8: (0.6, 0.93, 40.0)}
+"""Cost model of the sparse forward (:func:`_ws_sparse_plan`) by tile height,
+in streamed W elements of the full pass: per W element (the slabs come from
+HBM once per step; 4-row tiles read every 32-byte sector of W twice from L2),
+per child visit (a lane reading a child of a sample's packed column and the
+slab row of the tile) and per item (a sample's visit of a tile's child range
+by a warp). Fitted 2026-10-24 (non-negative least squares on relative error)
+on the forced kernel maps of the four 8k / 16k chains, B=64..2048 / 64..512,
+measured times converted by the full and tiles passes' modelled costs: 14 of
+16 decisions right among full / tiles / sparse with 4 / 8-row tiles (misses:
+16k d0.01 B=64, sparse 8-row 3 % slower than the full pass; 8k d0.1 B=512,
+tiles 4 % slower than full); per-point error 0.7-1.3x."""
+
+
+def _ws_sparse_plan(B: int, H_in: int, H_out: int, k_in: float,
+                    f_sparse: Dict[int, float]) -> Tuple[float, int]:
+    """``(cost, tile height)`` of the cheapest sparse forward
+    (:mod:`.sparse_io_cuda`) over the candidate heights in ``f_sparse``
+    (height -> expected fraction of its tiles a sample's output column
+    touches) for ``B`` samples with ``k_in`` children each, in streamed W
+    elements: one pass over W plus the child visits (every child of a sample,
+    once per tile it touches) plus the items (once per child range of the
+    tile), weighted by :data:`_WS_SPARSE_COST`."""
+    n_w = float(H_in) * float(H_out)
+    best = (math.inf, 0)
+    for tm, f in f_sparse.items():
+        c_w, c_visit, c_item = _WS_SPARSE_COST.get(tm, _WS_SPARSE_COST[4])
+        pairs = B * min(f, 1.0) * -(-H_out // tm)
+        _ks, n_split = _sio_cuda.slab_shape(H_in, tm, _WS_SPARSE_SLAB_BYTES)
+        cost = n_w * c_w + pairs * (min(k_in, H_in) * c_visit + n_split * c_item)
+        best = min(best, (cost, tm))
+    return best
+
+
 def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int,
                    n_tiles: Optional[int] = None, n_sm: int = 132) -> float:
     """Cost model of the tiles passes (:func:`_ws_fwd_tiles_kernel`,
@@ -264,7 +332,7 @@ def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int,
 def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
                  backward: bool, f_tiles: Optional[float] = None,
                  BB: Optional[int] = None, n_tiles: Optional[int] = None,
-                 n_sm: int = 132) -> Optional[str]:
+                 n_sm: int = 132, f_sparse: Optional[Dict[int, float]] = None) -> Optional[str]:
     """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
     kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
     over the rows of W^T of the batch's active children, compacted on the
@@ -273,7 +341,10 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     :func:`_ws_fwd_tiles_kernel`, active child tiles in the backward,
     :func:`_ws_bwd_flow_tiles_kernel`, when ``f_tiles``, the expected fraction
     of those tiles a sample touches, is given; ``n_tiles`` the tiles of
-    the listed side, ``n_sm`` the device's SMs) — the
+    the listed side, ``n_sm`` the device's SMs) or ``"sparse"`` (the
+    forward over the nonzero products only, :mod:`.sparse_io_cuda`, when
+    ``f_sparse`` maps its candidate tile heights to the expected fraction of
+    those parent tiles a sample touches; :func:`_ws_sparse_plan`) — the
     cheapest by the cost model above for ``B`` samples with ``pairs`` active
     ``(sample, in, out)`` pairs per step and ``k_in`` active children per
     sample (the batch's own counts, or the model's expectation for a CUDA
@@ -296,16 +367,23 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     tiles_ok = f_tiles is not None and _WS_TILES_MODE != "never"
     c_tiles = (_ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB, n_tiles, n_sm)
                if tiles_ok else math.inf)
+    forced = True
     if tiles_ok and _WS_TILES_MODE == "always":
         ws, c_ws = "tiles", c_tiles
     elif _WS_ACTIVE_MODE == "always":       # forced, whatever the batch
         ws, c_ws = "active", u * W * (_WS_ACTIVE_COST_BWD if backward else _WS_ACTIVE_COST)
     elif _WS_ACTIVE_MODE == "never" or c_active >= c_full:
-        ws, c_ws = "full", c_full
+        ws, c_ws, forced = "full", c_full, False
     else:
-        ws, c_ws = "active", c_active
+        ws, c_ws, forced = "active", c_active, False
     if c_tiles < c_ws:
         ws, c_ws = "tiles", c_tiles
+    # the sparse forward wins when forced, or on cost unless another pass is forced
+    sparse_ok = f_sparse is not None and not backward and _WS_SPARSE_MODE != "never"
+    if sparse_ok:
+        c_sparse = _ws_sparse_plan(B, H_in, H_out, k_in, f_sparse)[0]
+        if _WS_SPARSE_MODE == "always" or (not forced and c_sparse < c_ws):
+            ws, c_ws = "sparse", c_sparse
     if _WS_MODE == "always":
         return ws
     if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
@@ -421,6 +499,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # Set by :meth:`backward` while it dispatches its blocks: the tiles
         # pass of a backward is priced on the child tiles, not the parent ones.
         self._ws_in_backward = False
+        self._ws_sparse_tm: Dict[int, int] = {}       # block -> tile height of the sparse forward
 
     def __repr__(self) -> str:
         return (
@@ -564,7 +643,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws = self._ws_use(blk_idx, block, sv_in, sv_out, params) if sv_in.is_batched else None
             if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params,
-                                       active_children=ws == "active", tiles=ws == "tiles")
+                                       active_children=ws == "active", tiles=ws == "tiles",
+                                       sparse=ws == "sparse")
             elif sv_in.is_batched:
                 assert sv_out.is_batched
                 self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
@@ -739,7 +819,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
             ws = self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx)
             if ws:
                 self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params,
-                                       active_children=ws == "active", tiles=ws == "tiles")
+                                       active_children=ws == "active", tiles=ws == "tiles",
+                                       sparse=ws == "sparse")
             elif B == 1:
                 self._launch_single_forward(blk_idx, block, sv_in, sv_out, sv_in.max_val,
                                             params, static_ctx)
@@ -764,14 +845,20 @@ class SparseIOSumLayer(SparseInputSumLayer):
             B = static_ctx.B
             avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
             TM, _TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
+            f_sparse = self._ws_sparse_fraction(blk_idx, static_ctx)
             use = _ws_dispatch(B, group.H_in, group.H_out, B * avg_in * avg_out, avg_in,
                                backward=False,
                                f_tiles=self._ws_tiles_fraction(blk_idx, static_ctx),
                                BB=BB, n_tiles=group.H_out // TM if TM else None,
-                               n_sm=_num_sms(params.device))
+                               n_sm=_num_sms(params.device), f_sparse=f_sparse)
             if use is not None and not group.ensure_ready(params, B, need_stash=False):
                 use = None
+            if use == "sparse":
+                static_ctx.ws_decisions[key + ("tm",)] = _ws_sparse_plan(
+                    B, group.H_in, group.H_out, avg_in, f_sparse)[1]
         static_ctx.ws_decisions[key] = use
+        if use == "sparse":
+            self._ws_sparse_tm[blk_idx] = static_ctx.ws_decisions[key + ("tm",)]
         return use
 
     def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None,
@@ -804,6 +891,26 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # wikitext chains (0.17 vs 0.21 at 8k d0.01, 0.32 vs 0.45 at 8k d0.1)
         values = in_values if emit_ns.dist is out_dist else None
         return out_dist.expected_col_tiles(TM, values)
+
+    def _ws_sparse_fraction(self, blk_idx: int, static_ctx=None) -> Optional[Dict[int, float]]:
+        """The sparse forward's candidate tile heights (4 and 8, or the forced
+        ``_WS_SPARSE_SLAB_TM``) mapped to the expected fraction of those
+        parent tiles a sample's output column touches (as
+        :meth:`_ws_tiles_fraction`): the cost model's input; ``None`` when the
+        block cannot take the pass (a column whose rows do not ascend)."""
+        prod, ns_idx = self._sparse_input_refs[blk_idx]
+        emit_ns = prod.nodes[ns_idx].sparse_input_ns
+        out_dist = self._output_sparsity_dists[blk_idx]
+        if not (emit_ns.dist.columns_sorted() and out_dist.columns_sorted()):
+            return None
+        heights = (4, 8) if _WS_SPARSE_SLAB_TM == "auto" else (int(_WS_SPARSE_SLAB_TM),)
+        if static_ctx is not None and static_ctx.is_masked(self._output_sparsity_var_ids[blk_idx]):
+            return {tm: 1.0 for tm in heights}
+        values = None
+        if emit_ns.dist is out_dist:
+            base = emit_ns._param_range[0]
+            values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
+        return {tm: out_dist.expected_col_tiles(tm, values) for tm in heights}
 
     def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
         """``(TM, TK, BB, num_warps, num_stages)`` of the tiles pass for this
@@ -1092,27 +1199,51 @@ class SparseIOSumLayer(SparseInputSumLayer):
             n_tiles = None
         else:
             n_tiles = group.H_in // TK if self._ws_in_backward else group.H_out // TM
+        f_sparse = None if self._ws_in_backward else self._ws_sparse_fraction(blk_idx, static_ctx)
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
-                           f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device))
+                           f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device),
+                           f_sparse=f_sparse)
         if use is not None and not group.ensure_ready(params, B, need_stash):
             use = None
+        if use == "sparse":
+            self._ws_sparse_tm[blk_idx] = _ws_sparse_plan(B, group.H_in, group.H_out, k_in, f_sparse)[1]
         return use
 
     def _ws_forward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                           sv_out: SparseNodeValues, max_val: torch.Tensor,
                           params: torch.Tensor, active_children: bool = False,
-                          tiles: bool = False) -> None:
+                          tiles: bool = False, sparse: bool = False) -> None:
         """``sv_out = log(W @ exp(sv_in - max)) + max`` for the whole batch:
         densify the inputs, stream W once through :func:`_ws_fwd_kernel` (all
         of it, or with ``active_children`` only the rows of W^T of the batch's
         active children) — or with ``tiles`` walk every parent tile with the
         samples that have an active parent in it
-        (:func:`_ws_fwd_tiles_kernel`) — then gather the active parents."""
+        (:func:`_ws_fwd_tiles_kernel`) — then gather the active parents. With
+        ``sparse`` the CUDA-core slab kernel of :mod:`.sparse_io_cuda` (tile
+        height ``self._ws_sparse_tm[blk_idx]``, set by the dispatch) forms
+        only the products of the active pairs from the packed columns and
+        writes the packed output (exact fp32 W)."""
         group, _ = self._ws_slots[blk_idx]
         _, _, _, _, _NB, NB_ch, BS, CBS = block
         B = sv_in.batch_size
         device = params.device
         H_in, H_out = group.H_in, group.H_out
+        if sparse:
+            TMS = self._ws_sparse_tm[blk_idx]
+            n_m = -(-H_out // TMS)
+            K = sv_in.total_nnz
+            _KS, nsplit = _sio_cuda.slab_shape(H_in, TMS, _WS_SPARSE_SLAB_BYTES)
+            ent = _ws_scratch("sp_ent", (n_m, 2 * B), device, torch.int32)
+            cnt = _ws_scratch("sp_cnt", (n_m,), device, torch.int32)
+            xp = _ws_scratch("sp_xpack", (B, 2 * K), device, torch.int32)
+            cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+            _sio_cuda.ws_slab_forward(
+                sv_out.values, params, group.pid_start, sv_in, sv_out, max_val,
+                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS,
+                slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
+                min_blocks=_WS_SPARSE_SLAB_MINB,
+            )
+            return
         rnd = _WS_PRECISION == "tf32"
         w, w_start = group.weights(params)
 
