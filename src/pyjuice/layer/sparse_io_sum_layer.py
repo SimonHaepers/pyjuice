@@ -524,6 +524,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
         self._ws_in_backward = False
         self._ws_sparse_tm: Dict[int, int] = {}       # block -> tile height of the sparse forward
         self._ws_sparse_tm_bwd: Dict[int, int] = {}   # ... and of the sparse element-flow backward
+        self._ws_fraction_memo: Dict[tuple, Optional[object]] = {}
 
     def __repr__(self) -> str:
         return (
@@ -887,6 +888,24 @@ class SparseIOSumLayer(SparseInputSumLayer):
             self._ws_sparse_tm[blk_idx] = static_ctx.ws_decisions[key + ("tm",)]
         return use
 
+    def _ws_fraction_cached(self, kind: str, blk_idx: int, static_ctx, backward: bool):
+        """:meth:`_ws_tiles_fraction` / :meth:`_ws_sparse_fraction`, memoised
+        per block, direction and masked-ness of the variable they read: they
+        depend on the emission masses only through
+        :meth:`SparseCategorical.expected_col_tiles`, which caches its first
+        weighted estimate anyway, and an eager backward asks once per block
+        and step (tens of microseconds each, which a host-bound step at H=2k
+        feels)."""
+        prod, ns_idx = self._sparse_input_refs[blk_idx]
+        var = prod.nodes[ns_idx].var_id if backward else self._output_sparsity_var_ids[blk_idx]
+        masked = static_ctx is not None and static_ctx.is_masked(var)
+        key = (kind, blk_idx, backward, masked, _WS_SPARSE_SLAB_TM, _WS_TILES_TM, _WS_TILES_TK)
+        hit = self._ws_fraction_memo.get(key, self)
+        if hit is self:
+            fn = self._ws_tiles_fraction if kind == "tiles" else self._ws_sparse_fraction
+            hit = self._ws_fraction_memo[key] = fn(blk_idx, static_ctx, backward=backward)
+        return hit
+
     def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None,
                            backward: bool = False) -> Optional[float]:
         """Expected fraction of the tiles of the tiles pass a sample touches
@@ -1215,6 +1234,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if not group.eligible:
             return None
         B = sv_in.batch_size
+        if _WS_MODE != "always" and (B < 2 or group.H_in * group.H_out < _WS_MIN_W):
+            return None      # :func:`_ws_dispatch`'s gather rule, before the host-side estimates below
         avg_out = 0.0
         if sv_in.static or sv_out.static:
             avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
@@ -1225,14 +1246,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # the tiles passes' expected tile fraction (parents of the forward,
         # children of the backward) comes from the model: the batch's tile
         # counts live on the device
-        f_tiles = self._ws_tiles_fraction(blk_idx, static_ctx, backward=self._ws_in_backward)
+        f_tiles = self._ws_fraction_cached("tiles", blk_idx, static_ctx, self._ws_in_backward)
         TM, TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
         if TM is None:
             n_tiles = None
         else:
             n_tiles = group.H_in // TK if self._ws_in_backward else group.H_out // TM
         bwd = self._ws_in_backward
-        f_sparse = self._ws_sparse_fraction(blk_idx, static_ctx, backward=bwd)
+        f_sparse = self._ws_fraction_cached("sparse", blk_idx, static_ctx, bwd)
         if sv_in.static or sv_out.static:
             k_out = avg_out
         else:
