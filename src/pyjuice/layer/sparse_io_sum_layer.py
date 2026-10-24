@@ -842,6 +842,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
         warmup and capture dispatch."""
         key = (id(self), blk_idx)
         if key in static_ctx.ws_decisions:
+            if static_ctx.ws_decisions[key] == "sparse":
+                self._ws_sparse_tm[blk_idx] = static_ctx.ws_decisions[key + ("tm",)]
             return static_ctx.ws_decisions[key]
         use = None
         ws = self._ws_slots[blk_idx]
