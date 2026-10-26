@@ -159,6 +159,12 @@ recalibrated 2026-10-23 on the full pass's measured scaling, 2.0 / 3.5 /
 6.9 / 13.6x its B=64 time at B=256 / 512 / 1024 / 2048 on the 8k chains and
 2.2 / 4.2x at 16k (140 TFLOP/s at B >= 512)."""
 
+_WS_PFLOW_DEFER = os.environ.get("PYJUICE_SPARSE_IO_WS_PFLOW_DEFER", "1") == "1"
+"""Deferred param-flow GEMM: accumulate every flush's ``Gt @ Xt^T`` into one ``[H_out, H_in]``
+buffer per group (cuBLAS ``beta = 1``) and multiply by W once at the pass end, instead of
+running the W epilogue (two reads and a write of an ``H^2`` panel) at every flush; costs one
+``H^2`` fp32 buffer per group (W is the same for the whole pass)."""
+
 _WS_FLUSH_PANEL_ELEMS = 1 << 26
 """Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
 GEMM materialises at a time (256 MB fp32)."""
@@ -272,6 +278,34 @@ if os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"):
                              for t in (1, 2, 4, 8, 16)}
 _WS_SPARSE_SLAB_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_MINB", "3"))
 """CTAs per SM the compiler budgets registers for (``__launch_bounds__``)."""
+_WS_SPARSE_SLAB_GL = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_GL", "32"))
+"""Lanes that walk one (sample, tile, range) item: 32 / 16 / 8 / 4, so a warp
+works on ``32 / GL`` items at once."""
+_WS_SPARSE_SLAB_SWZ = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_SWZ", "1") == "1"
+"""8 / 16-row slabs of the slab-order copies stored with the 32B / 64B swizzle (16-byte chunk
+``q ^ (row bits)``): a warp's 16-byte reads of one 4-row quarter of random children spread
+over all eight bank groups (unswizzled 8-row slabs use four: 7-way conflicts, 2026-10-26)."""
+_WS_SPARSE_SLAB_NATIVE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NATIVE", "1") == "1"
+"""The forward reads its W slabs from a per-pass copy of W in slab order (bulk copies, any tile
+height, no sector over-fetch) instead of with TMA boxes from W itself; one ``H^2`` buffer, the
+size of the rounded copy the tensor-core passes keep. The TMA boxes of 16 / 32-byte rows
+were the forward's limit at small batches (8k d0.01 B=64: 14.5 -> 9.1 ms per batch, at the
+HBM rate; 16k B=512: 109 -> 84 ms, 2026-10-26)."""
+_WS_SPARSE_SLAB_NATIVE_BWD = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NATIVE_BWD", "1") == "1"
+"""The same for the element-flow (and fused param-flow) backward: slabs ``[KS parents][TMS
+children]`` from a per-pass copy, one 16-byte read per 4-child quarter instead of four."""
+_WS_SPARSE_SLAB_STATIC = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_STATIC", "1") == "1"
+"""Items handed to the warps round-robin instead of through a shared counter."""
+_WS_SPARSE_PFLOW = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PFLOW", "gemm")
+"""Parameter flows of a block on the sparse dispatch: ``"fused"`` — the
+backward slab kernel accumulates them over the active pairs in shared memory
+and adds them to the param flows itself (no stash, no dense GEMM; ``"fixed"``:
+the same in 32-bit fixed point with native shared atomics, deterministic); ``"gemm"``
+— the deferred dense GEMM of :class:`_WSGroup` like the tensor-core passes."""
+_WS_SPARSE_PF_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_KB", "48")) * 1024
+"""W slab of the fused param-flow backward (the accumulator doubles it)."""
+_WS_SPARSE_PF_NWARP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_NWARP", "16"))
+_WS_SPARSE_PF_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_MINB", "2"))
 _WS_SPARSE_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_MIN_BATCH", "32"))
 """Smallest batch ``"auto"`` considers the sparse forward at: the cost model
 below was fitted from B=64 on; smaller batches keep the passes calibrated
@@ -878,7 +912,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
                                f_tiles=self._ws_tiles_fraction(blk_idx, static_ctx),
                                BB=BB, n_tiles=group.H_out // TM if TM else None,
                                n_sm=_num_sms(params.device), f_sparse=f_sparse)
-            if use is not None and not group.ensure_ready(params, B, need_stash=False):
+            if use is not None and not group.ensure_ready(params, B, need_stash=False,
+                                                          w_copy=use != "sparse"):
                 use = None
             if use == "sparse":
                 static_ctx.ws_decisions[key + ("tm",)] = _ws_sparse_plan(
@@ -1262,7 +1297,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
         use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
                            f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device),
                            f_sparse=f_sparse, sparse_k=k_visit, sparse_bwd=bwd)
-        if use is not None and not group.ensure_ready(params, B, need_stash):
+        if use == "sparse":
+            # the sparse kernels read W itself; fused param flows need no stash
+            ready = group.ensure_ready(params, B, need_stash and _WS_SPARSE_PFLOW == "gemm", w_copy=False)
+        else:
+            ready = use is None or group.ensure_ready(params, B, need_stash)
+        if not ready:
             use = None
         if use == "sparse":
             tm = _ws_sparse_plan(B, group.H_in, group.H_out, k_visit, f_sparse, bwd)[1]
@@ -1297,11 +1337,14 @@ class SparseIOSumLayer(SparseInputSumLayer):
             cnt = _ws_scratch("sp_cnt", (n_m,), device, torch.int32)
             xp = _ws_scratch("sp_xpack", (B, 2 * K), device, torch.int32)
             cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+            wslab = (group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, _WS_SPARSE_SLAB_SWZ, BS)
+                     if _WS_SPARSE_SLAB_NATIVE else None)
             _sio_cuda.ws_slab_forward(
                 sv_out.values, params, group.pid_start, sv_in, sv_out, max_val,
-                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS,
+                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS, wslab=wslab,
                 slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
-                min_blocks=_WS_SPARSE_SLAB_MINB,
+                min_blocks=_WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
+                swz=_WS_SPARSE_SLAB_SWZ, static=_WS_SPARSE_SLAB_STATIC,
             )
             return
         rnd = _WS_PRECISION == "tf32"
@@ -1379,11 +1422,13 @@ class SparseIOSumLayer(SparseInputSumLayer):
             "WS backward needs the fused per-sample sv_in.max_val from the "
             "upstream prod layer's re-forward."
         )
-        w, w_start = group.weights(params)
+        fused_pf = sparse and param_flows is not None and _WS_SPARSE_PFLOW in ("fused", "fixed")
+        # the sparse kernels read W itself (exact fp32), not the rounded copy
+        w, w_start = (params, group.pid_start) if sparse else group.weights(params)
 
         if sparse:
             gd = None
-            if param_flows is not None:            # the stash of the deferred param-flow GEMM only
+            if param_flows is not None and not fused_pf:   # the stash of the deferred param-flow GEMM only
                 gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
                 _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
                     gt, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
@@ -1406,7 +1451,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 gt.stride(0), col0,
                 BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=param_flows is not None, WRITE_D=True,
             )
-        if param_flows is not None:
+        if param_flows is not None and not fused_pf:
             _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
                 xt, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
                 sv_in.values.stride(0), 1, xt.stride(0), col0,
@@ -1416,16 +1461,23 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if sparse:
             TMS = self._ws_sparse_tm_bwd[blk_idx]
             n_t = -(-H_in // TMS)
-            _KS, nsplit = _sio_cuda.slab_shape(H_out, TMS, _WS_SPARSE_SLAB_BYTES)
+            slab_bytes = _WS_SPARSE_PF_BYTES if fused_pf else _WS_SPARSE_SLAB_BYTES
+            _KS, nsplit = _sio_cuda.slab_shape(H_out, TMS, slab_bytes)
             ent = _ws_scratch("sp_ent", (n_t, 2 * B), device, torch.int32)
             cnt = _ws_scratch("sp_cnt", (n_t,), device, torch.int32)
             xp = _ws_scratch("sp_xpack", (B, 2 * sv_out.total_nnz), device, torch.int32)
             cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+            wslab = (group.slab_copy(params, TMS, slab_bytes, _WS_SPARSE_SLAB_SWZ, BS, bwd=True)
+                     if _WS_SPARSE_SLAB_NATIVE_BWD else None)
             _sio_cuda.ws_slab_backward(
                 sv_flow_in.values, params, group.pid_start, sv_in, sv_out, sv_flow_out, max_val,
-                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS,
-                slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
-                min_blocks=_WS_SPARSE_SLAB_MINB,
+                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS, slab_bytes=slab_bytes,
+                wslab=wslab, swz=_WS_SPARSE_SLAB_SWZ,
+                NWARP=_WS_SPARSE_PF_NWARP if fused_pf else _WS_SPARSE_SLAB_NWARP.get(TMS, 16),
+                min_blocks=_WS_SPARSE_PF_MINB if fused_pf else _WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
+                static=_WS_SPARSE_SLAB_STATIC,
+                pflow=param_flows if fused_pf else None, pf_start=group.pfid_start, pf_neg=negate_pflows,
+                pf_fixed=_WS_SPARSE_PFLOW == "fixed",
             )
             return
 
@@ -1478,6 +1530,7 @@ _WS_VEC = 256
 
 _WS_SCRATCH: Dict[Tuple[str, torch.device], torch.Tensor] = {}
 _WS_W_OWNER: Dict[torch.device, Tuple["_WSGroup", int]] = {}
+_WS_SLAB_OWNER: Dict[torch.device, tuple] = {}
 _WS_NUM_SMS: Dict[torch.device, int] = {}
 
 
@@ -1616,6 +1669,9 @@ class _WSGroup:
         # tl.dot needs every tile dim >= 16; tiles must divide the PC blocks.
         self.eligible = BS % 16 == 0 and CBS % 16 == 0
         self._w_valid = False
+        self._slab_valid = False
+        self._s: Optional[torch.Tensor] = None      # deferred-epilogue accumulator (_WS_PFLOW_DEFER)
+        self._s_dirty = False
         self._gt: Optional[torch.Tensor] = None
         self._xt: Optional[torch.Tensor] = None
         self._B = 0
@@ -1628,6 +1684,10 @@ class _WSGroup:
         rounded copy on next use. Unflushed factors of an abandoned pass are
         discarded. Reserved slots are zeroed before reuse."""
         self._w_valid = False
+        self._slab_valid = False
+        if self._s_dirty:            # an abandoned pass left flushes in the accumulator
+            self._s.zero_()
+            self._s_dirty = False
         self._used = 0
         self._negate = None
 
@@ -1651,22 +1711,41 @@ class _WSGroup:
             self._w_valid = True
         return buf, 0
 
-    def ensure_ready(self, params: torch.Tensor, B: int, need_stash: bool) -> bool:
+    def slab_copy(self, params: torch.Tensor, TMS: int, slab_bytes: int, swz: bool, BS: int,
+                  bwd: bool = False) -> torch.Tensor:
+        """W in the sparse forward's (``bwd``: backward's) slab order
+        (:func:`.sparse_io_cuda.slab_wcopy`), a process-wide buffer rebuilt once per pass
+        (or when another group, direction or slab shape used it)."""
+        device = params.device
+        n = _sio_cuda.slab_copy_numel(self.H_in, self.H_out, TMS, slab_bytes, bwd)
+        buf = _ws_scratch("w_slab", (n,), device)
+        tag = (self, buf.data_ptr(), TMS, slab_bytes, swz, bwd)
+        if not (self._slab_valid and _WS_SLAB_OWNER.get(device) == tag):
+            _sio_cuda.slab_wcopy(buf, params, self.pid_start, self.H_in, self.H_out, BS, TMS,
+                                 slab_bytes, swz, bwd)
+            _WS_SLAB_OWNER[device] = tag
+            self._slab_valid = True
+        return buf
+
+    def ensure_ready(self, params: torch.Tensor, B: int, need_stash: bool, w_copy: bool = True) -> bool:
         """Allocate this group's WS buffers up front — the per-pass rounded W
-        copy (``H^2`` floats) and, when ``need_stash``, the deferred param-flow
+        copy (``H^2`` floats; not for the sparse kernels, ``w_copy=False``, which
+        read W itself) and, when ``need_stash``, the deferred param-flow
         stash (``(H_out + H_in) * chunk_slots * B`` floats). Returns ``False``
         after disabling the group if they do not fit, so that enabling WS by
         default can never turn a run that used to fit into an OOM crash; the
         blocks then stay on the gather kernels for the rest of the session.
         """
         try:
-            if _WS_PRECISION == "tf32":
+            if _WS_PRECISION == "tf32" and w_copy:
                 _ws_scratch("w_rn", (self.H_out * self.H_in,), params.device)
             if need_stash:
                 self._ensure_stash(B, params.device)
+                if _WS_PFLOW_DEFER and self._s is None:
+                    self._s = torch.zeros(self.H_out, self.H_in, dtype=torch.float32, device=params.device)
         except torch.cuda.OutOfMemoryError:
             self.eligible = False
-            self._gt = self._xt = None
+            self._gt = self._xt = self._s = None
             _WS_SCRATCH.pop(("w_rn", params.device), None)
             extra = (self.H_out * self.H_in
                      + (self.H_out + self.H_in) * self._stash_slots(B) * B) * 4 / 2 ** 30
@@ -1721,12 +1800,17 @@ class _WSGroup:
         self._used += 1
         return self._gt, self._xt, col0
 
-    def flush(self, params: torch.Tensor, param_flows: torch.Tensor) -> None:
-        """Accumulate this chunk's Gt @ Xt.T into parameter flows.
+    def flush(self, params: torch.Tensor, param_flows: torch.Tensor, final: bool = False) -> None:
+        """Accumulate this chunk's Gt @ Xt.T into parameter flows (with
+        :data:`_WS_PFLOW_DEFER` into the group's accumulator, which ``final``,
+        the pass end, multiplies by W into the parameter flows and zeroes).
 
         Row panels also bound the GEMM output temporary. The last chunk can
         be smaller than capacity; cuBLAS receives its true reduction extent.
         """
+        if _WS_PFLOW_DEFER and self._s is not None:
+            self._flush_deferred(params, param_flows, final)
+            return
         if not self._used:
             return
         columns = self._used * self._B
@@ -1753,6 +1837,29 @@ class _WSGroup:
             torch.backends.cuda.matmul.allow_tf32 = prev
         self._used = 0
         self._negate = None
+
+    def _flush_deferred(self, params: torch.Tensor, param_flows: torch.Tensor, final: bool) -> None:
+        if self._used:
+            columns = self._used * self._B
+            prev = torch.backends.cuda.matmul.allow_tf32
+            torch.backends.cuda.matmul.allow_tf32 = _WS_PRECISION == "tf32"
+            try:
+                self._s.addmm_(self._gt[:, :columns], self._xt[:, :columns].t(), beta=1.0,
+                               alpha=-1.0 if self._negate else 1.0)
+            finally:
+                torch.backends.cuda.matmul.allow_tf32 = prev
+            self._s_dirty = True
+            self._used = 0
+            self._negate = None
+        if final and self._s_dirty:
+            TMe = min(64, self.BS)
+            TKe = min(64, self.CBS)
+            _ws_pflow_epilogue_kernel[(self.H_out // TMe, self.H_in // TKe)](
+                param_flows, params, self._s, 0, self.pid_start, self.pfid_start,
+                self.H_in, NB_ch=self.NB_ch, BS=self.BS, CBS=self.CBS,
+                TM=TMe, TK=TKe, NEGATE=False, ZERO_S=True,
+            )
+            self._s_dirty = False
 
 
 def build_ws_groups(inner_layer_groups) -> List[_WSGroup]:
@@ -2775,7 +2882,8 @@ def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, n
 @triton.jit(do_not_specialize=["r0", "pid_start", "pfid_start"])
 def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H_in,
                               NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                              TM: tl.constexpr, TK: tl.constexpr, NEGATE: tl.constexpr):
+                              TM: tl.constexpr, TK: tl.constexpr, NEGATE: tl.constexpr,
+                              ZERO_S: tl.constexpr = False):
     """``param_flows[(h, c)] += W[(h, c)] * S[h - r0, c]`` for one
     ``[rows, H_in]`` panel ``S = Gt[r0:r0+rows] @ Xt^T`` of the deferred
     param-flow GEMM (same ``(pb*NB_ch + cb)*CBS*BS + cs*BS + w`` layout for
@@ -2790,8 +2898,10 @@ def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H
     cs0 = c0 % CBS
     offs_m = tl.arange(0, TM)
     offs_k = tl.arange(0, TK)
-    s = tl.load(s_ptr + (pid_m * TM + offs_m).to(tl.int64)[:, None] * H_in
-                + (c0 + offs_k)[None, :])
+    s_off = (pid_m * TM + offs_m).to(tl.int64)[:, None] * H_in + (c0 + offs_k)[None, :]
+    s = tl.load(s_ptr + s_off)
+    if ZERO_S:                  # the deferred accumulator starts the next pass at zero
+        tl.store(s_ptr + s_off, tl.zeros_like(s))
     off = ((pb.to(tl.int64) * NB_ch + cb) * (CBS * BS)
            + (cs0 + offs_k)[None, :] * BS + (w0 + offs_m)[:, None])
     upd = tl.load(w_ptr + pid_start + off) * s

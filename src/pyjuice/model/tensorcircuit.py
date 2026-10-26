@@ -839,7 +839,7 @@ class TensorCircuit(nn.Module):
             # path: one GEMM per tied transition matrix for the whole pass.
             if compute_param_flows:
                 for ws_group in self._sparse_io_ws_groups:
-                    ws_group.flush(self.params, self.param_flows)
+                    ws_group.flush(self.params, self.param_flows, final=True)
 
             # Compute backward pass for all input layers
             if not _inner_layers_only:

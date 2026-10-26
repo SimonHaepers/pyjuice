@@ -6,8 +6,8 @@ packed output. It must give the gather path's log-likelihoods (and, through
 them, flows) at every batch size, eagerly and under a CUDA graph, on state
 counts that are not powers of two, with the slab copied by TMA and by 4-byte
 ``cp.async``, with empty columns and masked variables, on a circuit that is
-not a chain, for every kernel configuration; blocks with unsorted columns must
-not take it.
+not a chain, for every kernel configuration (slab sources, swizzle, item
+assignment, parameter-flow paths); blocks with unsorted columns must not take it.
 """
 from __future__ import annotations
 
@@ -184,6 +184,39 @@ def test_sparse_knobs(monkeypatch, knobs, loader):
     torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
     _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
     _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+
+
+@pytest.mark.parametrize("opts", [
+    dict(SLAB_NATIVE=False, SLAB_NATIVE_BWD=False, SLAB_STATIC=False),   # TMA boxes of W, shared item counter
+    dict(SLAB_NATIVE=True, SLAB_NATIVE_BWD=True, SLAB_SWZ=False),        # slab-order copies, unswizzled
+    dict(SLAB_TM=8, SLAB_SWZ=True, SLAB_GL=16),                           # 8-row swizzled slabs, 2 items per warp
+    dict(SLAB_TM=16, SLAB_SWZ=True, SLAB_BYTES=6144, SLAB_NWARP=12, SLAB_MINB=2),   # 64B swizzle, 3 ranges
+    dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_NATIVE_BWD=False),   # copy forward, TMA backward, 8 ranges
+    dict(PFLOW="fused"),                                                 # param flows in the backward slab kernel
+    dict(PFLOW="fixed", SLAB_TM=8),                                      # ... in 32-bit fixed point
+    dict(PFLOW="fixed", SLAB_TM=2, PF_BYTES=1024, PF_NWARP=4, PF_MINB=1),   # 2-row tiles, several parent ranges
+])
+@pytest.mark.parametrize("defer", [True, False])
+def test_sparse_slab_options(monkeypatch, opts, defer):
+    """The slab sources (TMA boxes of W, or the per-pass slab-order copies of either
+    direction, swizzled or not), the item assignment, the lanes per item and the
+    parameter-flow paths (the deferred dense GEMM with or without the deferred
+    epilogue; fp32 or fixed-point accumulation in the backward slab kernel) give
+    the gather path's LLs and flows."""
+    pc = _build(256, 60, 5, 128, 0.3, seed=3)
+    data = torch.randint(0, 60, (40, 5), device=DEV)
+    _set(monkeypatch, "never")
+    ref = _pass(pc, data)
+    monkeypatch.setattr(sio, "_WS_PFLOW_DEFER", defer)
+    calls = _count(monkeypatch)
+    _set(monkeypatch, "always", "ieee", sparse=True, **opts)
+    got = _pass(pc, data)
+    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+    got2 = _pass(pc, data)                       # a second pass reuses the copies / accumulator
+    _assert_flows_close(got2[1], ref[1], 1e-4, "transition param flows, second pass")
 
 
 def test_sparse_empty_columns(monkeypatch):
