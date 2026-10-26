@@ -20,6 +20,7 @@ import ctypes.util
 import glob
 import hashlib
 import os
+import tempfile
 import threading
 from typing import Dict, Optional, Sequence, Tuple
 
@@ -179,16 +180,27 @@ def compile_cubin(source: str, name: str, arch: str, options: Sequence[str] = ()
     """Compile ``source`` to a cubin for ``arch`` (``"sm_90"``), through the
     on-disk cache."""
     nvrtc = _nvrtc()
-    opts = [f"--gpu-architecture={arch}", "-std=c++17", *options]
+    lineinfo = os.environ.get("PYJUICE_NVRTC_LINEINFO", "0") == "1"
+    opts = [f"--gpu-architecture={arch}", "-std=c++17", *options] + (["--generate-line-info"] if lineinfo else [])
     key = hashlib.sha256("\0".join([source, name, *opts, repr(nvrtc_version())]).encode()).hexdigest()
     cache = os.environ.get("PYJUICE_NVRTC_CACHE", os.path.expanduser("~/.cache/pyjuice/nvrtc"))
+    prog_name = f"{name}.cu"
+    if lineinfo:
+        # ``PYJUICE_NVRTC_LINEINFO=1`` (profiling): the line info names this file, so
+        # ``ncu --import-source yes`` finds the source the cubin was built from
+        src_dir = os.path.join(cache or tempfile.gettempdir(), "src")
+        os.makedirs(src_dir, exist_ok=True)
+        prog_name = os.path.join(src_dir, f"{name}_{key[:16]}.cu")
+        if not os.path.exists(prog_name):
+            with open(prog_name, "w") as f:
+                f.write(source)
     path = os.path.join(cache, f"{key}.cubin") if cache else None
     if path and os.path.exists(path):
         with open(path, "rb") as f:
             return f.read()
     prog = ctypes.c_void_p()
     _nvrtc_check(nvrtc, nvrtc.nvrtcCreateProgram(ctypes.byref(prog), source.encode(),
-                                                 f"{name}.cu".encode(), 0, None, None))
+                                                 prog_name.encode(), 0, None, None))
     try:
         c_opts = (ctypes.c_char_p * len(opts))(*[o.encode() for o in opts])
         _nvrtc_check(nvrtc, nvrtc.nvrtcCompileProgram(prog, len(opts), c_opts), prog)
