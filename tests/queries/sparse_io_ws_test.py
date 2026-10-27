@@ -238,13 +238,14 @@ def test_ws_auto_skips_small_circuits(monkeypatch):
 
 def test_ws_small_w_backward_takes_full_pass(monkeypatch):
     """Below ``_WS_MIN_W`` the backward with parameter flows takes the full WS
-    pass from ``_WS_SMALL_W_BWD_BATCH`` samples on (the gather backward's
-    atomics grow with the batch, the full pass's work barely), the forward
-    stays on the gather kernels; LLs and flows match the gather path."""
+    pass from ``_WS_SMALL_W_BWD_BATCH`` samples on when gathering costs more
+    (the gather backward's atomics grow with the pairs, the full pass's work
+    barely), the forward stays on the gather kernels; LLs and flows match the
+    gather path."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     H, V, T = 1024, 400, 4
-    pc = _build(H, V, T, 1024, 0.01, seed=8)
+    pc = _build(H, V, T, 1024, 0.3, seed=8)            # enough pairs for gathering to cost more
     assert H * H < sio._WS_MIN_W
     x = torch.randint(0, V, (64, T), device="cuda:0")
     _set(monkeypatch, "never")
@@ -265,6 +266,7 @@ def test_ws_small_w_backward_takes_full_pass(monkeypatch):
     assert d(256, 2048, 2048, 256 * k * k, k, True) is None
     for B in (512, 1024, 2048):
         assert d(B, 2048, 2048, B * k * k, k, True) == "full", B
+    assert d(1024, 2048, 2048, 1024 * 41 * 41, 41, True) is None      # few pairs: gathering stays cheaper
 
 
 def _skewed_csc(H, V, n_dense, tail_nnz, seed):
@@ -391,7 +393,9 @@ def test_ws_skips_ineligible_blocks(monkeypatch):
 
 def test_ws_dispatch_cost_model(monkeypatch):
     """The dispatch rule on the measured map (2026-10-19, trained wikitext
-    chains; ``k`` = active children per sample): no WS while W sits in L2;
+    chains; ``k`` = active children per sample): no WS forward while W sits in L2,
+    its backward with parameter flows on the full pass from ``_WS_SMALL_W_BWD_BATCH``
+    samples on unless W is so sparse that gathering stays cheaper (2026-10-27);
     at H=16k the active-children pass for small batches, the full pass from
     B=16; the full pass from B=2 once a sample activates half the children
     (32k _early chains); gather at any batch for a 99 %-sparse H=4096 chain,
@@ -400,7 +404,9 @@ def test_ws_dispatch_cost_model(monkeypatch):
     d = sio._ws_dispatch
     for B in (2, 16, 64, 1024):
         assert d(B, 2048, 2048, B * 339 * 339, 339, False) is None
-        assert d(B, 2048, 2048, B * 339 * 339, 339, True) is None
+        assert d(B, 2048, 2048, B * 339 * 339, 339, True) == (
+            "full" if B >= sio._WS_SMALL_W_BWD_BATCH else None)
+    assert all(d(B, 2048, 2048, B * 41 * 41, 41, True) is None for B in (512, 8192))
     H, k = 16384, 1818                                   # 16384_d0.05
     assert [d(B, H, H, B * k * k, k, False) for B in (1, 2, 4, 8, 16, 64)] == \
         [None, "active", "active", "active", "full", "full"]

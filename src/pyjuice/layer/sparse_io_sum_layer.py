@@ -125,10 +125,12 @@ B=4096 (2026-10-27). The backward with parameter flows is the exception, from
 ``_WS_SMALL_W_BWD_BATCH`` samples on."""
 _WS_SMALL_W_BWD_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SMALL_W_BWD_BATCH", "512"))
 """Batch from which a block below ``_WS_MIN_W`` runs its backward with
-parameter flows on the full WS pass: the gather backward adds one atomic per
-pair, so its cost grows with the batch while the full pass's barely does. On
-the trained 2k d0.01 chain (2026-10-27, EM backward): gather 19 / 71 / 140 ms
-at B = 256 / 1024 / 2048, the full pass 23 / 18 / 31 ms."""
+parameter flows on the full WS pass when the cost model prices the gather
+backward above it: the gather backward adds one atomic per pair, so its cost
+grows with the batch while the full pass's barely does. On the trained 2k
+d0.01 chain (2026-10-27, EM backward): gather 19 / 71 / 140 ms at B = 256 /
+1024 / 2048, the full pass 23 / 18 / 31 ms (below B = 512 the full pass's
+launches outweigh it). A very sparse W (few pairs) stays on gather."""
 
 # Cost model of :func:`_ws_dispatch`, in units of one streamed W element of the
 # full WS pass (~2.9 TB/s on an H100 NVL). Calibrated 2026-10-19 on the trained
@@ -463,7 +465,9 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
     if _WS_MODE == "always":
         return ws
     if n_w < _WS_MIN_W and backward and B >= _WS_SMALL_W_BWD_BATCH:
-        return ws if forced else "full"
+        if forced:
+            return ws
+        return "full" if c_gather > c_full else None
     if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
         return None
     return ws
