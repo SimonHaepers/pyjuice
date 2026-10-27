@@ -89,6 +89,11 @@ _SLAB_SRC = r"""
 #ifndef STATIC
 #define STATIC 0
 #endif
+// AHEAD 2 (with STATIC): the list entry of the item after the next one is loaded one item
+// ahead, so the next item's child range (cofs, indexed by that entry) loads without waiting
+#ifndef AHEAD
+#define AHEAD 1
+#endif
 #define SWM (TMS == 16 ? 3 : 1)
 // BNAT: backward slabs from the slab-order copy (LOADER 9), [KS parents][TMS children]
 // (children contiguous, swizzled with SWZ) instead of TMA boxes [TMS children][BOXW parents]
@@ -131,6 +136,93 @@ ws_slab_pack(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cofs,
         const float x = expf(in_vals[(long long)b * in_stride + j] - fmaxf(max_val[b], -1e30f));
         xp[(long long)b * xp_stride + j] = make_int2((c % KS) * TMS * 4, __float_as_int(x));
     }
+}
+
+// Reorder every 32-entry row of the packed list of each (sample b, range s), xp[b, cofs[b, s]
+// + 32 k ..] in place, so that the four 8-lane phases of the walk's 16-byte slab reads hit
+// different bank groups where the row allows it (the sums do not depend on the order). The
+// phases are filled one after the other: one entry of every bank group left, then, while
+// slots are free, one more of the groups with the most entries left (ties: lower group);
+// within a phase by group, a group's entries in their order (on the 8k d0.01 chain: 1.33
+// wavefronts per conflict-free minimum instead of 1.60, the exact minimum 1.32). For
+// 16-byte slab rows (TMS 4: the forward, the backward from the slab-order copy) and GL 32.
+// Grid (cdiv(K + 32 NSPLIT, 256), B), one warp per row.
+extern "C" __global__ void __launch_bounds__(256)
+ws_slab_perm(int2* __restrict__ xp, long long xp_stride, const int* __restrict__ cofs)
+{
+    const int b = blockIdx.y, lane = threadIdx.x & 31;
+    int w = (blockIdx.x * 256 + threadIdx.x) >> 5;
+    const int* cb = cofs + (long long)b * (NSPLIT + 1);
+    int s = 0, j0 = 0, j1 = 0;
+    for (; s < NSPLIT; ++s) {
+        j0 = cb[s];
+        j1 = cb[s + 1];
+        const int nrows = (j1 - j0 + 31) >> 5;
+        if (w < nrows) break;
+        w -= nrows;
+    }
+    if (s == NSPLIT) return;                          // the whole warp
+    int2* row = xp + (long long)b * xp_stride + j0 + 32 * w;
+    const bool in = j0 + 32 * w + lane < j1;
+    const int2 v = in ? row[lane] : make_int2(0, 0);
+    const int key = (v.x >> 4) & 7;                   // bank group of the lane's 16-byte read
+    int cnt[8];
+    unsigned mine = 0u;
+    #pragma unroll
+    for (int g = 0; g < 8; ++g) {
+        const unsigned m = __ballot_sync(FULL, in && key == g);
+        cnt[g] = __popc(m);
+        if (g == key) mine = m;
+    }
+    const int rank = __popc(mine & ((1u << lane) - 1u));   // within the lane's bank group
+    // the phases' group counts t[] (the same in every lane) and the lane's position
+    int rem[8], n = 0;
+    #pragma unroll
+    for (int g = 0; g < 8; ++g) { rem[g] = cnt[g]; n += cnt[g]; }
+    int base = 0, before = 0, pos = 0;               // before: the group's entries in earlier phases
+    #pragma unroll
+    for (int p = 0; p < 4; ++p) {
+        int t[8];
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) t[g] = 0;
+        int m = min(8, n - base);
+        while (m > 0) {
+            int cand = 0;
+            #pragma unroll
+            for (int g = 0; g < 8; ++g) cand += rem[g] - t[g] > 0 ? 1 : 0;
+            unsigned pick = 0u;
+            if (cand <= m) {
+                #pragma unroll
+                for (int g = 0; g < 8; ++g) pick |= rem[g] - t[g] > 0 ? 1u << g : 0u;
+            } else {
+                for (int q = 0; q < m; ++q) {        // the m groups with the most entries left
+                    int best = 0, bv = 0;
+                    #pragma unroll
+                    for (int g = 0; g < 8; ++g) {
+                        const int left = ((pick >> g) & 1u) ? 0 : rem[g] - t[g];
+                        if (left > bv) { bv = left; best = g; }
+                    }
+                    pick |= 1u << best;
+                }
+            }
+            #pragma unroll
+            for (int g = 0; g < 8; ++g) t[g] += (pick >> g) & 1u;
+            m -= __popc(pick);
+        }
+        int off = 0, tk = 0, sum = 0;
+        #pragma unroll
+        for (int g = 0; g < 8; ++g) {
+            off += g < key ? t[g] : 0;
+            tk += g == key ? t[g] : 0;
+            sum += t[g];
+            rem[g] -= t[g];
+        }
+        if (rank >= before && rank < before + tk) pos = base + off + rank - before;
+        before += tk;
+        base += sum;
+    }
+    __syncwarp();
+    if (in) row[pos] = v;
 }
 
 #if !BWD
@@ -454,6 +546,10 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
         e = lst[i];
         cr = make_int2(cofs[(long long)e.x * (NSPLIT + 1) + sp], cofs[(long long)e.x * (NSPLIT + 1) + sp + 1]);
     }
+#if STATIC && AHEAD == 2
+    int2 en = make_int2(0, 0);                        // list entry of the next item
+    if (i + NWARP * IPW < n) en = lst[i + NWARP * IPW];
+#endif
     while (i0 < n) {
         const bool has = i < n;                       // a group past the list's end idles
         const int b = e.x, ps = e.y >> TMS;
@@ -467,10 +563,18 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
         n0 = __shfl_sync(FULL, n0, 0);
 #endif
         const int inext = n0 + grp;
+#if STATIC && AHEAD == 2
+        if (inext < n) {
+            e = en;
+            cr = make_int2(cofs[(long long)e.x * (NSPLIT + 1) + sp], cofs[(long long)e.x * (NSPLIT + 1) + sp + 1]);
+        }
+        if (inext + NWARP * IPW < n) en = lst[inext + NWARP * IPW];
+#else
         if (inext < n) {
             e = lst[inext];
             cr = make_int2(cofs[(long long)e.x * (NSPLIT + 1) + sp], cofs[(long long)e.x * (NSPLIT + 1) + sp + 1]);
         }
+#endif
 
         float a[TMS];
         #pragma unroll
@@ -748,36 +852,39 @@ def slab_smem(KS: int, TMS: int, pf: int = 0) -> int:
 
 def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
                  loader: int, min_blocks: int, bwd: bool = False, GL: int = 32,
-                 pf: int = 0, swz: bool = False, static: bool = False) -> tuple:
-    """``(lists, pack, main, finalize kernels, main smem bytes)`` of a block
+                 pf: int = 0, swz: bool = False, static: bool = False, ahead: int = 1) -> tuple:
+    """``(lists, pack, main, finalize, perm kernels, main smem bytes)`` of a block
     shape: the forward (tiles of parents, ranges of children) or with
     ``bwd`` the element-flow backward (tiles of children, ranges of
     parents); compiled on first use (cubins cached on disk). ``GL`` lanes
     walk one item (``32 / GL`` items per warp); ``pf`` (backward) accumulates the
     slab's parameter flows too (1 fp32, 2 fixed point); ``swz`` (slab-order copies,
     ``loader`` 9, 8 / 16-row tiles) reads swizzled rows; ``static`` hands the
-    items to the warps round-robin."""
-    assert GL in (4, 8, 16, 32) and not (pf and not bwd)
+    items to the warps round-robin, with ``ahead`` 2 loading the list entries two
+    items ahead. ``perm`` (``ws_slab_perm``) reorders the packed lists for fewer
+    bank conflicts of 16-byte slab rows."""
+    assert GL in (4, 8, 16, 32) and not (pf and not bwd) and ahead in (1, 2)
     assert not (swz and (loader != 9 or TMS not in (8, 16)))
-    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd, GL, pf, swz, static)
+    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd, GL, pf, swz, static, ahead)
     hit = _SLAB_KERNELS.get(key)
     if hit is None:
         smem = slab_smem(KS, TMS, pf)
         n_split = -(-(H_out if bwd else H_in) // KS)
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
                        NWARP=NWARP, LOADER=loader, MINB=min_blocks, BWD=int(bwd), BOXW=min(KS, 256),
-                       GL=GL, PF=int(pf), SWZ=int(swz), STATIC=int(static))
+                       GL=GL, PF=int(pf), SWZ=int(swz), STATIC=int(static), AHEAD=ahead)
         src = ("".join(f"#define {k} {v}\n" for k, v in defines.items())
                + f"#define NSPLIT_OVERRIDE {n_split}\n" + _SLAB_SRC)
         main = CudaKernel(src, "ws_slab_bwd" if bwd else "ws_slab_fwd", _SLAB_FWD_ARGS, max_shared=smem)
+        perm = CudaKernel(src, "ws_slab_perm", ["ptr", "i64", "ptr"])
         if bwd:
             hit = (CudaKernel(src, "ws_slab_lists", _SLAB_LIST_ARGS),
                    CudaKernel(src, "ws_slab_pack_g", _SLAB_PACK_G_ARGS), main,
-                   CudaKernel(src, "ws_slab_finalize_flow", _SLAB_FIN_FLOW_ARGS), smem)
+                   CudaKernel(src, "ws_slab_finalize_flow", _SLAB_FIN_FLOW_ARGS), perm, smem)
         else:
             hit = (CudaKernel(src, "ws_slab_lists", _SLAB_LIST_ARGS),
                    CudaKernel(src, "ws_slab_pack", _PACK_ARGS), main,
-                   CudaKernel(src, "ws_slab_finalize", _SLAB_FIN_ARGS), smem)
+                   CudaKernel(src, "ws_slab_finalize", _SLAB_FIN_ARGS), perm, smem)
         _SLAB_KERNELS[key] = hit
     return hit
 
@@ -826,7 +933,8 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
                     xp: torch.Tensor, cofs: torch.Tensor, B: int, H_in: int, H_out: int, BS: int,
                     TMS: int = 4, slab_bytes: int = 64 * 1024, NWARP: int = 16,
                     min_blocks: int = 3, GL: int = 32, swz: bool = False,
-                    static: bool = False, wslab: Optional[torch.Tensor] = None) -> None:
+                    static: bool = False, wslab: Optional[torch.Tensor] = None,
+                    ahead: int = 1, perm: bool = False) -> None:
     """Build the per-tile sample lists, pack the input columns and run the
     slab forward for one block, writing ``out_vals[b, i]`` (row stride
     ``out_vals.stride(0)``) for every active parent ``i`` of every sample;
@@ -835,10 +943,14 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
     ``[cdiv(H_out, TMS)]``), ``xp`` (int32 ``[B, >= 2 K_in]``), ``cofs``
     (int32 ``[B, NSPLIT + 1]``, :func:`slab_shape`). With ``wslab`` (W in slab
     order, :func:`slab_wcopy` with the same ``TMS`` / ``slab_bytes`` / ``swz``)
-    the slabs are read from it with bulk copies, any tile height. Graph-capturable,
-    no host sync."""
+    the slabs are read from it with bulk copies, any tile height. ``ahead`` 2 (with
+    ``static``) loads the list entries two items ahead; ``perm`` reorders the packed
+    input columns for fewer bank conflicts (4-row tiles, ``GL`` 32; ignored otherwise).
+    Graph-capturable, no host sync."""
     assert TMS in (1, 2, 4, 8, 16)
     KS, nsplit = slab_shape(H_in, TMS, slab_bytes)
+    perm = perm and TMS == 4 and GL == 32
+    ahead = ahead if static else 1
     assert sv_out.values.shape[-1] < 1 << (31 - TMS), "output columns too long for the list entries"
     n_m = -(-H_out // TMS)
     aligned = (TMS >= 4 and BS % TMS == 0 and (w.data_ptr() // 4 + w_start) % 4 == 0
@@ -848,8 +960,8 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
     swz = swz and wslab is not None and TMS in (8, 16)
     if wslab is not None:                             # slab-order copy of W: bulk loads
         loader, w, w_start = 9, wslab, 0
-    lists, pack, fwd, fin, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
-                                               GL=GL, swz=swz, static=static)
+    lists, pack, fwd, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
+                                                       GL=GL, swz=swz, static=static, ahead=ahead)
     K = sv_in.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
     assert ent.shape[0] >= n_m and ent.stride(0) == 2 * B and cnt.numel() >= n_m
@@ -870,6 +982,8 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
     pack((-(-(K + 1) // 256), B), (256,),
          [xp, xp.stride(0) // 2, cofs, sv_in.indices, sv_in.values, sv_in.values.stride(0),
           sv_in.col_starts, sv_in.nnz, max_val], device=device)
+    if perm:
+        perm_k((-(-(K + 32 * nsplit) // 256), B), (256,), [xp, xp.stride(0) // 2, cofs], device=device)
     fwd((nsplit, n_m), (NWARP * 32,),
         [out_vals, out_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
          ent, cnt, B, max_val, 0, tmap, max_val, 0, 0], shared_mem=smem, device=device)
@@ -884,7 +998,8 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
                      TMS: int = 4, slab_bytes: int = 64 * 1024, NWARP: int = 16,
                      min_blocks: int = 3, GL: int = 32, static: bool = False, pflow: Optional[torch.Tensor] = None,
                      pf_start: int = 0, pf_neg: bool = False, pf_fixed: bool = False,
-                     wslab: Optional[torch.Tensor] = None, swz: bool = False) -> None:
+                     wslab: Optional[torch.Tensor] = None, swz: bool = False,
+                     ahead: int = 1, perm: bool = False) -> None:
     """Element flows of one block: ``flow_vals[b, k] = exp(in[b, k] - max_b)
     * sum_h g[b, h] W[h, c_k]`` over the sample's active parents ``h`` (``g =
     nflow * exp(max_b - nmars)``), for every active child ``c_k`` — the slab
@@ -899,10 +1014,13 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
     with ``pf_fixed`` in 32-bit fixed point, three times, deterministic). With
     ``wslab`` (:func:`slab_wcopy` with ``bwd``, same ``TMS`` / ``slab_bytes`` /
     ``swz``) the slabs come from that copy with bulk loads, ``[KS parents][TMS
-    children]``: one 16-byte read per quarter instead of four.
+    children]``: one 16-byte read per quarter instead of four. ``ahead`` / ``perm`` as in
+    :func:`ws_slab_forward` (``perm`` only with ``wslab``: 16-byte rows).
     Graph-capturable, no host sync."""
     assert TMS in (1, 2, 4, 8, 16)
     KS, nsplit = slab_shape(H_out, TMS, slab_bytes)
+    perm = perm and TMS == 4 and GL == 32 and wslab is not None
+    ahead = ahead if static else 1
     assert sv_in.values.shape[-1] < 1 << (31 - TMS), "input columns too long for the list entries"
     boxw = min(KS, 256)
     n_t = -(-H_in // TMS)
@@ -914,8 +1032,9 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
         loader, w, w_start = 9, wslab, 0
     pf = 0 if pflow is None else (2 if pf_fixed else 1)
     assert pf != 2 or B < 1 << 14, "fixed-point param flows: fewer than 2^14 samples"
-    lists, pack, main, fin, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
-                                                bwd=True, GL=GL, pf=pf, static=static, swz=swz)
+    lists, pack, main, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
+                                                        bwd=True, GL=GL, pf=pf, static=static, swz=swz,
+                                                        ahead=ahead)
     K = sv_out.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
     assert ent.shape[0] >= n_t and ent.stride(0) == 2 * B and cnt.numel() >= n_t
@@ -937,6 +1056,8 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
          [xp, xp.stride(0) // 2, cofs, sv_out.indices, sv_out.col_starts, sv_out.nnz,
           sv_flow_out.values, sv_flow_out.values.stride(0), sv_out.values, sv_out.values.stride(0),
           max_val, sv_in.nnz], device=device)
+    if perm:
+        perm_k((-(-(K + 32 * nsplit) // 256), B), (256,), [xp, xp.stride(0) // 2, cofs], device=device)
     main((nsplit, n_t), (NWARP * 32,),
          [flow_vals, flow_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
           ent, cnt, B, sv_in.values, sv_in.values.stride(0), tmap,

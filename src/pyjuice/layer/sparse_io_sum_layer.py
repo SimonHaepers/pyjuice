@@ -296,6 +296,17 @@ _WS_SPARSE_SLAB_NATIVE_BWD = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NA
 children]`` from a per-pass copy, one 16-byte read per 4-child quarter instead of four."""
 _WS_SPARSE_SLAB_STATIC = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_STATIC", "1") == "1"
 """Items handed to the warps round-robin instead of through a shared counter."""
+_WS_SPARSE_SLAB_AHEAD = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_AHEAD", "1"))
+"""2: with the round-robin items, the slab kernels load each item's list entry two items ahead,
+so the child range of the next item (indexed by its entry) loads without a stall (ncu
+2026-10-26: 11 % of the stall samples at 8k d0.01, B=1024). Measured 2026-10-27: forward
+kernel -2 / -3 % at 8k B=1024 / 2048, +-2 % at 16k, EM step +-1 %: off by default."""
+_WS_SPARSE_SLAB_PERM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_PERM", "0") == "1"
+"""Reorder each 32-entry row of the packed child (parent) lists so that the walk's 8-lane phases
+of 16-byte slab reads hit different bank groups (4-row tiles; ncu 2026-10-26: 34 % of those
+reads' shared-memory wavefronts were bank conflicts at 8k d0.01, B=1024). Measured 2026-10-27:
+the forward / backward kernels -5 to -7 %, but the reorder kernel costs as much (5.6 ms per EM
+step at 8k B=1024, 9 ms at 16k B=512): EM step +-1 %, off by default."""
 _WS_SPARSE_PFLOW = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PFLOW", "gemm")
 """Parameter flows of a block on the sparse dispatch: ``"fused"`` — the
 backward slab kernel accumulates them over the active pairs in shared memory
@@ -1345,6 +1356,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
                 min_blocks=_WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
                 swz=_WS_SPARSE_SLAB_SWZ, static=_WS_SPARSE_SLAB_STATIC,
+                ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM,
             )
             return
         rnd = _WS_PRECISION == "tf32"
@@ -1475,7 +1487,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 wslab=wslab, swz=_WS_SPARSE_SLAB_SWZ,
                 NWARP=_WS_SPARSE_PF_NWARP if fused_pf else _WS_SPARSE_SLAB_NWARP.get(TMS, 16),
                 min_blocks=_WS_SPARSE_PF_MINB if fused_pf else _WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
-                static=_WS_SPARSE_SLAB_STATIC,
+                static=_WS_SPARSE_SLAB_STATIC, ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM,
                 pflow=param_flows if fused_pf else None, pf_start=group.pfid_start, pf_neg=negate_pflows,
                 pf_fixed=_WS_SPARSE_PFLOW == "fixed",
             )

@@ -195,6 +195,9 @@ def test_sparse_knobs(monkeypatch, knobs, loader):
     dict(PFLOW="fused"),                                                 # param flows in the backward slab kernel
     dict(PFLOW="fixed", SLAB_TM=8),                                      # ... in 32-bit fixed point
     dict(PFLOW="fixed", SLAB_TM=2, PF_BYTES=1024, PF_NWARP=4, PF_MINB=1),   # 2-row tiles, several parent ranges
+    dict(SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),                       # entries two items ahead, bank-group order
+    dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_AHEAD=2, SLAB_PERM=True),   # ... 8 ranges, short rows
+    dict(PFLOW="fixed", SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),        # ... with fixed-point param flows
 ])
 @pytest.mark.parametrize("defer", [True, False])
 def test_sparse_slab_options(monkeypatch, opts, defer):
@@ -217,6 +220,68 @@ def test_sparse_slab_options(monkeypatch, opts, defer):
     _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
     got2 = _pass(pc, data)                       # a second pass reuses the copies / accumulator
     _assert_flows_close(got2[1], ref[1], 1e-4, "transition param flows, second pass")
+
+
+def _bank_order(keys):
+    """Reference of ``ws_slab_perm`` for one row: the indices of the row's entries in their
+    new order. Phases of 8 filled one after the other with one entry of every bank group
+    left, then one more of the groups with the most entries left (ties: lower group);
+    within a phase by group, a group's entries in their order."""
+    left = {g: [i for i, k in enumerate(keys) if k == g] for g in range(8)}
+    out = []
+    while len(out) < len(keys):
+        m, t = min(8, len(keys) - len(out)), [0] * 8
+        while m:
+            cand = [g for g in range(8) if len(left[g]) - t[g] > 0]
+            if len(cand) > m:
+                cand = sorted(cand, key=lambda g: (t[g] - len(left[g]), g))[:m]
+            for g in cand:
+                t[g] += 1
+            m -= len(cand)
+        for g in range(8):
+            out += left[g][:t[g]]
+            left[g] = left[g][t[g]:]
+    return out
+
+
+def test_slab_perm_rows():
+    """``ws_slab_perm`` reorders each 32-entry row of every (sample, range) list
+    within the row as :func:`_bank_order` does: fewer bank-group conflicts of the
+    8-entry phases in total, none in a full row that allows none."""
+    H, TMS, KS, B = 256, 4, 64, 9
+    nsplit = H // KS
+    perm = sio_cuda.slab_kernels(H, H, 64, TMS, KS, 4, 9, 1)[4]
+    g = torch.Generator().manual_seed(5)
+    sizes = torch.randint(1, H, (B - 2,), generator=g).tolist() + [H, 0]   # random, full, empty column
+    cols = [torch.sort(torch.randperm(H, generator=g)[:n]).values for n in sizes]
+    K = max(len(c) for c in cols) + 1
+    xp = torch.zeros(B, 2 * K, dtype=torch.int32)
+    cofs = torch.zeros(B, nsplit + 1, dtype=torch.int32)
+    for b, c in enumerate(cols):
+        xp[b, 0:2 * len(c):2] = (c % KS) * TMS * 4
+        xp[b, 1:2 * len(c):2] = c.int()                      # payload: the child itself
+        cofs[b] = torch.searchsorted(c, torch.arange(nsplit + 1) * KS).int()
+    xp_d, cofs_d = xp.to(DEV), cofs.to(DEV)
+    perm((-(-(K + 32 * nsplit) // 256), B), (256,), [xp_d, xp_d.stride(0) // 2, cofs_d], device=DEV)
+    out = xp_d.cpu()
+
+    def conflicts(keys):   # extra wavefronts of the 8-lane phases of one row
+        return sum(max(torch.bincount(keys[p:p + 8], minlength=8).tolist()) - 1
+                   for p in range(0, len(keys), 8) if len(keys[p:p + 8]))
+    total_before = total_after = 0
+    for b, c in enumerate(cols):
+        for s in range(nsplit):
+            j0, j1 = int(cofs[b, s]), int(cofs[b, s + 1])
+            for r0 in range(j0, j1, 32):
+                r1 = min(r0 + 32, j1)
+                before, after = xp[b, 2 * r0:2 * r1].view(-1, 2), out[b, 2 * r0:2 * r1].view(-1, 2)
+                kb, ka = ((before[:, 0] >> 4) & 7).long(), ((after[:, 0] >> 4) & 7).long()
+                assert torch.equal(after, before[_bank_order(kb.tolist())]), (b, s, r0)
+                total_before, total_after = total_before + conflicts(kb), total_after + conflicts(ka)
+                if len(ka) == 32 and torch.bincount(ka, minlength=8).max() <= 4:
+                    assert conflicts(ka) == 0
+        assert (out[b, 2 * len(c):] == 0).all()
+    assert total_after < total_before
 
 
 def test_sparse_empty_columns(monkeypatch):
