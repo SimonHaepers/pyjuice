@@ -117,10 +117,18 @@ exact fp32 FMA, ~3x slower than tf32 but still memory-bound at B=64."""
 
 _WS_MIN_W = 1 << 24
 """Elements of W (``H_out * H_in``) below which a block stays on the gather
-kernels at any batch size: a smaller W (64 MB fp32 at 2^24) sits in the L2
-cache, where the gather kernels read it as cheaply as a streaming pass. On the
-trained H=2048 wikitext chains gather beats every WS variant up to B=64
-(forward 1.0 vs 1.7 ms, EM step 15 vs 26 ms at B=64)."""
+kernels: a smaller W (64 MB fp32 at 2^24) sits in the L2 cache, where the
+gather kernels read it as cheaply as a streaming pass. On the trained H=2048
+wikitext chains gather beats every WS variant up to B=64 (forward 1.0 vs
+1.7 ms, EM step 15 vs 26 ms at B=64), the gather forward at every batch up to
+B=4096 (2026-10-27). The backward with parameter flows is the exception, from
+``_WS_SMALL_W_BWD_BATCH`` samples on."""
+_WS_SMALL_W_BWD_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SMALL_W_BWD_BATCH", "512"))
+"""Batch from which a block below ``_WS_MIN_W`` runs its backward with
+parameter flows on the full WS pass: the gather backward adds one atomic per
+pair, so its cost grows with the batch while the full pass's barely does. On
+the trained 2k d0.01 chain (2026-10-27, EM backward): gather 19 / 71 / 140 ms
+at B = 256 / 1024 / 2048, the full pass 23 / 18 / 31 ms."""
 
 # Cost model of :func:`_ws_dispatch`, in units of one streamed W element of the
 # full WS pass (~2.9 TB/s on an H100 NVL). Calibrated 2026-10-19 on the trained
@@ -454,6 +462,8 @@ def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
             ws, c_ws = "sparse", c_sparse
     if _WS_MODE == "always":
         return ws
+    if n_w < _WS_MIN_W and backward and B >= _WS_SMALL_W_BWD_BATCH:
+        return ws if forced else "full"
     if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
         return None
     return ws
@@ -1280,7 +1290,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
         if not group.eligible:
             return None
         B = sv_in.batch_size
-        if _WS_MODE != "always" and (B < 2 or group.H_in * group.H_out < _WS_MIN_W):
+        small_w = group.H_in * group.H_out < _WS_MIN_W and not (need_stash and B >= _WS_SMALL_W_BWD_BATCH)
+        if _WS_MODE != "always" and (B < 2 or small_w):
             return None      # :func:`_ws_dispatch`'s gather rule, before the host-side estimates below
         avg_out = 0.0
         if sv_in.static or sv_out.static:

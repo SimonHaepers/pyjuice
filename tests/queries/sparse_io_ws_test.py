@@ -224,14 +224,47 @@ def test_ws_auto_dispatch_by_cost(monkeypatch):
 
 def test_ws_auto_skips_small_circuits(monkeypatch):
     """A circuit whose W sits in the L2 cache stays on the gather kernels
-    however large the batch (``_WS_MIN_W``)."""
+    (``_WS_MIN_W``): the forward at any batch, the backward with parameter
+    flows below ``_WS_SMALL_W_BWD_BATCH``."""
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     pc = _build(1024, 400, 4, 1024, 0.01, seed=8)
+    assert sio._WS_SMALL_W_BWD_BATCH > 64
     calls = _count_ws_calls(monkeypatch)
     _set(monkeypatch, "auto")
     _pass(pc, torch.randint(0, 400, (64, 4), device="cuda:0"))
     assert calls == _NO_WS
+
+
+def test_ws_small_w_backward_takes_full_pass(monkeypatch):
+    """Below ``_WS_MIN_W`` the backward with parameter flows takes the full WS
+    pass from ``_WS_SMALL_W_BWD_BATCH`` samples on (the gather backward's
+    atomics grow with the batch, the full pass's work barely), the forward
+    stays on the gather kernels; LLs and flows match the gather path."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    H, V, T = 1024, 400, 4
+    pc = _build(H, V, T, 1024, 0.01, seed=8)
+    assert H * H < sio._WS_MIN_W
+    x = torch.randint(0, V, (64, T), device="cuda:0")
+    _set(monkeypatch, "never")
+    ref = _pass(pc, x)
+    monkeypatch.setattr(sio, "_WS_SMALL_W_BWD_BATCH", 64)
+    calls = _count_ws_calls(monkeypatch)
+    _set(monkeypatch, "auto")
+    got = _pass(pc, x)
+    assert calls == {"fwd": 0, "bwd": T - 1, "fwd_active": 0, "bwd_active": 0}, calls
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+    # the rule itself (host logic), at the default threshold of 512
+    monkeypatch.setattr(sio, "_WS_SMALL_W_BWD_BATCH", 512)
+    d, k = sio._ws_dispatch, 92
+    for B in (2, 256, 1024, 4096):
+        assert d(B, 2048, 2048, B * k * k, k, False) is None, B
+    assert d(256, 2048, 2048, 256 * k * k, k, True) is None
+    for B in (512, 1024, 2048):
+        assert d(B, 2048, 2048, B * k * k, k, True) == "full", B
 
 
 def _skewed_csc(H, V, n_dense, tail_nnz, seed):
