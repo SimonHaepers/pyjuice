@@ -198,6 +198,24 @@ def test_sparse_knobs(monkeypatch, knobs, loader):
     dict(SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),                       # entries two items ahead, bank-group order
     dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_AHEAD=2, SLAB_PERM=True),   # ... 8 ranges, short rows
     dict(PFLOW="fixed", SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),        # ... with fixed-point param flows
+    dict(SLAB_TM=4, SLAB_GROUP=4, SLAB_MINB=2),                          # samples with the same column per warp
+    dict(SLAB_TM=4, SLAB_GROUP=2, SLAB_NATIVE_BWD=False),                 # ... TMA backward layout
+    dict(SLAB_TM=4, SLAB_GROUP=8, SLAB_MINB=2, PFLOW="fixed"),           # ... forward grouped, backward fused
+    dict(SLAB_TM=4, SLAB_STREAM=4, SLAB_MINB=2),                         # samples walked software-pipelined
+    dict(SLAB_TM=8, SLAB_STREAM=1, SLAB_MINB=2, SLAB_BYTES=2048, SLAB_NWARP=2),   # 8-row, 4 ranges, long tails
+    dict(SLAB_TM=4, SLAB_STREAM=2, SLAB_NATIVE_BWD=False),               # ... TMA backward layout
+    dict(SLAB_TM=8, SLAB_STREAM=6, SLAB_MINB=2, PFLOW="fixed"),          # ... forward only (fused backward)
+    dict(SLAB_TM=4, SLAB_ROWS=True),                                      # row-by-row slabs, 4-byte reads per active row
+    dict(SLAB_TM=4, SLAB_ROWS=True, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_AHEAD=2, SLAB_PERM=True),   # ... 8 ranges
+    dict(SLAB_TM=4, SLAB_ROWS=True, SLAB_NATIVE_BWD=False),               # ... forward only (TMA backward)
+    dict(SLAB_TM=4, SLAB_ROWS=True, PFLOW="fixed"),                       # ... forward only (fused backward)
+    dict(PFLOW="tile"),                                                   # param flows on accumulator tiles
+    dict(PFLOW="tile", PF_TILE_SLOTS=1),                                  # ... accumulated after every step
+    dict(PFLOW="tile", PF_TILE_SLOTS=3, PF_TILE_NWARP=2),                 # ... every 3 steps, 2 warps per tile
+    dict(PFLOW="tile", PF_TILE_STASH_BYTES=1),                            # ... the stash budget: one step at a time
+    dict(PFLOW="tile", PF_TILE_FIXED=False),                              # ... fp32 tiles (compare-and-swap adds)
+    dict(PFLOW="tile", PF_TILE_FIXED=False, PF_TILE_BYTES=1024, PF_TILE_NWARP=4),
+    dict(PFLOW="tile", PF_TILE_BYTES=1024, PF_TILE_NWARP=4),              # ... 4 ranges of 64 children
 ])
 @pytest.mark.parametrize("defer", [True, False])
 def test_sparse_slab_options(monkeypatch, opts, defer):
@@ -220,6 +238,95 @@ def test_sparse_slab_options(monkeypatch, opts, defer):
     _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
     got2 = _pass(pc, data)                       # a second pass reuses the copies / accumulator
     _assert_flows_close(got2[1], ref[1], 1e-4, "transition param flows, second pass")
+
+
+def test_sparse_slab_rows_toggle(monkeypatch):
+    """Passes with and without row-by-row slabs on one circuit: the per-pass slab copies follow
+    the layout the kernels read (the copy cache keys on it)."""
+    pc = _build(256, 60, 5, 128, 0.3, seed=4)
+    data = torch.randint(0, 60, (24, 5), device=DEV)
+    _set(monkeypatch, "never")
+    ref = _pass(pc, data)
+    for rows in (False, True, False, True):
+        _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, SLAB_ROWS=rows)
+        got = _pass(pc, data)
+        torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+        _assert_flows_close(got[1], ref[1], 1e-4, f"transition param flows, rows={rows}")
+
+
+def test_pflow_mode_auto(monkeypatch):
+    """``"auto"`` param flows: the tile kernel for a large W from the batch threshold on (a larger W from
+    proportionally fewer samples), the dense GEMM below; an explicit mode is kept."""
+    monkeypatch.setattr(sio, "_WS_SPARSE_PFLOW", "auto")
+    monkeypatch.setattr(sio, "_WS_SPARSE_PF_TILE_MIN_W", 1 << 26)
+    monkeypatch.setattr(sio, "_WS_SPARSE_PF_TILE_MIN_BATCH", 256)
+    assert sio._pflow_mode(8192, 8192, 1024) == "tile"
+    assert sio._pflow_mode(8192, 8192, 256) == "tile"
+    assert sio._pflow_mode(8192, 8192, 128) == "gemm"
+    assert sio._pflow_mode(16384, 16384, 64) == "tile"
+    assert sio._pflow_mode(16384, 16384, 32) == "gemm"
+    assert sio._pflow_mode(2048, 2048, 4096) == "gemm"
+    assert sio._pflow_mode(16384, 4096, 256) == "tile"
+    monkeypatch.setattr(sio, "_WS_SPARSE_PFLOW", "gemm")
+    assert sio._pflow_mode(8192, 8192, 1024) == "gemm"
+
+
+@pytest.mark.parametrize("fixed", [True, False])
+@pytest.mark.parametrize("H,pad", [(256, 0), (250, 0), (256, 1)])
+def test_pflow_tile_corner(H, pad, fixed):
+    """``pflow_tile_flush`` with a corner leaves exactly the pairs (parent < P, child < C) out: the corner
+    run plus a dense outer product over the corner equals the run without one (fp32, random samples; several
+    samples share their child list, as samples with the same next token do). The tiles are added to S by 16-byte
+    groups (H = 256) or one value at a time: H not a multiple of 4 (250), or S's rows not 16-byte aligned (pad 1);
+    the tiles in fixed point or fp32."""
+    B, S = 24, 3
+    gen = torch.Generator(device="cpu").manual_seed(7)
+    lists = [torch.sort(torch.randperm(H, generator=gen)[:k]).values for k in (37, 60, 1, 90)]
+    rows = torch.cat(lists).to(DEV)
+    starts = torch.tensor([0, 37, 97, 98], dtype=torch.int32)
+
+    class SV:
+        def __init__(self, idx, cs, nnz, vals):
+            self.indices, self.col_starts, self.nnz, self.values = idx, cs, nnz, vals
+            self.total_nnz = vals.shape[1]
+
+    KB = 1024
+    KS, nsplit, n_m = sio_cuda.pflow_tile_shape(H, H, KB)
+    bufs = None
+    ref = torch.zeros(H, H, dtype=torch.float64, device=DEV)
+    for s in range(S):
+        ci = torch.randint(0, 4, (B,), generator=gen)                         # child list per sample (shared)
+        pi = torch.randint(0, 4, (B,), generator=gen)
+        cn = torch.tensor([len(lists[i]) for i in ci], dtype=torch.int32)
+        pn = torch.tensor([len(lists[i]) for i in pi], dtype=torch.int32)
+        K = 90
+        v = torch.rand(B, K, generator=gen) * -3.0
+        g = torch.rand(B, K, generator=gen) + 0.1
+        sv_in = SV(rows, starts[ci].to(DEV), cn.to(DEV), v.to(DEV))
+        sv_out = SV(rows, starts[pi].to(DEV), pn.to(DEV), torch.zeros(B, K, device=DEV))
+        sv_flow = SV(rows, starts[pi].to(DEV), pn.to(DEV), g.to(DEV))
+        if bufs is None:
+            i32 = dict(dtype=torch.int32, device=DEV)
+            bufs = {"ent": torch.empty(S, n_m, B, 2, **i32), "cnt": torch.zeros(S, n_m, **i32),
+                    "xo": torch.empty(S, B, K, **i32), "xv": torch.empty(S, B, K, device=DEV),
+                    "cofs": torch.empty(S, B, nsplit + 1, **i32),
+                    "gkey": torch.empty(S, B, dtype=torch.int64, device=DEV),
+                    "gp": torch.empty(S, B, K, dtype=torch.float32, device=DEV)}
+        sio_cuda.pflow_tile_stash(bufs, s, sv_in, sv_out, sv_flow, torch.zeros(B, device=DEV), B, H, H, KB)
+        for b in range(B):
+            p = lists[pi[b]].to(DEV)
+            c = lists[ci[b]].to(DEV)
+            ref[p[:, None], c[None, :]] += (g[b, :len(p)].double().to(DEV)[:, None]
+                                            * torch.exp(v[b, :len(c)].double()).to(DEV)[None, :])
+    full = torch.zeros(H, H + pad, device=DEV)[:, pad:]
+    sio_cuda.pflow_tile_flush(full, bufs, S, B, H, H, 1.0, NW=2, slab_bytes=KB, fixed=fixed)
+    torch.testing.assert_close(full.double(), ref, rtol=1e-5, atol=1e-6)
+    P, C = 128, 2 * KS
+    part = torch.zeros(H, H + pad, device=DEV)[:, pad:]
+    sio_cuda.pflow_tile_flush(part, bufs, S, B, H, H, -1.0, NW=2, slab_bytes=KB, corner=(P, C), fixed=fixed)
+    assert torch.all(part[:P, :C] == 0)
+    torch.testing.assert_close(-part[P:].double(), ref[P:], rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(-part[:P, C:].double(), ref[:P, C:], rtol=1e-5, atol=1e-6)
 
 
 def _bank_order(keys):
@@ -284,10 +391,38 @@ def test_slab_perm_rows():
     assert total_after < total_before
 
 
-def test_sparse_empty_columns(monkeypatch):
+@pytest.mark.parametrize("opts", [
+    dict(SLAB_GROUP=8, SLAB_MINB=2),                                     # one range, groups cut at 8
+    dict(SLAB_GROUP=4, SLAB_MINB=2, SLAB_BYTES=512, SLAB_NWARP=1),      # 8 ranges, lists longer than a chunk
+    dict(SLAB_GROUP=2, SLAB_PERM=True),                                  # with the bank-group order
+    dict(SLAB_GROUP=4, SLAB_MINB=2, SLAB_PIPE=True),                     # next chunk loaded during the FMAs
+    dict(SLAB_GROUP=8, SLAB_MINB=2, SLAB_PIPE=True, SLAB_BYTES=1024, SLAB_NWARP=2),   # ... 4 ranges, short lists
+])
+def test_sparse_slab_groups(monkeypatch, opts):
+    """Many samples share a token (8 tokens, 160 samples): the grouped walk
+    (``SLAB_GROUP``) cuts runs of up to ~20 samples with the same column into
+    groups, also across several column ranges and sorted chunks, and gives the
+    gather path's LLs and flows."""
+    pc = _build(256, 8, 5, 128, 0.3, seed=4)
+    data = torch.randint(0, 8, (160, 5), device=DEV)
+    _set(monkeypatch, "never")
+    ref = _pass(pc, data)
+    calls = _count(monkeypatch)
+    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, **opts)
+    got = _pass(pc, data)
+    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
+    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
+    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+
+
+@pytest.mark.parametrize("opts", [dict(), dict(SLAB_GROUP=4, SLAB_MINB=2), dict(SLAB_STREAM=4, SLAB_MINB=2)])
+def test_sparse_empty_columns(monkeypatch, opts):
     """A sample whose token has an empty emission column (impossible
     sequence) gets ``-inf``-like values like the gather path; the others are
-    unaffected."""
+    unaffected. The empty column starts where token 1's does: the grouped
+    walk (``SLAB_GROUP``) must not put them in one group; the pipelined walk
+    (``SLAB_STREAM``) gives the same."""
     H, V, T, bs = 64, 20, 6, 16
     indptr, indices, _, _ = random_emission_csc(H, V, 0.3, seed=3)
     indices = indices[indptr[1]:]                    # token 0 loses its column
@@ -296,9 +431,10 @@ def test_sparse_empty_columns(monkeypatch):
     x = torch.randint(1, V, (5, T), device=DEV)
     x[1, 2] = 0
     x[3, 0] = 0
+    x[0, 2] = x[4, 2] = x[2, 0] = 1                  # token 1 next to the empty columns
     _set(monkeypatch, "never")
     ref = pc(x, apply_cudagraph=False).detach().clone()
-    _set(monkeypatch, "always", "ieee", sparse=True)
+    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, **opts)
     got = pc(x, apply_cudagraph=False).detach().clone()
     impossible = torch.tensor([False, True, False, True, False], device=DEV)
     assert (got[impossible] < -1e29).all()

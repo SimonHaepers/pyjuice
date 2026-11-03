@@ -311,18 +311,70 @@ _WS_SPARSE_SLAB_AHEAD = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_AHE
 so the child range of the next item (indexed by its entry) loads without a stall (ncu
 2026-10-26: 11 % of the stall samples at 8k d0.01, B=1024). Measured 2026-10-27: forward
 kernel -2 / -3 % at 8k B=1024 / 2048, +-2 % at 16k, EM step +-1 %: off by default."""
+_WS_SPARSE_SLAB_GROUP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_GROUP", "0"))
+"""2 / 4 / 8: a warp of the sparse kernels walks up to that many samples whose walked column is the
+same (the same CSC column, ``col_starts``) at once: per child one offset and one W row for all of
+them, their values, 4 FMAs each (4-row tiles, 32 lanes per sample, no fused param flows). At
+B = 2048 on the trained 8k / 16k d0.01 chains 74 / 78 % of the child visits fall in such groups
+of 2 or more inside one tile's list (2026-10-27). 0: one sample per warp."""
+_WS_SPARSE_SLAB_PIPE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_PIPE", "0") == "1"
+"""With ``_WS_SPARSE_SLAB_GROUP``: a lane loads the next chunk's child offsets and values before
+the current chunk's FMAs (software pipelining inside the warp; more registers)."""
+_WS_SPARSE_SLAB_STREAM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_STREAM", "0"))
+"""s > 0: each warp of the sparse kernels walks its samples software-pipelined, holding s input
+entries per lane of the current sample in registers while the next sample's entries, the column
+range of the one after and the list entry of the third are in flight (4 / 8-row tiles, no fused
+parameter flows, not with ``_WS_SPARSE_SLAB_GROUP``). 0: one sample at a time."""
 _WS_SPARSE_SLAB_PERM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_PERM", "0") == "1"
 """Reorder each 32-entry row of the packed child (parent) lists so that the walk's 8-lane phases
 of 16-byte slab reads hit different bank groups (4-row tiles; ncu 2026-10-26: 34 % of those
 reads' shared-memory wavefronts were bank conflicts at 8k d0.01, B=1024). Measured 2026-10-27:
 the forward / backward kernels -5 to -7 %, but the reorder kernel costs as much (5.6 ms per EM
 step at 8k B=1024, 9 ms at 16k B=512): EM step +-1 %, off by default."""
-_WS_SPARSE_PFLOW = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PFLOW", "gemm")
+_WS_SPARSE_SLAB_ROWS = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_ROWS", "0") == "1"
+"""4-row slabs of the slab-order copies stored row by row and read with one 4-byte load per active
+row of the item (a sample has 1.4 of the 4 rows active on average at 8k d0.01) instead of one 16-byte
+read of all four rows; for both directions, where :func:`.sparse_io_cuda.slab_rows_ok` (4-row tiles,
+32 lanes per item, no grouped / pipelined walk, no fused param flows)."""
+_WS_SPARSE_PFLOW = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PFLOW", "auto")
 """Parameter flows of a block on the sparse dispatch: ``"fused"`` — the
 backward slab kernel accumulates them over the active pairs in shared memory
 and adds them to the param flows itself (no stash, no dense GEMM; ``"fixed"``:
 the same in 32-bit fixed point with native shared atomics, deterministic); ``"gemm"``
-— the deferred dense GEMM of :class:`_WSGroup` like the tensor-core passes."""
+— the deferred dense GEMM of :class:`_WSGroup` like the tensor-core passes; ``"tile"`` —
+each step's sparse inputs are packed into a stash and every ``_WS_SPARSE_PF_TILE_SLOTS`` steps
+accumulated on stationary accumulator tiles of 4 parent rows in shared memory, the samples with the
+same child list (next token) summed in registers first, into the group's deferred accumulator,
+multiplied by W at the pass end (:func:`.sparse_io_cuda.pflow_tile_flush`); ``"auto"`` — ``"tile"`` for a W of at
+least ``_WS_SPARSE_PF_TILE_MIN_W`` elements from ``_WS_SPARSE_PF_TILE_MIN_BATCH`` samples on (a larger W from
+proportionally fewer), else ``"gemm"`` (:func:`_pflow_mode`)."""
+_WS_SPARSE_PF_TILE_MIN_W = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_MIN_W", str(1 << 26)))
+_WS_SPARSE_PF_TILE_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_MIN_BATCH", "256"))
+"""``"auto"`` param flows take the tile kernel for a W of at least ``_WS_SPARSE_PF_TILE_MIN_W`` elements (8k x 8k)
+from this many samples on, a larger W from proportionally fewer (``B W >= MIN_BATCH MIN_W``; the dense GEMM grows
+with W, the tile kernel with the active pairs). EM steps on the trained d0.01 chains, H100 (2026-10-29, snapshot
+2026-10-29_pf-tile3, tile vs dense GEMM, ms per EM step / GPU kernel ms): 8k B=256 50.2 vs 49.6 / 37.8 vs 47.0 (the
+tile path's eager launches bound the step at this size), B=384 47.6 vs 62.6; 16k B=64 104.3 vs 107.8, B=128 129.4 vs
+145.5, B=256 166.2 vs 201.0; 2k B=1024 38.6 vs 37.7, B=2048 64.8 vs 60.4 (the dense GEMM of a small W is cheap)."""
+_WS_SPARSE_PF_TILE_SLOTS = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_SLOTS", "32"))
+"""Steps stored per accumulation of ``_WS_SPARSE_PFLOW = "tile"`` (at most 32; fewer where the stash would exceed
+``_WS_SPARSE_PF_TILE_STASH_BYTES``). Each holds the per-tile sample lists, ``[H_out / 4, B]`` entries, and the packed
+children and parents of the batch. Every accumulation zeroes its tiles and adds them to the accumulator, so fewer,
+longer ones are faster (pf_bench2 2026-10-29, pf_tile per EM step with 8 / 32 steps: 8k B=1024 25.6 / 22.7 ms, 16k
+B=512 83.0 / 70.0 ms)."""
+_WS_SPARSE_PF_TILE_STASH_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_STASH_MB", "1024")) << 20
+"""Memory of the ``"tile"`` stash; it bounds the steps per accumulation (32 steps at 8k B=1024: about 0.7 GB)."""
+_WS_SPARSE_PF_TILE_FIXED = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_FIXED", "1") != "0"
+"""``"tile"`` accumulator tiles in 32-bit fixed point (native integer adds; the rows scaled by their sums of g; a
+term's error at most 2^-32 of its row's sum, the result independent of the order of the adds) instead of fp32
+compare-and-swap adds. pf_bench2 2026-10-29 (32 steps): 8k B=1024 22.7 -> 20.2 ms per EM step, 16k B=512 70.4 -> 64.4,
+relative L1 error against fp64 1.8e-7 -> 7.3e-8 (fp32 rounds the long sums)."""
+_WS_SPARSE_PF_TILE_NWARP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_NWARP", "32"))
+"""Warps sharing one accumulator tile of ``_WS_SPARSE_PFLOW = "tile"`` (a power of two up to 32; the tile's list
+entries are sorted in chunks of ``32 NWARP``)."""
+_WS_SPARSE_PF_TILE_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_KB", "128")) * 1024
+"""Shared memory of one accumulator tile (4 parent rows x as many children as fit, fp32): 128 KB is the whole
+8k state range per tile, one tile per SM (2026-10-28: 4 x 8192 with 32 warps beat 4 x 4096 with 16 warps)."""
 _WS_SPARSE_PF_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_KB", "48")) * 1024
 """W slab of the fused param-flow backward (the accumulator doubles it)."""
 _WS_SPARSE_PF_NWARP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_NWARP", "16"))
@@ -1325,7 +1377,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
                            f_sparse=f_sparse, sparse_k=k_visit, sparse_bwd=bwd)
         if use == "sparse":
             # the sparse kernels read W itself; fused param flows need no stash
-            ready = group.ensure_ready(params, B, need_stash and _WS_SPARSE_PFLOW == "gemm", w_copy=False)
+            ready = group.ensure_ready(params, B, need_stash and _pflow_mode(group.H_in, group.H_out, B) == "gemm",
+                                       w_copy=False)
         else:
             ready = use is None or group.ensure_ready(params, B, need_stash)
         if not ready:
@@ -1363,7 +1416,9 @@ class SparseIOSumLayer(SparseInputSumLayer):
             cnt = _ws_scratch("sp_cnt", (n_m,), device, torch.int32)
             xp = _ws_scratch("sp_xpack", (B, 2 * K), device, torch.int32)
             cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
-            wslab = (group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, _WS_SPARSE_SLAB_SWZ, BS)
+            rows = (_WS_SPARSE_SLAB_ROWS and _WS_SPARSE_SLAB_NATIVE
+                    and _sio_cuda.slab_rows_ok(TMS, _WS_SPARSE_SLAB_GL, _WS_SPARSE_SLAB_GROUP, _WS_SPARSE_SLAB_STREAM))
+            wslab = (group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, _WS_SPARSE_SLAB_SWZ, BS, rows=rows)
                      if _WS_SPARSE_SLAB_NATIVE else None)
             _sio_cuda.ws_slab_forward(
                 sv_out.values, params, group.pid_start, sv_in, sv_out, max_val,
@@ -1371,7 +1426,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
                 min_blocks=_WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
                 swz=_WS_SPARSE_SLAB_SWZ, static=_WS_SPARSE_SLAB_STATIC,
-                ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM,
+                ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM, group=_WS_SPARSE_SLAB_GROUP,
+                pipe=_WS_SPARSE_SLAB_PIPE, stream=_WS_SPARSE_SLAB_STREAM,
+                xv=(_ws_scratch("sp_xval", (B, K), device, torch.float32)
+                    if _WS_SPARSE_SLAB_GROUP else None), rows=rows,
             )
             return
         rnd = _WS_PRECISION == "tf32"
@@ -1449,13 +1507,17 @@ class SparseIOSumLayer(SparseInputSumLayer):
             "WS backward needs the fused per-sample sv_in.max_val from the "
             "upstream prod layer's re-forward."
         )
-        fused_pf = sparse and param_flows is not None and _WS_SPARSE_PFLOW in ("fused", "fixed")
+        pf_mode = _pflow_mode(group.H_in, group.H_out, B)
+        fused_pf = sparse and param_flows is not None and pf_mode in ("fused", "fixed")
+        tile_pf = sparse and param_flows is not None and pf_mode == "tile"
         # the sparse kernels read W itself (exact fp32), not the rounded copy
         w, w_start = (params, group.pid_start) if sparse else group.weights(params)
 
         if sparse:
             gd = None
-            if param_flows is not None and not fused_pf:   # the stash of the deferred param-flow GEMM only
+            if tile_pf:                                    # stationary accumulator tiles
+                group.tile_stash(params, param_flows, sv_in, sv_out, sv_flow_out, max_val, B, negate_pflows)
+            elif param_flows is not None and not fused_pf:   # the stash of the deferred param-flow GEMM only
                 gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
                 _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
                     gt, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
@@ -1478,7 +1540,7 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 gt.stride(0), col0,
                 BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=param_flows is not None, WRITE_D=True,
             )
-        if param_flows is not None and not fused_pf:
+        if param_flows is not None and not fused_pf and not tile_pf:
             _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
                 xt, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
                 sv_in.values.stride(0), 1, xt.stride(0), col0,
@@ -1494,7 +1556,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
             cnt = _ws_scratch("sp_cnt", (n_t,), device, torch.int32)
             xp = _ws_scratch("sp_xpack", (B, 2 * sv_out.total_nnz), device, torch.int32)
             cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
-            wslab = (group.slab_copy(params, TMS, slab_bytes, _WS_SPARSE_SLAB_SWZ, BS, bwd=True)
+            rows = (_WS_SPARSE_SLAB_ROWS and _WS_SPARSE_SLAB_NATIVE_BWD
+                    and _sio_cuda.slab_rows_ok(TMS, _WS_SPARSE_SLAB_GL, 0 if fused_pf else _WS_SPARSE_SLAB_GROUP,
+                                               _WS_SPARSE_SLAB_STREAM, int(fused_pf)))
+            wslab = (group.slab_copy(params, TMS, slab_bytes, _WS_SPARSE_SLAB_SWZ, BS, bwd=True, rows=rows)
                      if _WS_SPARSE_SLAB_NATIVE_BWD else None)
             _sio_cuda.ws_slab_backward(
                 sv_flow_in.values, params, group.pid_start, sv_in, sv_out, sv_flow_out, max_val,
@@ -1503,8 +1568,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 NWARP=_WS_SPARSE_PF_NWARP if fused_pf else _WS_SPARSE_SLAB_NWARP.get(TMS, 16),
                 min_blocks=_WS_SPARSE_PF_MINB if fused_pf else _WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
                 static=_WS_SPARSE_SLAB_STATIC, ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM,
+                group=0 if fused_pf else _WS_SPARSE_SLAB_GROUP, pipe=_WS_SPARSE_SLAB_PIPE,
+                stream=_WS_SPARSE_SLAB_STREAM,
+                xv=(_ws_scratch("sp_xval", (B, sv_out.total_nnz), device, torch.float32)
+                    if _WS_SPARSE_SLAB_GROUP and not fused_pf else None),
                 pflow=param_flows if fused_pf else None, pf_start=group.pfid_start, pf_neg=negate_pflows,
-                pf_fixed=_WS_SPARSE_PFLOW == "fixed",
+                pf_fixed=pf_mode == "fixed", rows=rows,
             )
             return
 
@@ -1671,6 +1740,15 @@ def _ws_tiles(n_rows: int, B: int, blk: int, t_max: int,
     return (T, BB, 8, 3) if BB >= 128 else (T, BB, 4, 4)
 
 
+def _pflow_mode(H_in: int, H_out: int, B: int) -> str:
+    """The param-flow path of a sparse-dispatch block (``_WS_SPARSE_PFLOW``, ``"auto"`` resolved)."""
+    if _WS_SPARSE_PFLOW != "auto":
+        return _WS_SPARSE_PFLOW
+    W = H_in * H_out
+    return "tile" if W >= _WS_SPARSE_PF_TILE_MIN_W and B * W >= _WS_SPARSE_PF_TILE_MIN_BATCH * _WS_SPARSE_PF_TILE_MIN_W \
+        else "gemm"
+
+
 class _WSGroup:
     """WS state shared by every :class:`SparseIOSumLayer` block that reads
     the same (tied) transition matrix, i.e. the same ``pid_start`` /
@@ -1705,6 +1783,47 @@ class _WSGroup:
         self._capacity = 0
         self._used = 0
         self._negate: Optional[bool] = None
+        self._tbufs: Optional[dict] = None          # _WS_SPARSE_PFLOW "tile": stored steps
+        self._tused = 0
+        self._tnegate: Optional[bool] = None
+
+    def tile_stash(self, params: torch.Tensor, param_flows: torch.Tensor, sv_in, sv_out, sv_flow_out,
+                   max_val: torch.Tensor, B: int, negate: bool) -> None:
+        """Store one step's packed parameter-flow inputs (``_WS_SPARSE_PFLOW = "tile"``), accumulating
+        the stored steps first when the stash is full or the batch / sign changed."""
+        device = params.device
+        if self._s is None:
+            self._s = torch.zeros(self.H_out, self.H_in, dtype=torch.float32, device=device)
+        Kx, Kg = sv_in.values.shape[-1], sv_out.values.shape[-1]
+        b = self._tbufs
+        if (b is None or b["B"] != B or b["xo"].shape[2] < Kx or b["gp"].shape[2] < Kg
+                or (self._tused and self._tnegate != negate)):
+            self.tile_flush()
+            _KS, nsplit, n_m = _sio_cuda.pflow_tile_shape(self.H_in, self.H_out, _WS_SPARSE_PF_TILE_BYTES)
+            per_step = n_m * (B * 8 + 4) + B * (Kx * 8 + (nsplit + 1) * 4 + 8 + Kg * 4)
+            S = max(1, min(_WS_SPARSE_PF_TILE_SLOTS, _WS_SPARSE_PF_TILE_STASH_BYTES // per_step))
+            i32 = dict(dtype=torch.int32, device=device)
+            b = self._tbufs = {"B": B, "ent": torch.empty(S, n_m, B, 2, **i32), "cnt": torch.zeros(S, n_m, **i32),
+                               "xo": torch.empty(S, B, Kx, **i32), "cofs": torch.empty(S, B, nsplit + 1, **i32),
+                               "xv": torch.empty(S, B, Kx, dtype=torch.float32, device=device),
+                               "gkey": torch.empty(S, B, dtype=torch.int64, device=device),
+                               "gp": torch.empty(S, B, Kg, dtype=torch.float32, device=device)}
+        elif self._tused == b["cnt"].shape[0]:
+            self.tile_flush()
+        _sio_cuda.pflow_tile_stash(b, self._tused, sv_in, sv_out, sv_flow_out, max_val, B,
+                                   self.H_in, self.H_out, _WS_SPARSE_PF_TILE_BYTES)
+        self._tused += 1
+        self._tnegate = negate
+
+    def tile_flush(self) -> None:
+        """Accumulate the stored steps of ``_WS_SPARSE_PFLOW = "tile"`` into the deferred accumulator."""
+        if self._tused:
+            _sio_cuda.pflow_tile_flush(self._s, self._tbufs, self._tused, self._tbufs["B"], self.H_in, self.H_out,
+                                       -1.0 if self._tnegate else 1.0, _WS_SPARSE_PF_TILE_NWARP,
+                                       slab_bytes=_WS_SPARSE_PF_TILE_BYTES, fixed=_WS_SPARSE_PF_TILE_FIXED)
+            self._s_dirty = True
+            self._tused = 0
+            self._tnegate = None
 
     def begin_pass(self) -> None:
         """Params may have changed since the last pass (EM step): rebuild the
@@ -1717,6 +1836,8 @@ class _WSGroup:
             self._s_dirty = False
         self._used = 0
         self._negate = None
+        self._tused = 0
+        self._tnegate = None
 
     def weights(self, params: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """``(tensor, offset of W in it)`` for the WS GEMMs. In tf32 mode
@@ -1739,17 +1860,18 @@ class _WSGroup:
         return buf, 0
 
     def slab_copy(self, params: torch.Tensor, TMS: int, slab_bytes: int, swz: bool, BS: int,
-                  bwd: bool = False) -> torch.Tensor:
+                  bwd: bool = False, rows: bool = False) -> torch.Tensor:
         """W in the sparse forward's (``bwd``: backward's) slab order
         (:func:`.sparse_io_cuda.slab_wcopy`), a process-wide buffer rebuilt once per pass
-        (or when another group, direction or slab shape used it)."""
+        (or when another group, direction, slab shape or layout used it); ``rows``: slabs stored
+        row by row."""
         device = params.device
         n = _sio_cuda.slab_copy_numel(self.H_in, self.H_out, TMS, slab_bytes, bwd)
         buf = _ws_scratch("w_slab", (n,), device)
-        tag = (self, buf.data_ptr(), TMS, slab_bytes, swz, bwd)
+        tag = (self, buf.data_ptr(), TMS, slab_bytes, swz, bwd, rows)
         if not (self._slab_valid and _WS_SLAB_OWNER.get(device) == tag):
             _sio_cuda.slab_wcopy(buf, params, self.pid_start, self.H_in, self.H_out, BS, TMS,
-                                 slab_bytes, swz, bwd)
+                                 slab_bytes, swz, bwd, rows)
             _WS_SLAB_OWNER[device] = tag
             self._slab_valid = True
         return buf
@@ -1835,7 +1957,8 @@ class _WSGroup:
         Row panels also bound the GEMM output temporary. The last chunk can
         be smaller than capacity; cuBLAS receives its true reduction extent.
         """
-        if _WS_PFLOW_DEFER and self._s is not None:
+        self.tile_flush()
+        if (_WS_PFLOW_DEFER or self._tbufs is not None) and self._s is not None:
             self._flush_deferred(params, param_flows, final)
             return
         if not self._used:

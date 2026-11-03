@@ -94,6 +94,38 @@ _SLAB_SRC = r"""
 #ifndef AHEAD
 #define AHEAD 1
 #endif
+// GROUP g (2 / 4 / 8; TMS 4, GL 32, no PF, NT a power of two): samples whose walked column is the same
+// (same CSC column: gkey[b] = its column start, and the same length) share one warp, up to g of them:
+// per child the warp reads the child's W row and offset once and the members' values (xv), g x 4 FMAs.
+// The CTA sorts its list by column (bitonic, up to NT entries at a time) while its W block lands.
+#ifndef GROUP
+#define GROUP 0
+#endif
+// PIPE (with GROUP): a lane loads the next chunk's offsets and values before the current chunk's FMAs
+#ifndef PIPE
+#define PIPE 0
+#endif
+// STREAM s (TMS 4 / 8, GL 32, no PF / GROUP): each warp walks its samples of the tile's list software-
+// pipelined: while it computes sample k from s input entries per lane held in registers, the entries of
+// sample k + 1, the column range of k + 2 and the list entry of k + 3 are in flight
+#ifndef STREAM
+#define STREAM 0
+#endif
+#if STREAM && (GROUP || PF || GL != 32 || (TMS != 4 && TMS != 8))
+#error "STREAM needs TMS 4 or 8, GL 32, no PF, no GROUP"
+#endif
+#if GROUP && (PF || TMS != 4 || GL != 32 || (NT & (NT - 1)))
+#error "GROUP needs TMS 4, GL 32, no PF and a power-of-two NT"
+#endif
+// ROWS: 4-row slabs stored row by row ([TMS][KS] floats, from the slab-order copies), each active row
+// of the item read with a 4-byte load (the walk is specialised on the item's row mask) instead of one
+// 16-byte read of all four rows
+#ifndef ROWS
+#define ROWS 0
+#endif
+#if ROWS && (TMS != 4 || GL != 32 || PF || GROUP || STREAM || SWZ || LOADER != 9)
+#error "ROWS needs 4-row tiles from the slab-order copies, 32 lanes per item, no PF / GROUP / STREAM / SWZ"
+#endif
 #define SWM (TMS == 16 ? 3 : 1)
 // BNAT: backward slabs from the slab-order copy (LOADER 9), [KS parents][TMS children]
 // (children contiguous, swizzled with SWZ) instead of TMA boxes [TMS children][BOXW parents]
@@ -120,7 +152,7 @@ extern "C" __global__ void __launch_bounds__(256)
 ws_slab_pack(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cofs,
              const long long* __restrict__ in_idx, const float* __restrict__ in_vals,
              long long in_stride, const int* __restrict__ in_cs, const int* __restrict__ in_nnz,
-             const float* __restrict__ max_val)
+             const float* __restrict__ max_val, float* __restrict__ xv)
 {
     const int b = blockIdx.y;
     const int j = blockIdx.x * 256 + threadIdx.x;
@@ -134,7 +166,10 @@ ws_slab_pack(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cofs,
     for (int k = kp + 1; k <= kc; ++k) cb[k] = j;
     if (j < n) {
         const float x = expf(in_vals[(long long)b * in_stride + j] - fmaxf(max_val[b], -1e30f));
-        xp[(long long)b * xp_stride + j] = make_int2((c % KS) * TMS * 4, __float_as_int(x));
+        xp[(long long)b * xp_stride + j] = make_int2((c % KS) * (ROWS ? 4 : TMS * 4), __float_as_int(x));
+#if GROUP
+        xv[(long long)b * xp_stride + j] = x;          // the values alone, for the other members of a group
+#endif
     }
 }
 
@@ -244,12 +279,20 @@ ws_slab_wcopy(float* __restrict__ dst, const float* __restrict__ w, long long w_
     __syncthreads();
     const int sp = j0 / KS;
     for (int e = threadIdx.x; e < 32 * 32; e += 256) {
+#if ROWS
+        // e = (tile in the block, row, child): the slab's rows are KS floats each, 32 children contiguous
+        const int tb = e / (32 * TMS), rem = e - tb * (32 * TMS), r = rem / 32, cl = rem - r * 32;
+        const int m = (h0 + tb * TMS) / TMS, cin = j0 - sp * KS + cl;
+        if (m * TMS < ((H_OUT + TMS - 1) / TMS) * TMS)
+            dst[((long long)(m * NSPLIT + sp) * TMS + r) * KS + cin] = t[cl][tb * TMS + r];
+#else
         // e = (tile in the block, child, row): each tile's 32 rows of TMS floats are contiguous
         const int tb = e / (32 * TMS), rem = e - tb * (32 * TMS), cl = rem / TMS, r = rem - cl * TMS;
         const int m = (h0 + tb * TMS) / TMS, cin = j0 - sp * KS + cl;
         const int rr = SWZ ? r ^ ((((cin * TMS * 4) >> 7) & SWM) << 2) : r;
         if (m * TMS < ((H_OUT + TMS - 1) / TMS) * TMS)
             dst[((long long)(m * NSPLIT + sp) * KS + cin) * TMS + rr] = t[cl][tb * TMS + r];
+#endif
     }
 }
 #endif
@@ -399,6 +442,210 @@ __device__ __forceinline__ void slab_walk_any(float* a, const int2* __restrict__
         }
     }
 }
+#if ROWS
+// a[r] += x_j * W[r, c_j] over the lane's children j for the rows r in RM (row r of the slab: the KS
+// floats at r * KS); past j1 a lane adds 0 x W[r, 0]
+template <unsigned RM>
+__device__ __forceinline__ void slab_walk_rows(float* a, const int2* __restrict__ pp, const char* sb, int j, int j1) {
+    for (; j < j1; j += 4 * GL, pp += 4 * GL) {
+        int2 v[4];
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) v[u] = j + GL * u < j1 ? __ldg(pp + GL * u) : make_int2(0, 0);
+        #pragma unroll
+        for (int u = 0; u < 4; ++u) {
+            const float x = __int_as_float(v[u].y);
+            const float* wc = reinterpret_cast<const float*>(sb + v[u].x);
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                if ((RM >> r) & 1u) a[r] = fmaf(x, wc[r * KS], a[r]);
+        }
+    }
+}
+#endif
+#endif
+
+#if GROUP || STREAM
+// the warp's sum of each of V values (a power of two, <= 32) over its 32 lanes (transpose
+// reduction: at each of the first log2 V levels a lane keeps half of its values and sends the
+// other half, then plain sums): a[0] of lane l holds value l >> (5 - log2 V), whole in the lanes
+// with (l & ((32 >> log2 V) - 1)) == 0
+template <int V>
+__device__ __forceinline__ void lane_reduce(float* a, int lane) {
+    constexpr int L = V >= 32 ? 5 : V >= 16 ? 4 : V >= 8 ? 3 : V >= 4 ? 2 : V >= 2 ? 1 : 0;
+    #pragma unroll
+    for (int lv = 0; lv < L; ++lv) {
+        const int off = 16 >> lv, h = V >> (lv + 1);
+        const bool hi = lane & off;
+        #pragma unroll
+        for (int k = 0; k < h; ++k) {
+            const float keep = hi ? a[k + h] : a[k], send = hi ? a[k] : a[k + h];
+            a[k] = keep + __shfl_xor_sync(FULL, send, off);
+        }
+    }
+    #pragma unroll
+    for (int off = 16 >> L; off; off >>= 1) a[0] += __shfl_xor_sync(FULL, a[0], off);
+}
+#endif
+
+#if GROUP
+// a[4 s + r] += x_s[j] * W[c_j, r] for the G members s of a group (the same children c_j), over the
+// lane's children j (every 32nd from jl up to j1): per child one offset, one W row, G values; U
+// children in flight (G x U independent loads); past j1 a lane adds 0 x row 0. The member-0 entries
+// at p0 (offset, value), the others' values at xv + mo[s] (mo: the lane's first child of member s).
+template <int G, int U>
+__device__ __forceinline__ void group_load(int2* v, float (*x)[G], const int2* __restrict__ p0,
+                                           const float* __restrict__ xv, const unsigned* mo, int j, int jl, int j1) {
+    const int d = j - jl;
+    #pragma unroll
+    for (int u = 0; u < U; ++u) {
+        const bool ok = j + 32 * u < j1;
+        v[u] = ok ? __ldg(p0 + d + 32 * u) : make_int2(0, 0);
+        x[u][0] = __int_as_float(v[u].y);
+        #pragma unroll
+        for (int s = 1; s < G; ++s) x[u][s] = ok ? __ldg(xv + mo[s] + d + 32 * u) : 0.f;
+    }
+}
+template <int G>
+__device__ __forceinline__ void group_walk(float* a, const int2* __restrict__ p0, const float* __restrict__ xv,
+                                           const unsigned* mo, const char* sb, int jl, int j1) {
+    constexpr int U = G >= 4 ? 1 : (G >= 2 ? 2 : 4);   // G x U loads in flight per lane
+#if PIPE
+    int2 v[U];
+    float x[U][G];
+    group_load<G, U>(v, x, p0, xv, mo, jl, jl, j1);
+    for (int j = jl; j < j1; j += U * 32) {
+        int2 vn[U];
+        float xn[U][G];
+        group_load<G, U>(vn, xn, p0, xv, mo, j + U * 32, jl, j1);   // the next chunk, in flight
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            QUARTER(wv, sb + v[u].x, 0)
+            #pragma unroll
+            for (int s = 0; s < G; ++s) {
+                a[4 * s] = fmaf(x[u][s], wv.x, a[4 * s]);
+                a[4 * s + 1] = fmaf(x[u][s], wv.y, a[4 * s + 1]);
+                a[4 * s + 2] = fmaf(x[u][s], wv.z, a[4 * s + 2]);
+                a[4 * s + 3] = fmaf(x[u][s], wv.w, a[4 * s + 3]);
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            v[u] = vn[u];
+            #pragma unroll
+            for (int s = 0; s < G; ++s) x[u][s] = xn[u][s];
+        }
+    }
+#else
+    for (int j = jl; j < j1; j += U * 32) {
+        const int d = j - jl;
+        int2 v[U];
+        float x[U][G];
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const bool ok = j + 32 * u < j1;
+            v[u] = ok ? __ldg(p0 + d + 32 * u) : make_int2(0, 0);
+            x[u][0] = __int_as_float(v[u].y);
+            #pragma unroll
+            for (int s = 1; s < G; ++s) x[u][s] = ok ? __ldg(xv + mo[s] + d + 32 * u) : 0.f;
+        }
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            QUARTER(wv, sb + v[u].x, 0)
+            #pragma unroll
+            for (int s = 0; s < G; ++s) {
+                a[4 * s] = fmaf(x[u][s], wv.x, a[4 * s]);
+                a[4 * s + 1] = fmaf(x[u][s], wv.y, a[4 * s + 1]);
+                a[4 * s + 2] = fmaf(x[u][s], wv.z, a[4 * s + 2]);
+                a[4 * s + 3] = fmaf(x[u][s], wv.w, a[4 * s + 3]);
+            }
+        }
+    }
+#endif
+}
+// one group: the G samples at sorted positions i.. of the CTA's chunk (GP: G rounded up to a power
+// of two), their walk, the warp's sums and the writes of each member's active rows
+template <int G, int GP>
+__device__ __forceinline__ void group_piece(int i, int lane, const unsigned long long* skey, const int2* sent,
+                                            const int2* __restrict__ xp, int xp_stride, const float* __restrict__ xv,
+                                            const int* __restrict__ cofs, int sp, const char* sb,
+                                            float* __restrict__ out_vals, long long out_stride,
+                                            const float* __restrict__ max_val, const int* __restrict__ in_nnz,
+                                            const float* __restrict__ in_vals, long long in_stride) {
+    unsigned mo[G];
+    int b0 = 0;
+    #pragma unroll
+    for (int s = 0; s < G; ++s) {
+        const int b = sent[(unsigned)skey[i + s]].x;
+        if (s == 0) b0 = b;
+        mo[s] = (unsigned)(b * xp_stride);
+    }
+    const int j0 = cofs[(long long)b0 * (NSPLIT + 1) + sp], j1 = cofs[(long long)b0 * (NSPLIT + 1) + sp + 1];
+    #pragma unroll
+    for (int s = 0; s < G; ++s) mo[s] += (unsigned)(j0 + lane);
+    float a[4 * GP];
+    #pragma unroll
+    for (int k = 0; k < 4 * GP; ++k) a[k] = 0.f;
+    group_walk<G>(a, xp + mo[0], xv, mo, sb, j0 + lane, j1);
+    lane_reduce<4 * GP>(a, lane);
+    constexpr int LV = 4 * GP >= 32 ? 5 : 4 * GP >= 16 ? 4 : 4 * GP >= 8 ? 3 : 2;
+    const int vi = lane >> (5 - LV), s = vi >> 2, r = vi & 3;
+    if ((lane & ((32 >> LV) - 1)) == 0 && s < G) {
+        const int2 e = sent[(unsigned)skey[i + s]];
+        const int b = e.x, ps = e.y >> TMS;
+        const unsigned rows = e.y & ((1 << TMS) - 1);
+        if ((rows >> r) & 1u) {
+            const int o = ps + __popc(rows & ((1u << r) - 1));
+            float* dst = out_vals + (long long)b * out_stride + o;
+            const float acc = a[0];
+#if NSPLIT > 1
+            atomicAdd(dst, acc);
+#elif BWD
+            *dst = expf(in_vals[(long long)b * in_stride + o] - fmaxf(max_val[b], -1e30f)) * acc;
+#else
+            *dst = in_nnz[b] == 0 ? __int_as_float(0xff800000) : logf(acc) + fmaxf(max_val[b], -1e30f);
+#endif
+        }
+    }
+}
+#endif
+
+#if STREAM
+// the lane's input entries of one sample in the CTA's column range: e[u] = xp[b, j0 + lane + 32 u] for
+// u < STREAM (zeros past j1); a longer range is finished by stream_sample
+__device__ __forceinline__ void stream_load(int2* e, const int2* __restrict__ xp, int xp_stride, int b, int j0,
+                                            int j1, int lane) {
+    const int2* p = xp + ((unsigned)(b * xp_stride) + (unsigned)(j0 + lane));
+    #pragma unroll
+    for (int u = 0; u < STREAM; ++u) e[u] = j0 + lane + 32 * u < j1 ? __ldg(p + 32 * u) : make_int2(0, 0);
+}
+// a[4 q + r] += x W[c, 4 q + r] over the loaded entries, for the 4-row quarters q in QM
+template <unsigned QM>
+__device__ __forceinline__ void stream_fma(float* a, const int2* e, const char* sb) {
+    #pragma unroll
+    for (int u = 0; u < STREAM; ++u) {
+        const float x = __int_as_float(e[u].y);
+        #pragma unroll
+        for (int q = 0; q < TMS / 4; ++q) {
+            if (!((QM >> q) & 1)) continue;
+            QUARTER(wv, sb + e[u].x, q)
+            a[4 * q] = fmaf(x, wv.x, a[4 * q]);
+            a[4 * q + 1] = fmaf(x, wv.y, a[4 * q + 1]);
+            a[4 * q + 2] = fmaf(x, wv.z, a[4 * q + 2]);
+            a[4 * q + 3] = fmaf(x, wv.w, a[4 * q + 3]);
+        }
+    }
+}
+// one sample: the entries in registers, then (rarely) the rest of a range longer than 32 x STREAM
+template <unsigned QM>
+__device__ __forceinline__ void stream_sample(float* a, const int2* e, const int2* __restrict__ xp, int xp_stride,
+                                              int b, int j0, int j1, int lane, const char* sb) {
+    stream_fma<QM>(a, e, sb);
+    for (int j = j0 + 32 * STREAM; j < j1; j += 32 * STREAM) {
+        int2 t[STREAM];
+        stream_load(t, xp, xp_stride, b, j, j1, lane);
+        stream_fma<QM>(a, t, sb);
+    }
+}
 #endif
 
 __device__ __forceinline__ void mbar_wait(unsigned long long* bar, unsigned parity) {
@@ -498,7 +745,8 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
             const int2* __restrict__ ent, const int* __restrict__ cnt, int B,
             const float* __restrict__ in_vals, long long in_stride,
             const __grid_constant__ TmaDesc tmap,
-            float* __restrict__ pflow, long long pf_start, int pf_neg)
+            float* __restrict__ pflow, long long pf_start, int pf_neg,
+            const int* __restrict__ gkey, const float* __restrict__ xv)
 {
     extern __shared__ __align__(1024) float smem[];
     float* slab = smem;                                              // [KS][TMS]
@@ -525,8 +773,148 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
     }
     __syncthreads();
     load_slab(slab, bar, m * TMS, sp * KS, w, w_start, &tmap, tid);
-    mbar_wait(bar, 0);
     const char* sb = reinterpret_cast<const char*>(slab);
+#if GROUP
+    // the tile's list in chunks of NT samples: sort a chunk by walked column (key: column start, or
+    // a unique key for an empty column, whose start may equal the next column's), cut the runs of
+    // equal keys into groups of up to GROUP samples, hand the groups to the warps round-robin
+    {
+    const int warp = tid >> 5;
+    const int2* lst = ent + (long long)m * B;
+    unsigned long long* skey = reinterpret_cast<unsigned long long*>(bar + 2);   // [NT] key << 32 | index
+    int2* sent = reinterpret_cast<int2*>(skey + NT);                             // [NT] the chunk's entries
+    int* spiece = reinterpret_cast<int*>(sent + NT);                             // [NT] group start | size << 16
+    int* swarp = spiece + NT;                                                    // [NWARP]
+    bool landed = false;
+    for (int c0 = 0; c0 < n; c0 += NT) {
+        const int nc = n - c0 < NT ? n - c0 : NT;
+        unsigned long long kv = ~0ull;
+        if (tid < nc) {
+            const int2 e = lst[c0 + tid];
+            sent[tid] = e;
+            const unsigned len = (unsigned)cofs[(long long)e.x * (NSPLIT + 1) + NSPLIT];
+            const unsigned k = len ? (unsigned)gkey[e.x] : (0x80000000u | (unsigned)e.x);
+            kv = ((unsigned long long)k << 32) | (unsigned)tid;
+        }
+        skey[tid] = kv;
+        __syncthreads();
+        int n2 = 2;                                   // sort the chunk's entries rounded up to a power of two
+        while (n2 < nc) n2 <<= 1;
+        for (int kk = 2; kk <= n2; kk <<= 1)
+            for (int jj = kk >> 1; jj > 0; jj >>= 1) {
+                const int p = tid ^ jj;
+                if (p > tid && p < n2) {
+                    const unsigned long long x0 = skey[tid], x1 = skey[p];
+                    if ((x0 > x1) == ((tid & kk) == 0)) { skey[tid] = x1; skey[p] = x0; }
+                }
+                __syncthreads();
+            }
+        bool start = false;
+        int size = 0;
+        if (tid < nc) {
+            const unsigned k = (unsigned)(skey[tid] >> 32);
+            int lo = 0, hi = tid;                     // the run's first position
+            while (lo < hi) { const int mid = (lo + hi) >> 1; if ((unsigned)(skey[mid] >> 32) < k) lo = mid + 1; else hi = mid; }
+            const int first = lo;
+            lo = tid + 1; hi = nc;                    // the next run's first position
+            while (lo < hi) { const int mid = (lo + hi) >> 1; if ((unsigned)(skey[mid] >> 32) <= k) lo = mid + 1; else hi = mid; }
+            start = (tid - first) % GROUP == 0;
+            size = lo - tid < GROUP ? lo - tid : GROUP;
+        }
+        const unsigned bal = __ballot_sync(FULL, start);
+        if (lane == 0) swarp[warp] = __popc(bal);
+        __syncthreads();
+        int base = 0, np = 0;
+        for (int w2 = 0; w2 < NWARP; ++w2) { const int c = swarp[w2]; base += w2 < warp ? c : 0; np += c; }
+        if (start) spiece[base + __popc(bal & ((1u << lane) - 1u))] = tid | (size << 16);
+        __syncthreads();
+        if (!landed) { mbar_wait(bar, 0); landed = true; }
+        for (int k = warp; k < np; k += NWARP) {
+            const int pc = spiece[k], i = pc & 0xffff;
+#define GP_ARGS i, lane, skey, sent, xp, xp_stride, xv, cofs, sp, sb, out_vals, out_stride, max_val, in_nnz, in_vals, in_stride
+            switch (pc >> 16) {
+                case 1: group_piece<1, 1>(GP_ARGS); break;
+#if GROUP >= 2
+                case 2: group_piece<2, 2>(GP_ARGS); break;
+#endif
+#if GROUP >= 4
+                case 3: group_piece<3, 4>(GP_ARGS); break;
+                case 4: group_piece<4, 4>(GP_ARGS); break;
+#endif
+#if GROUP >= 8
+                case 5: group_piece<5, 8>(GP_ARGS); break;
+                case 6: group_piece<6, 8>(GP_ARGS); break;
+                case 7: group_piece<7, 8>(GP_ARGS); break;
+                case 8: group_piece<8, 8>(GP_ARGS); break;
+#endif
+            }
+#undef GP_ARGS
+        }
+        __syncthreads();                              // before the next chunk reuses the arrays
+    }
+    }
+#elif STREAM
+    mbar_wait(bar, 0);
+    {
+    // the warp's samples u, u + NWARP, ... of the tile's list. Iteration k computes sample A (its
+    // entries vA loaded in iteration k - 1) after issuing the loads of the entries of B (the next
+    // sample), the column range of C and the list entry of D: no load waits on another one, and
+    // the FMAs wait only on loads issued one iteration earlier
+    const int2* lst = ent + (long long)m * B;
+    int u = tid >> 5;
+    const long long cs = NSPLIT + 1;
+    int2 eA = make_int2(0, 0), eB = make_int2(0, 0), eC = make_int2(0, 0);
+    int2 rA = make_int2(0, 0), rB = make_int2(0, 0);
+    if (u < n) eA = lst[u];
+    if (u + NWARP < n) eB = lst[u + NWARP];
+    if (u + 2 * NWARP < n) eC = lst[u + 2 * NWARP];
+    if (u < n) rA = make_int2(cofs[eA.x * cs + sp], cofs[eA.x * cs + sp + 1]);
+    if (u + NWARP < n) rB = make_int2(cofs[eB.x * cs + sp], cofs[eB.x * cs + sp + 1]);
+    int2 vA[STREAM];
+    if (u < n) stream_load(vA, xp, xp_stride, eA.x, rA.x, rA.y, lane);
+    while (u < n) {
+        int2 vB[STREAM];
+        if (u + NWARP < n) stream_load(vB, xp, xp_stride, eB.x, rB.x, rB.y, lane);
+        int2 rC = make_int2(0, 0), eD = make_int2(0, 0);
+        if (u + 2 * NWARP < n) rC = make_int2(cofs[eC.x * cs + sp], cofs[eC.x * cs + sp + 1]);
+        if (u + 3 * NWARP < n) eD = lst[u + 3 * NWARP];
+        const int b = eA.x, ps = eA.y >> TMS;
+        const unsigned rows = eA.y & ((1 << TMS) - 1);
+        float a[TMS];
+        #pragma unroll
+        for (int r = 0; r < TMS; ++r) a[r] = 0.f;
+#if TMS == 8
+        // only the 4-row quarters with a parent of the sample are read and multiplied
+        const unsigned qmask = quarters(rows);
+        if (qmask == 1u) stream_sample<1>(a, vA, xp, xp_stride, b, rA.x, rA.y, lane, sb);
+        else if (qmask == 2u) stream_sample<2>(a, vA, xp, xp_stride, b, rA.x, rA.y, lane, sb);
+        else stream_sample<3>(a, vA, xp, xp_stride, b, rA.x, rA.y, lane, sb);
+#else
+        stream_sample<1>(a, vA, xp, xp_stride, b, rA.x, rA.y, lane, sb);
+#endif
+        // the warp's sum per row (the same reduction tree as the per-sample walk) and the writes
+        lane_reduce<TMS>(a, lane);
+        constexpr int LV = TMS == 8 ? 3 : 2;
+        const int r = lane >> (5 - LV);
+        if ((lane & ((32 >> LV) - 1)) == 0 && ((rows >> r) & 1u)) {
+            const int o = ps + __popc(rows & ((1u << r) - 1));
+            float* dst = out_vals + (long long)b * out_stride + o;
+#if NSPLIT > 1
+            atomicAdd(dst, a[0]);
+#elif BWD
+            *dst = expf(in_vals[(long long)b * in_stride + o] - fmaxf(max_val[b], -1e30f)) * a[0];
+#else
+            *dst = in_nnz[b] == 0 ? __int_as_float(0xff800000) : logf(a[0]) + fmaxf(max_val[b], -1e30f);
+#endif
+        }
+        eA = eB; rA = rB; eB = eC; rB = rC; eC = eD;
+        #pragma unroll
+        for (int k = 0; k < STREAM; ++k) vA[k] = vB[k];
+        u += NWARP;
+    }
+    }
+#else
+    mbar_wait(bar, 0);
 
     const int2* lst = ent + (long long)m * B;
     // items: the samples of the tile's list; each group of GL lanes takes one,
@@ -607,6 +995,24 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
 #endif
 #elif TMS >= 8
         slab_walk_any(a, pp, sb, j0 + gl, j1, quarters(rows) PF_PASS);
+#elif TMS == 4 && ROWS
+        switch (rows) {                               // uniform per item (32 lanes per item)
+            case 1: slab_walk_rows<1>(a, pp, sb, j0 + gl, j1); break;
+            case 2: slab_walk_rows<2>(a, pp, sb, j0 + gl, j1); break;
+            case 3: slab_walk_rows<3>(a, pp, sb, j0 + gl, j1); break;
+            case 4: slab_walk_rows<4>(a, pp, sb, j0 + gl, j1); break;
+            case 5: slab_walk_rows<5>(a, pp, sb, j0 + gl, j1); break;
+            case 6: slab_walk_rows<6>(a, pp, sb, j0 + gl, j1); break;
+            case 7: slab_walk_rows<7>(a, pp, sb, j0 + gl, j1); break;
+            case 8: slab_walk_rows<8>(a, pp, sb, j0 + gl, j1); break;
+            case 9: slab_walk_rows<9>(a, pp, sb, j0 + gl, j1); break;
+            case 10: slab_walk_rows<10>(a, pp, sb, j0 + gl, j1); break;
+            case 11: slab_walk_rows<11>(a, pp, sb, j0 + gl, j1); break;
+            case 12: slab_walk_rows<12>(a, pp, sb, j0 + gl, j1); break;
+            case 13: slab_walk_rows<13>(a, pp, sb, j0 + gl, j1); break;
+            case 14: slab_walk_rows<14>(a, pp, sb, j0 + gl, j1); break;
+            case 15: slab_walk_rows<15>(a, pp, sb, j0 + gl, j1); break;
+        }
 #elif TMS == 4
         slab_walk<1>(a, pp, sb, j0 + gl, j1 PF_PASS);
 #elif TMS == 2 && !BWD
@@ -691,6 +1097,7 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
         i0 = n0;
         i = inext;
     }
+#endif
 #if PF
     // the slab's param flows: CTA (child tile m, parent range sp) owns them;
     // layout [KS / BOXW][TMS children][BOXW parents], parents contiguous in W
@@ -754,10 +1161,16 @@ ws_slab_wcopy_bwd(float* __restrict__ dst, const float* __restrict__ w, long lon
     __syncthreads();
     const int sp = j0 / KS;
     for (int e = threadIdx.x; e < 32 * TMS; e += 256) {
+#if ROWS
+        const int r = e / 32, pl = e - r * 32;                // slab rows of KS parents, 32 contiguous
+        const int pin = j0 - sp * KS + pl;
+        dst[((long long)(m * NSPLIT + sp) * TMS + r) * KS + pin] = t[pl][r];
+#else
         const int pl = e / TMS, r = e - pl * TMS;
         const int pin = j0 - sp * KS + pl;                    // parent row within the slab
         const int rr = SWZ ? r ^ ((((pin * TMS * 4) >> 7) & SWM) << 2) : r;
         dst[((long long)(m * NSPLIT + sp) * KS + pin) * TMS + rr] = t[pl][r];
+#endif
     }
 }
 
@@ -785,7 +1198,7 @@ ws_slab_pack_g(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cof
                const long long* __restrict__ out_idx, const int* __restrict__ out_cs,
                const int* __restrict__ out_nnz, const float* __restrict__ nflow, long long flow_stride,
                const float* __restrict__ nmars, long long mars_stride,
-               const float* __restrict__ max_val, const int* __restrict__ in_nnz)
+               const float* __restrict__ max_val, const int* __restrict__ in_nnz, float* __restrict__ xv)
 {
     const int b = blockIdx.y;
     const int i = blockIdx.x * 256 + threadIdx.x;
@@ -802,21 +1215,544 @@ ws_slab_pack_g(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cof
         float g = nflow[(long long)b * flow_stride + i] * expf(fmaxf(max_val[b], -1e30f) - nm);
         if (in_nnz[b] == 0 || nm == __int_as_float(0xff800000)) g = 0.f;
         const int hl = h % KS;
-        xp[(long long)b * xp_stride + i] = make_int2(BNAT ? hl * TMS * 4 : ((hl / BOXW) * TMS * BOXW + hl % BOXW) * 4,
+        xp[(long long)b * xp_stride + i] = make_int2(BNAT ? hl * (ROWS ? 4 : TMS * 4) : ((hl / BOXW) * TMS * BOXW + hl % BOXW) * 4,
                                                      __float_as_int(g));
+#if GROUP
+        xv[(long long)b * xp_stride + i] = g;
+#endif
     }
 }
 #endif
 """
 
+_PFLOW_SRC = r"""
+// Sparse parameter flows (PFLOW "tile"): S[h, c] += g[b, h] x[b, c] over the active (parent h, child c) pairs of
+// every sample b of N stored steps; the caller multiplies S by W at the pass end. A CTA owns a tile of 4 parent rows
+// x KS children, fp32 in shared memory, and adds the tile's list entries of all stored steps. The entries are sorted,
+// in chunks of the CTA's threads, by the address of their sample's child list: the samples with the same next token
+// share that list, so a run of equal addresses is a group whose products are summed in registers and added to the
+// tile once per (child, active row) of the group. The warps share the tile. FX 1: the tile in 32-bit fixed point, each
+// row scaled by 2^31 / G_r, G_r = the row's sum of g over the tile's entries (a pre-pass): every element's sum is at most
+// G_r since x = exp(v - max) <= 1, so native integer shared adds (no reads, no compare-and-swaps; the result does not
+// depend on the order of the adds; a term's rounding error is at most 2^-32 G_r). FX 0: fp32 adds by compare-and-swap
+// (sm_90 has no native shared fp32 add), each lane's reads first, then its compare-and-swaps; the few that another warp
+// changed in between are redone with atomicAdd. Pairs in the corner [0, pc) x [0, cc) are left out (the caller covers
+// them). pf_bench2.py (2026-10-29, 32 steps per accumulation, ms per EM step): 8k B=1024 28.2 -> 15.8, 16k B=512
+// 86.7 -> 51.9 against the version of 2026-10-28 (one-row copies of the item, branch-free adds, a table of the items'
+// runs, 16-byte write-back, fixed point, 4 blocks per item).
+#define FULL 0xffffffffu
+#define CH (NW * 32)
+#define LUTN 8192                                     // items per chunk in pf_tile's table of their runs
+
+// the samples of every 4-row parent tile: ent[t, pos] = (b, ps << 4 | rows) (as ws_slab_lists)
+extern "C" __global__ void __launch_bounds__(256)
+pf_lists(int2* __restrict__ ent, int* __restrict__ cnt, const long long* __restrict__ out_idx,
+         const int* __restrict__ out_cs, const int* __restrict__ out_nnz, int B)
+{
+    const int b = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x, n = out_nnz[b];
+    if (i >= n) return;
+    const long long* op = out_idx + out_cs[b];
+    const int h = (int)op[i], t = h >> 2;
+    if (i > 0 && (int)op[i - 1] >> 2 == t) return;
+    unsigned rows = 1u << (h & 3);
+    #pragma unroll
+    for (int k = 1; k < 4; ++k) {
+        if (i + k >= n) break;
+        const int hk = (int)op[i + k];
+        if (hk >> 2 != t) break;
+        rows |= 1u << (hk & 3);
+    }
+    const int pos = atomicAdd(cnt + t, 1);
+    ent[(long long)t * B + pos] = make_int2(b, (i << 4) | (int)rows);
+}
+
+// children: xo[b, j] = c % KS, xv[b, j] = exp(v - max_b); cofs[b, k] = the first j with c_j >= k KS (k = 0..NSPLIT);
+// gkey[b] = the address of the sample's child list (equal for samples with the same list)
+extern "C" __global__ void __launch_bounds__(256)
+pf_pack_x(int* __restrict__ xo, float* __restrict__ xv, int* __restrict__ cofs, unsigned long long* __restrict__ gkey, int K,
+          const long long* __restrict__ in_idx, const float* __restrict__ in_vals, long long in_stride,
+          const int* __restrict__ in_cs, const int* __restrict__ in_nnz, const float* __restrict__ max_val)
+{
+    const int b = blockIdx.y, j = blockIdx.x * 256 + threadIdx.x, n = in_nnz[b];
+    if (j > n) return;
+    const long long* ip = in_idx + in_cs[b];
+    if (j == 0) gkey[b] = (unsigned long long)ip;
+    int* cb = cofs + (long long)b * (NSPLIT + 1);
+    const int kp = j == 0 ? -1 : (int)(ip[j - 1] / KS);
+    const int c = j < n ? (int)ip[j] : 0;
+    const int kc = j < n ? c / KS : NSPLIT;
+    for (int k = kp + 1; k <= kc; ++k) cb[k] = j;
+    if (j < n) {
+        xo[(long long)b * K + j] = c % KS;
+        xv[(long long)b * K + j] = expf(in_vals[(long long)b * in_stride + j] - fmaxf(max_val[b], -1e30f));
+    }
+}
+
+// parents: gp[b, i] = flow * exp(max_b - value) (0 for a sample without children or a dead parent)
+extern "C" __global__ void __launch_bounds__(256)
+pf_pack_g(float* __restrict__ gp, int K, const float* __restrict__ nflow, long long flow_stride,
+          const float* __restrict__ nmars, long long mars_stride, const float* __restrict__ max_val,
+          const int* __restrict__ in_nnz, const int* __restrict__ out_nnz)
+{
+    const int b = blockIdx.y, i = blockIdx.x * 256 + threadIdx.x;
+    if (i >= out_nnz[b]) return;
+    const float nm = nmars[(long long)b * mars_stride + i];
+    float g = nflow[(long long)b * flow_stride + i] * expf(fmaxf(max_val[b], -1e30f) - nm);
+    if (in_nnz[b] == 0 || nm == __int_as_float(0xff800000)) g = 0.f;
+    gp[(long long)b * K + i] = g;
+}
+
+// exclusive prefix sum of one value per thread over the CTA (all threads call it); *total: the sum
+__device__ __forceinline__ int block_exscan(int v, int* s_wsum, int lane, int warp, int* total) {
+    int x = v;
+    #pragma unroll
+    for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(FULL, x, o); if (lane >= o) x += y; }
+    if (lane == 31) s_wsum[warp] = x;
+    __syncthreads();
+    if (warp == 0) {
+        int w = lane < NW ? s_wsum[lane] : 0;
+        #pragma unroll
+        for (int o = 1; o < 32; o <<= 1) { const int y = __shfl_up_sync(FULL, w, o); if (lane >= o) w += y; }
+        if (lane < NW) s_wsum[lane] = w;
+    }
+    __syncthreads();
+    const int before = (warp ? s_wsum[warp - 1] : 0) + x - v;
+    *total = s_wsum[NW - 1];
+    __syncthreads();                                  // s_wsum is reused by the next scan
+    return before;
+}
+
+// one item: the children jb + 32 k (k < IU) of the group of sorted entries t0..t1, multiplied by the members' g and
+// added to the tile's rows of the group: RM, one row, at compile time (most groups have one active row in a tile of 4),
+// else all 4 rows multiplied and the rows of rmv added. The adds: all reads, then the compare-and-swaps, then the few
+// that another warp changed in between redone with atomicAdd (one branch for them); a lane without a child, or a row
+// outside the group's, adds 0 to the lane's own scratch word, so that no branch diverges
+template <unsigned RM>
+__device__ __forceinline__ void pf_item(float* __restrict__ T, const unsigned long long* __restrict__ skey,
+                                        const float4* __restrict__ sg, const int* __restrict__ sxo,
+                                        const int* __restrict__ xo, const float* __restrict__ xv,
+                                        int t0, int t1, int jb, int len, int xol, unsigned rmv, float* scr,
+                                        float4 sc)
+{
+    const unsigned rm = RM ? RM : rmv;
+    int off[IU];
+    #pragma unroll
+    for (int k = 0; k < IU; ++k) off[k] = jb + 32 * k < len ? xo[xol + jb + 32 * k] : -1;
+    float acc[IU][4];
+    #pragma unroll
+    for (int k = 0; k < IU; ++k) { acc[k][0] = 0.f; acc[k][1] = 0.f; acc[k][2] = 0.f; acc[k][3] = 0.f; }
+    for (int t = t0; t < t1; ++t) {
+        const int mi = (int)(skey[t] & 2047);
+        const float4 g = sg[mi];
+        const int xom = sxo[mi];
+        float xm[IU];
+        #pragma unroll
+        for (int k = 0; k < IU; ++k) xm[k] = off[k] >= 0 ? xv[xom + jb + 32 * k] : 0.f;
+        #pragma unroll
+        for (int k = 0; k < IU; ++k) {
+            if (!RM || (RM & 1u)) acc[k][0] = fmaf(g.x, xm[k], acc[k][0]);
+            if (!RM || (RM & 2u)) acc[k][1] = fmaf(g.y, xm[k], acc[k][1]);
+            if (!RM || (RM & 4u)) acc[k][2] = fmaf(g.z, xm[k], acc[k][2]);
+            if (!RM || (RM & 8u)) acc[k][3] = fmaf(g.w, xm[k], acc[k][3]);
+        }
+    }
+#if FX
+    const float scv[4] = {sc.x, sc.y, sc.z, sc.w};
+    #pragma unroll
+    for (int k = 0; k < IU; ++k)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+            if (!RM || ((RM >> r) & 1u)) {
+                const bool on = off[k] >= 0 && ((rm >> r) & 1u);
+                atomicAdd(on ? reinterpret_cast<unsigned*>(T + r * KS + off[k]) : reinterpret_cast<unsigned*>(scr),
+                          on ? __float2uint_rn(acc[k][r] * scv[r]) : 0u);
+            }
+#else
+    float* ad[IU][4];
+    #pragma unroll
+    for (int k = 0; k < IU; ++k)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            const bool on = off[k] >= 0 && ((rm >> r) & 1u);
+            ad[k][r] = on ? T + r * KS + off[k] : scr;
+            if (!on) acc[k][r] = 0.f;
+        }
+    float old[IU][4];
+    #pragma unroll
+    for (int k = 0; k < IU; ++k)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+            if (!RM || ((RM >> r) & 1u)) old[k][r] = *ad[k][r];
+    unsigned bad = 0;                                 // the failed compare-and-swaps, one bit per (block, row)
+    #pragma unroll
+    for (int k = 0; k < IU; ++k)
+        #pragma unroll
+        for (int r = 0; r < 4; ++r)
+            if (!RM || ((RM >> r) & 1u)) {
+                const unsigned o = __float_as_uint(old[k][r]);
+                const unsigned w = atomicCAS(reinterpret_cast<unsigned*>(ad[k][r]), o,
+                                             __float_as_uint(old[k][r] + acc[k][r]));
+                bad |= (w != o ? 1u : 0u) << (4 * k + r);
+            }
+    if (bad) {
+        #pragma unroll
+        for (int k = 0; k < IU; ++k)
+            #pragma unroll
+            for (int r = 0; r < 4; ++r)
+                if ((bad >> (4 * k + r)) & 1u) atomicAdd(ad[k][r], acc[k][r]);
+    }
+#endif
+}
+
+// one row: a copy per row; more rows: at run time
+__device__ __forceinline__ void pf_item_rows(unsigned rm, float* __restrict__ T,
+                                             const unsigned long long* __restrict__ skey, const float4* __restrict__ sg,
+                                             const int* __restrict__ sxo, const int* __restrict__ xo,
+                                             const float* __restrict__ xv, int t0, int t1, int jb, int len, int xol,
+                                             float* scr, float4 sc)
+{
+    switch (rm) {
+        case 1: pf_item<1>(T, skey, sg, sxo, xo, xv, t0, t1, jb, len, xol, 0u, scr, sc); break;
+        case 2: pf_item<2>(T, skey, sg, sxo, xo, xv, t0, t1, jb, len, xol, 0u, scr, sc); break;
+        case 4: pf_item<4>(T, skey, sg, sxo, xo, xv, t0, t1, jb, len, xol, 0u, scr, sc); break;
+        case 8: pf_item<8>(T, skey, sg, sxo, xo, xv, t0, t1, jb, len, xol, 0u, scr, sc); break;
+        default: pf_item<0>(T, skey, sg, sxo, xo, xv, t0, t1, jb, len, xol, rm, scr, sc); break;
+    }
+}
+
+// one CTA per (child range sp, parent tile m). Per chunk of the tile's entries (all stored steps in order): load,
+// bitonic sort by (list address, position) of the chunk's entries, runs of equal address and length = groups (their
+// rows: the union of the members'), items = (group, block of 32 IU children) handed out GI at a time through a shared
+// counter, an item's run from a table (up to LUTN items per chunk; more: binary search from the warp's last run)
+extern "C" __global__ void __launch_bounds__(NW * 32, MINB)
+pf_tile(float* __restrict__ S, long long s_stride, const int2* __restrict__ ent, const int* __restrict__ cnt,
+        const int* __restrict__ xo, const float* __restrict__ xv, const int* __restrict__ cofs,
+        const float* __restrict__ gp, const unsigned long long* __restrict__ gkey, int nslot, int B, int Kx, int Kg,
+        int n_m, float sign, int pc, int cc)
+{
+    if (blockIdx.y * 4 < pc && (blockIdx.x + 1) * KS <= cc) return;     // inside the caller's corner
+    extern __shared__ __align__(16) float smem[];
+    float* T = smem;                                                         // [4][KS]
+    unsigned long long* skey = reinterpret_cast<unsigned long long*>(T + 4 * KS);   // [CH] (address >> 3) << 11 | pos
+    float4* sg = reinterpret_cast<float4*>(skey + CH);                       // [CH] g of the entry's 4 rows
+    int* sxo = reinterpret_cast<int*>(sg + CH);                              // [CH] xo / xv index of the range's first child
+    int* slen = sxo + CH;                                                    // [CH] children in the range
+    int* srows = slen + CH;                                                  // [CH] active rows
+    int* sst = srows + CH;                                                   // [CH + 1] sorted start of run k
+    int* soff = sst + CH + 1;                                                // [CH + 1] items before run k
+    unsigned* srm = reinterpret_cast<unsigned*>(soff + CH + 1);              // [CH] rows of run k
+    float* sscr = reinterpret_cast<float*>(srm + CH);                        // [CH] a scratch word per thread
+    unsigned short* slut = reinterpret_cast<unsigned short*>(sscr + CH);     // [LUTN] run of item it
+    __shared__ int s_ne[MAXSLOT + 1];
+    __shared__ int s_wsum[32];
+    __shared__ int s_next;
+    __shared__ float s_red[4 * NW], s_sc[8];                                 // FX: row sums of g, scales
+    const int sp = blockIdx.x, m = blockIdx.y, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    float* scr = sscr + tid;
+    if (tid == 0) {
+        int q = 0;
+        for (int s = 0; s < nslot; ++s) { s_ne[s] = q; q += cnt[(long long)s * n_m + m]; }
+        s_ne[nslot] = q;
+    }
+    for (int e = tid; e < 4 * KS; e += CH) T[e] = 0.f;
+    sscr[tid] = 0.f;                                  // 0 + 0 keeps its bits: a scratch compare-and-swap never fails
+    __syncthreads();
+    const int NE = s_ne[nslot];
+    if (NE == 0) return;                                                     // CTA-uniform
+    float4 sc = make_float4(0.f, 0.f, 0.f, 0.f);
+#if FX
+    {   // G_r = the row's sum of g over the tile's entries: scale 2^31 / G_r (headroom 2: no element reaches 2^32)
+        float g0 = 0.f, g1 = 0.f, g2 = 0.f, g3 = 0.f;
+        for (int q = tid; q < NE; q += CH) {
+            int s = 0;
+            while (q >= s_ne[s + 1]) ++s;
+            const int2 e = ent[((long long)s * n_m + m) * B + (q - s_ne[s])];
+            const int b = e.x;
+            const unsigned rows = e.y & 15u;
+            const int* cb = cofs + ((long long)s * B + b) * (NSPLIT + 1) + sp;
+            if (cb[1] > cb[0]) {
+                const float* gb = gp + ((long long)s * B + b) * Kg + (e.y >> 4);
+                if (rows & 1u) g0 += gb[0];
+                if (rows & 2u) g1 += gb[__popc(rows & 1u)];
+                if (rows & 4u) g2 += gb[__popc(rows & 3u)];
+                if (rows & 8u) g3 += gb[__popc(rows & 7u)];
+            }
+        }
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) {
+            g0 += __shfl_xor_sync(FULL, g0, o); g1 += __shfl_xor_sync(FULL, g1, o);
+            g2 += __shfl_xor_sync(FULL, g2, o); g3 += __shfl_xor_sync(FULL, g3, o);
+        }
+        if (lane == 0) { s_red[4 * warp] = g0; s_red[4 * warp + 1] = g1; s_red[4 * warp + 2] = g2; s_red[4 * warp + 3] = g3; }
+        __syncthreads();
+        if (tid < 4) {
+            float G = 0.f;
+            for (int w = 0; w < NW; ++w) G += s_red[4 * w + tid];
+            G *= 1.0001f;                                 // the rounding of the sum
+            s_sc[tid] = G > 0.f ? 2147483648.f / G : 0.f;
+            s_sc[4 + tid] = G / 2147483648.f;
+        }
+        __syncthreads();
+        sc = make_float4(s_sc[0], s_sc[1], s_sc[2], s_sc[3]);
+    }
+#endif
+    for (int c0 = 0; c0 < NE; c0 += CH) {
+        unsigned long long key = ~0ull;
+        const int q = c0 + tid;
+        if (q < NE) {
+            int s = 0;
+            while (q >= s_ne[s + 1]) ++s;
+            const int2 e = ent[((long long)s * n_m + m) * B + (q - s_ne[s])];
+            const int b = e.x;
+            const unsigned rows = e.y & 15u;
+            const int* cb = cofs + ((long long)s * B + b) * (NSPLIT + 1) + sp;
+            const int j0 = cb[0], j1 = cb[1];
+            if (j1 > j0) {
+                const float* gb = gp + ((long long)s * B + b) * Kg + (e.y >> 4);
+                float4 g = make_float4(0.f, 0.f, 0.f, 0.f);
+                if (rows & 1u) g.x = gb[0];
+                if (rows & 2u) g.y = gb[__popc(rows & 1u)];
+                if (rows & 4u) g.z = gb[__popc(rows & 3u)];
+                if (rows & 8u) g.w = gb[__popc(rows & 7u)];
+                sg[tid] = g;
+                sxo[tid] = (s * B + b) * Kx + j0;
+                slen[tid] = j1 - j0;
+                srows[tid] = (int)rows;
+                key = ((gkey[(long long)s * B + b] >> 3) << 11) | (unsigned long long)tid;
+            }
+        }
+        skey[tid] = key;
+        __syncthreads();
+        const int nc = NE - c0 < CH ? NE - c0 : CH;      // sort the chunk's entries only (next power of two)
+        int n2 = 2;
+        while (n2 < nc) n2 <<= 1;
+        for (int k = 2; k <= n2; k <<= 1)
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                const int p = tid ^ j;
+                if (p > tid && p < n2) {
+                    const unsigned long long a = skey[tid], c = skey[p];
+                    if ((a > c) == ((tid & k) == 0)) { skey[tid] = c; skey[p] = a; }
+                }
+                __syncthreads();
+            }
+        // runs: equal list address and length
+        const unsigned long long a = skey[tid];
+        const bool valid = a != ~0ull;
+        bool start = false;
+        if (valid) {
+            start = tid == 0;
+            if (!start) {
+                const unsigned long long pa = skey[tid - 1];
+                start = (pa >> 11) != (a >> 11) || slen[pa & 2047] != slen[a & 2047];
+            }
+        }
+        int nrun = 0, nvalid = 0, nitem = 0;
+        const int rk = block_exscan(start ? 1 : 0, s_wsum, lane, warp, &nrun);
+        block_exscan(valid ? 1 : 0, s_wsum, lane, warp, &nvalid);
+        if (start) sst[rk] = tid;
+        if (tid == 0) { sst[nrun] = nvalid; s_next = 0; }
+        __syncthreads();
+        int ni = 0;
+        if (tid < nrun) {
+            const int t0 = sst[tid], t1 = sst[tid + 1];
+            ni = (slen[skey[t0] & 2047] + 32 * IU - 1) / (32 * IU);
+            unsigned rmu = 0;
+            for (int t = t0; t < t1; ++t) rmu |= (unsigned)srows[skey[t] & 2047];
+            srm[tid] = rmu;
+        }
+        const int io = block_exscan(ni, s_wsum, lane, warp, &nitem);
+        if (tid < nrun) soff[tid] = io;
+        if (tid == 0) soff[nrun] = nitem;
+        if (nitem <= LUTN && tid < nrun)                  // the run of every item (CTA-uniform condition)
+            for (int it = io; it < io + ni; ++it) slut[it] = (unsigned short)tid;
+        __syncthreads();
+        int lo = 0;                                       // the warp's current run
+        while (true) {
+            int it0 = 0;
+            if (lane == 0) it0 = atomicAdd(&s_next, GI);
+            it0 = __shfl_sync(FULL, it0, 0);
+            if (it0 >= nitem) break;
+            const int itn = it0 + GI < nitem ? it0 + GI : nitem;
+            if (nitem <= LUTN) {
+                for (int it = it0; it < itn; ++it) {
+                    const int k = slut[it];
+                    const int t0 = sst[k], t1 = sst[k + 1];
+                    const int lead = (int)(skey[t0] & 2047);
+                    pf_item_rows(srm[k], T, skey, sg, sxo, xo, xv, t0, t1, (it - soff[k]) * 32 * IU + lane, slen[lead],
+                                 sxo[lead], scr, sc);
+                }
+                continue;
+            }
+            {                                             // the run of it0: the other warps took the items in between
+                int lb = lo, ub = nrun;
+                while (ub - lb > 1) { const int mid = (lb + ub) >> 1; if (soff[mid] <= it0) lb = mid; else ub = mid; }
+                lo = lb;
+            }
+            for (int it = it0; it < itn; ++it) {
+                while (soff[lo + 1] <= it) ++lo;
+                const int t0 = sst[lo], t1 = sst[lo + 1];
+                const int lead = (int)(skey[t0] & 2047);
+                pf_item_rows(srm[lo], T, skey, sg, sxo, xo, xv, t0, t1, (it - soff[lo]) * 32 * IU + lane, slen[lead],
+                             sxo[lead], scr, sc);
+            }
+        }
+        __syncthreads();                                  // before the next chunk reuses the arrays
+    }
+    // S += sign T (FX: T u32, times G_r / 2^31): 16-byte reads and writes of 4 consecutive children where S's rows
+    // allow it (4 per thread in flight, groups of 4 zeros skipped), else 4 single values per thread in flight
+#if H_IN % 4 == 0
+    const bool vec = (((unsigned long long)S | (unsigned long long)(s_stride * 4)) & 15ull) == 0;
+#else
+    const bool vec = false;
+#endif
+    if (vec) {
+        const float4* T4 = reinterpret_cast<const float4*>(T);
+        for (int q0 = tid; q0 < KS; q0 += 4 * CH) {
+            float4 tv[4], sv[4];
+            float4* ad[4];
+            bool ok[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int q = q0 + u * CH, r = q / (KS / 4), c4 = q - r * (KS / 4), h = m * 4 + r, col = sp * KS + 4 * c4;
+                ok[u] = q < KS && h < H_OUT && col < H_IN;
+#if FX
+                const uint4 tu = ok[u] ? reinterpret_cast<const uint4*>(T)[q] : make_uint4(0u, 0u, 0u, 0u);
+                const float f = s_sc[4 + (r & 3)];
+                tv[u] = make_float4(__uint2float_rn(tu.x) * f, __uint2float_rn(tu.y) * f, __uint2float_rn(tu.z) * f,
+                                    __uint2float_rn(tu.w) * f);
+#else
+                tv[u] = ok[u] ? T4[q] : make_float4(0.f, 0.f, 0.f, 0.f);
+#endif
+                ok[u] = ok[u] && (tv[u].x != 0.f || tv[u].y != 0.f || tv[u].z != 0.f || tv[u].w != 0.f);
+                ad[u] = reinterpret_cast<float4*>(S + (long long)h * s_stride + col);
+            }
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) if (ok[u]) sv[u] = *ad[u];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u)
+                if (ok[u]) *ad[u] = make_float4(sv[u].x + sign * tv[u].x, sv[u].y + sign * tv[u].y,
+                                                sv[u].z + sign * tv[u].z, sv[u].w + sign * tv[u].w);
+        }
+    } else {
+        for (int e0 = tid; e0 < 4 * KS; e0 += 4 * CH) {
+            float tv[4], sv[4];
+            long long ad[4];
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) {
+                const int e = e0 + u * CH, r = e / KS, c = e - r * KS, h = m * 4 + r, col = sp * KS + c;
+#if FX
+                tv[u] = (e < 4 * KS && h < H_OUT && col < H_IN)
+                    ? __uint2float_rn(reinterpret_cast<const unsigned*>(T)[e]) * s_sc[4 + (r & 3)] : 0.f;
+#else
+                tv[u] = (e < 4 * KS && h < H_OUT && col < H_IN) ? T[e] : 0.f;
+#endif
+                ad[u] = (long long)h * s_stride + col;
+            }
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) sv[u] = tv[u] != 0.f ? S[ad[u]] : 0.f;
+            #pragma unroll
+            for (int u = 0; u < 4; ++u) if (tv[u] != 0.f) S[ad[u]] = sv[u] + sign * tv[u];
+        }
+    }
+}
+"""
+_PFLOW_KERNELS: Dict[tuple, tuple] = {}
+_PFLOW_MAXSLOT = 32
+"""Stored steps one accumulation can take (pf_tile's shared slot offsets)."""
+
+
+def pflow_tile_shape(H_in: int, H_out: int, slab_bytes: int = 128 * 1024) -> Tuple[int, int, int]:
+    """``(KS, NSPLIT, n_m)`` of the parameter-flow tiles: 4 parent rows x ``KS`` children (fp32 within
+    ``slab_bytes``), ``NSPLIT`` ranges of children, ``n_m`` parent tiles."""
+    KS, nsplit = slab_shape(H_in, 4, slab_bytes)
+    assert KS % 32 == 0, KS
+    return KS, nsplit, -(-H_out // 4)
+
+
+def pflow_tile_iu(H_in: int, H_out: int) -> int:
+    """Blocks of 32 children per item of ``pf_tile`` (pf_bench2 2026-10-29: 4 blocks with 2 items per counter step
+    beat 2 x 4, 3 x 4 and 4 x 4 on 8k B=512..2048 and 16k B=256..1024)."""
+    return 4
+
+
+def pflow_tile_kernels(H_in: int, H_out: int, NW: int = 32, min_blocks: int = 1,
+                       slab_bytes: int = 128 * 1024, fixed: bool = True) -> tuple:
+    """``(lists, pack_x, pack_g, tile kernel, tile smem bytes)`` for ``W [H_out, H_in]``; ``NW`` warps per tile
+    (the sort chunk: ``32 NW`` entries); ``fixed``: the tile in 32-bit fixed point (else fp32)."""
+    assert 1 <= NW <= 32 and NW & (NW - 1) == 0, NW
+    KS, nsplit, _ = pflow_tile_shape(H_in, H_out, slab_bytes)
+    iu = pflow_tile_iu(H_in, H_out)
+    key = (H_in, H_out, NW, min_blocks, KS, bool(fixed), iu)
+    hit = _PFLOW_KERNELS.get(key)
+    if hit is None:
+        ch = NW * 32
+        smem = 4 * KS * 4 + ch * (8 + 16 + 3 * 4) + 2 * (ch + 1) * 4 + 2 * ch * 4 + 8192 * 2   # + item table
+        assert smem <= SMEM_LIMIT, (smem, KS, NW)
+        # iu blocks of 32 children per item, 2 items per counter step (pf_bench2 2026-10-29; 64 KB tiles with 16
+        # warps, 2 per SM, are slower)
+        defines = dict(H_IN=H_in, H_OUT=H_out, KS=KS, NSPLIT=nsplit, NW=NW, MINB=min_blocks, IU=iu, GI=2,
+                       MAXSLOT=_PFLOW_MAXSLOT, FX=int(bool(fixed)))
+        src = "".join(f"#define {k} {v}\n" for k, v in defines.items()) + _PFLOW_SRC
+        hit = (CudaKernel(src, "pf_lists", ["ptr", "ptr", "ptr", "ptr", "ptr", "i32"]),
+               CudaKernel(src, "pf_pack_x", ["ptr", "ptr", "ptr", "ptr", "i32", "ptr", "ptr", "i64", "ptr", "ptr",
+                                             "ptr"]),
+               CudaKernel(src, "pf_pack_g", ["ptr", "i32", "ptr", "i64", "ptr", "i64", "ptr", "ptr", "ptr"]),
+               CudaKernel(src, "pf_tile", ["ptr", "i64", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "ptr", "i32",
+                                           "i32", "i32", "i32", "i32", "f32", "i32", "i32"], max_shared=smem), smem)
+        _PFLOW_KERNELS[key] = hit
+    return hit
+
+
+def pflow_tile_stash(bufs: dict, slot: int, sv_in, sv_out, sv_flow_out, max_val: torch.Tensor, B: int,
+                     H_in: int, H_out: int, slab_bytes: int = 128 * 1024) -> None:
+    """Pack one step's parameter-flow inputs into stash ``slot`` of ``bufs`` (``ent [S, n_m, B, 2]``,
+    ``cnt [S, n_m]``, ``xo [S, B, Kx]``, ``xv [S, B, Kx]`` (float32), ``cofs [S, B, NSPLIT + 1]``, ``gkey [S, B]``
+    (int64), ``gp [S, B, Kg]``): the samples of every parent tile, the children (offset in the range, x), their range
+    starts and the address of the child list, the parents' g. Graph-capturable, no host sync."""
+    lists, pack_x, pack_g, _, _ = pflow_tile_kernels(H_in, H_out, slab_bytes=slab_bytes)
+    ent, cnt, xo, xv, cofs, gkey, gp = (bufs[k][slot] for k in ("ent", "cnt", "xo", "xv", "cofs", "gkey", "gp"))
+    Kx, Kg = xo.shape[1], gp.shape[1]
+    assert sv_in.total_nnz <= Kx and sv_out.total_nnz <= Kg
+    device = gp.device
+    cnt.zero_()
+    lists((-(-sv_out.total_nnz // 256), B), (256,),
+          [ent, cnt, sv_out.indices, sv_out.col_starts, sv_out.nnz, B], device=device)
+    pack_x((-(-(sv_in.total_nnz + 1) // 256), B), (256,),
+           [xo, xv, cofs, gkey, Kx, sv_in.indices, sv_in.values, sv_in.values.stride(0), sv_in.col_starts,
+            sv_in.nnz, max_val], device=device)
+    pack_g((-(-sv_out.total_nnz // 256), B), (256,),
+           [gp, Kg, sv_flow_out.values, sv_flow_out.values.stride(0), sv_out.values, sv_out.values.stride(0),
+            max_val, sv_in.nnz, sv_out.nnz], device=device)
+
+
+def pflow_tile_flush(S: torch.Tensor, bufs: dict, nslot: int, B: int, H_in: int, H_out: int,
+                     sign: float = 1.0, NW: int = 32, min_blocks: int = 1, slab_bytes: int = 128 * 1024,
+                     corner: Tuple[int, int] = (0, 0), fixed: bool = True) -> None:
+    """``S [H_out, H_in] += sign * sum over the first nslot stored steps of g x^T`` (active pairs), except the
+    pairs with parent < ``corner[0]`` and child < ``corner[1]`` (a multiple of the tile width). ``fixed``: the
+    tiles in 32-bit fixed point (needs ``x = exp(v - max_val) <= 1``, i.e. ``max_val`` at least the sample's largest
+    input value, as the upstream product layers give it; else fp32 compare-and-swap adds)."""
+    if nslot == 0:
+        return
+    assert nslot <= _PFLOW_MAXSLOT
+    _, _, _, tile, smem = pflow_tile_kernels(H_in, H_out, NW, min_blocks, slab_bytes, fixed)
+    KS, nsplit, n_m = pflow_tile_shape(H_in, H_out, slab_bytes)
+    assert corner[1] % KS == 0 or corner[1] >= H_in, (corner, KS)
+    ent, cnt, xo, xv, cofs, gkey, gp = (bufs[k] for k in ("ent", "cnt", "xo", "xv", "cofs", "gkey", "gp"))
+    assert xo.shape[0] * B * xo.shape[2] < 1 << 31, "stash too large for 32-bit child offsets"
+    tile((nsplit, n_m), (NW * 32,),
+         [S, S.stride(0), ent, cnt, xo, xv, cofs, gp, gkey, nslot, B, xo.shape[2], gp.shape[2], n_m, float(sign),
+          int(corner[0]), int(corner[1])], shared_mem=smem, device=S.device)
+
+
 _SLAB_FWD_ARGS = ["ptr", "i64", "ptr", "i64", "ptr", "i32", "ptr", "ptr", "ptr",
-                  "ptr", "ptr", "i32", "ptr", "i64", "tmap", "ptr", "i64", "i32"]
+                  "ptr", "ptr", "i32", "ptr", "i64", "tmap", "ptr", "i64", "i32", "ptr", "ptr"]
 _SLAB_FIN_FLOW_ARGS = ["ptr", "i64", "ptr", "ptr", "i64", "ptr"]
-_SLAB_PACK_G_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr", "ptr", "ptr", "i64", "ptr", "i64", "ptr", "ptr"]
+_SLAB_PACK_G_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr", "ptr", "ptr", "i64", "ptr", "i64", "ptr", "ptr", "ptr"]
 _SLAB_LIST_ARGS = ["ptr", "ptr", "ptr", "ptr", "ptr", "i32", "ptr", "i64"]
 _SLAB_FIN_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr"]
 _SLAB_KERNELS: Dict[tuple, tuple] = {}
-_PACK_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr", "i64", "ptr", "ptr", "ptr"]
+_PACK_ARGS = ["ptr", "i64", "ptr", "ptr", "ptr", "i64", "ptr", "ptr", "ptr", "ptr"]
 
 FORCE_LOADER: Optional[int] = (int(os.environ["PYJUICE_SPARSE_IO_WS_SPARSE_LOADER"])
                                if os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_LOADER") else None)
@@ -843,16 +1779,25 @@ def slab_shape(H_in: int, TMS: int, slab_bytes: int) -> Tuple[int, int]:
         nsplit += 1
 
 
-def slab_smem(KS: int, TMS: int, pf: int = 0) -> int:
+def slab_smem(KS: int, TMS: int, pf: int = 0, group_nt: int = 0) -> int:
     """Dynamic shared memory of a slab CTA: the slab (and the param-flow
     accumulator: ``pf`` 1 fp32, 2 fixed point in two u32 arrays), its barrier
-    and the item counter."""
-    return KS * TMS * 4 * (1 + int(pf)) + 16
+    and the item counter; with ``group_nt`` (the CTA's threads, ``GROUP``) the
+    sort keys, entries and group list of one chunk of the tile's list."""
+    return KS * TMS * 4 * (1 + int(pf)) + 16 + (group_nt * 20 + 128 if group_nt else 0)
+
+
+def slab_rows_ok(TMS: int, GL: int, group: int = 0, stream: int = 0, pf: int = 0) -> bool:
+    """Whether the slab kernels can read row-by-row slabs (``rows``): 4-row tiles, 32 lanes per item,
+    no grouped or software-pipelined walk, no fused parameter flows; the slabs must come from the
+    slab-order copies (``wslab``)."""
+    return TMS == 4 and GL == 32 and not group and not stream and not pf
 
 
 def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
                  loader: int, min_blocks: int, bwd: bool = False, GL: int = 32,
-                 pf: int = 0, swz: bool = False, static: bool = False, ahead: int = 1) -> tuple:
+                 pf: int = 0, swz: bool = False, static: bool = False, ahead: int = 1,
+                 group: int = 0, pipe: bool = False, stream: int = 0, rows: bool = False) -> tuple:
     """``(lists, pack, main, finalize, perm kernels, main smem bytes)`` of a block
     shape: the forward (tiles of parents, ranges of children) or with
     ``bwd`` the element-flow backward (tiles of children, ranges of
@@ -862,17 +1807,27 @@ def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
     ``loader`` 9, 8 / 16-row tiles) reads swizzled rows; ``static`` hands the
     items to the warps round-robin, with ``ahead`` 2 loading the list entries two
     items ahead. ``perm`` (``ws_slab_perm``) reorders the packed lists for fewer
-    bank conflicts of 16-byte slab rows."""
+    bank conflicts of 16-byte slab rows. ``group`` (2 / 4 / 8; 4-row tiles, ``GL``
+    32, no ``pf``, ``NWARP`` a power of two) lets a warp walk up to that many
+    samples with the same walked column at once. ``rows`` (:func:`slab_rows_ok`) reads 4-row slabs stored
+    row by row (:func:`slab_wcopy` with ``rows``), one 4-byte load per active row."""
     assert GL in (4, 8, 16, 32) and not (pf and not bwd) and ahead in (1, 2)
+    assert group in (0, 2, 4, 8) and not (group and (pf or TMS != 4 or GL != 32 or NWARP & (NWARP - 1)))
     assert not (swz and (loader != 9 or TMS not in (8, 16)))
-    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd, GL, pf, swz, static, ahead)
+    pipe = bool(pipe and group)
+    assert not (stream and (group or pf or GL != 32 or TMS not in (4, 8)))
+    rows = bool(rows)
+    assert not rows or (slab_rows_ok(TMS, GL, group, stream, pf) and loader == 9 and not swz)
+    key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd, GL, pf, swz, static, ahead, group, pipe,
+           stream, rows)
     hit = _SLAB_KERNELS.get(key)
     if hit is None:
-        smem = slab_smem(KS, TMS, pf)
+        smem = slab_smem(KS, TMS, pf, NWARP * 32 if group else 0)
         n_split = -(-(H_out if bwd else H_in) // KS)
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
                        NWARP=NWARP, LOADER=loader, MINB=min_blocks, BWD=int(bwd), BOXW=min(KS, 256),
-                       GL=GL, PF=int(pf), SWZ=int(swz), STATIC=int(static), AHEAD=ahead)
+                       GL=GL, PF=int(pf), SWZ=int(swz), STATIC=int(static), AHEAD=ahead, GROUP=group,
+                       PIPE=int(pipe), STREAM=stream, ROWS=int(rows))
         src = ("".join(f"#define {k} {v}\n" for k, v in defines.items())
                + f"#define NSPLIT_OVERRIDE {n_split}\n" + _SLAB_SRC)
         main = CudaKernel(src, "ws_slab_bwd" if bwd else "ws_slab_fwd", _SLAB_FWD_ARGS, max_shared=smem)
@@ -901,19 +1856,22 @@ def slab_copy_numel(H_in: int, H_out: int, TMS: int, slab_bytes: int, bwd: bool 
 
 
 def slab_wcopy(dst: torch.Tensor, w: torch.Tensor, w_start: int, H_in: int, H_out: int, BS: int,
-               TMS: int, slab_bytes: int, swz: bool = False, bwd: bool = False) -> None:
+               TMS: int, slab_bytes: int, swz: bool = False, bwd: bool = False, rows: bool = False) -> None:
     """Write W (block layout of :class:`SparseIOSumLayer` at ``w[w_start:]``) into ``dst`` in
     slab order: one contiguous ``[KS, TMS]`` slab per (parent tile, child range) for the
     forward, per (child tile, parent range) with ``bwd``, as the bulk loader of
-    :func:`ws_slab_forward` / :func:`ws_slab_backward` (``wslab``) reads it. One pass over W."""
+    :func:`ws_slab_forward` / :func:`ws_slab_backward` (``wslab``) reads it. One pass over W. With
+    ``rows`` (4-row tiles) each slab is stored row by row, ``[TMS, KS]``."""
     H_r = H_out if bwd else H_in
     KS, nsplit = slab_shape(H_r, TMS, slab_bytes)
     swz = swz and TMS in (8, 16)
-    key = (H_in, H_out, BS, TMS, KS, swz, bwd)
+    rows = bool(rows)
+    assert not rows or TMS == 4
+    key = (H_in, H_out, BS, TMS, KS, swz, bwd, rows)
     k = _WCOPY_KERNELS.get(key)
     if k is None:
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
-                       NWARP=4, LOADER=9, MINB=1, BWD=int(bwd), BOXW=min(KS, 256), SWZ=int(swz))
+                       NWARP=4, LOADER=9, MINB=1, BWD=int(bwd), BOXW=min(KS, 256), SWZ=int(swz), ROWS=int(rows))
         src = ("".join(f"#define {k_} {v}\n" for k_, v in defines.items())
                + f"#define NSPLIT_OVERRIDE {nsplit}\n" + _SLAB_SRC)
         k = _WCOPY_KERNELS[key] = CudaKernel(src, "ws_slab_wcopy_bwd" if bwd else "ws_slab_wcopy",
@@ -934,7 +1892,9 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
                     TMS: int = 4, slab_bytes: int = 64 * 1024, NWARP: int = 16,
                     min_blocks: int = 3, GL: int = 32, swz: bool = False,
                     static: bool = False, wslab: Optional[torch.Tensor] = None,
-                    ahead: int = 1, perm: bool = False) -> None:
+                    ahead: int = 1, perm: bool = False, group: int = 0,
+                    xv: Optional[torch.Tensor] = None, pipe: bool = False, stream: int = 0,
+                    rows: bool = False) -> None:
     """Build the per-tile sample lists, pack the input columns and run the
     slab forward for one block, writing ``out_vals[b, i]`` (row stride
     ``out_vals.stride(0)``) for every active parent ``i`` of every sample;
@@ -946,10 +1906,19 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
     the slabs are read from it with bulk copies, any tile height. ``ahead`` 2 (with
     ``static``) loads the list entries two items ahead; ``perm`` reorders the packed
     input columns for fewer bank conflicts (4-row tiles, ``GL`` 32; ignored otherwise).
+    ``group`` (2 / 4 / 8; 4-row tiles, ``GL`` 32, ``NWARP`` a power of two; ignored
+    otherwise) walks up to that many samples with the same input column per warp; scratch
+    ``xv`` (float32 ``[B, >= K_in]``, row stride ``xp.stride(0) // 2``) holds their values.
+    ``rows``: ``wslab`` holds row-by-row slabs (:func:`slab_wcopy` with ``rows``; only where
+    :func:`slab_rows_ok`), read with one 4-byte load per active row.
     Graph-capturable, no host sync."""
     assert TMS in (1, 2, 4, 8, 16)
     KS, nsplit = slab_shape(H_in, TMS, slab_bytes)
     perm = perm and TMS == 4 and GL == 32
+    group = group if (TMS == 4 and GL == 32 and not NWARP & (NWARP - 1)) else 0
+    assert not group or (xv is not None and xv.stride(0) == xp.stride(0) // 2 and xv.dtype == torch.float32)
+    stream = stream if (TMS in (4, 8) and GL == 32 and not group) else 0
+    perm = perm and not group                         # the group's values (xv) keep the packed order
     ahead = ahead if static else 1
     assert sv_out.values.shape[-1] < 1 << (31 - TMS), "output columns too long for the list entries"
     n_m = -(-H_out // TMS)
@@ -960,8 +1929,13 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
     swz = swz and wslab is not None and TMS in (8, 16)
     if wslab is not None:                             # slab-order copy of W: bulk loads
         loader, w, w_start = 9, wslab, 0
+    rows = bool(rows)
+    assert not rows or (wslab is not None and slab_rows_ok(TMS, GL, group, stream)), "rows: see slab_rows_ok"
+    perm = perm and not rows                          # the bank-group order is for 16-byte rows
     lists, pack, fwd, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
-                                                       GL=GL, swz=swz, static=static, ahead=ahead)
+                                                       GL=GL, swz=swz, static=static, ahead=ahead, group=group,
+                                                       pipe=pipe, stream=stream, rows=rows)
+    xv = xv if group else max_val                     # unread without ``group``
     K = sv_in.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
     assert ent.shape[0] >= n_m and ent.stride(0) == 2 * B and cnt.numel() >= n_m
@@ -981,12 +1955,12 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
           device=device)
     pack((-(-(K + 1) // 256), B), (256,),
          [xp, xp.stride(0) // 2, cofs, sv_in.indices, sv_in.values, sv_in.values.stride(0),
-          sv_in.col_starts, sv_in.nnz, max_val], device=device)
+          sv_in.col_starts, sv_in.nnz, max_val, xv], device=device)
     if perm:
         perm_k((-(-(K + 32 * nsplit) // 256), B), (256,), [xp, xp.stride(0) // 2, cofs], device=device)
     fwd((nsplit, n_m), (NWARP * 32,),
         [out_vals, out_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
-         ent, cnt, B, max_val, 0, tmap, max_val, 0, 0], shared_mem=smem, device=device)
+         ent, cnt, B, max_val, 0, tmap, max_val, 0, 0, sv_in.col_starts, xv], shared_mem=smem, device=device)
     if nsplit > 1:
         fin((-(-sv_out.total_nnz // 256), B), (256,),
             [out_vals, out_vals.stride(0), sv_out.nnz, sv_in.nnz, max_val], device=device)
@@ -999,7 +1973,9 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
                      min_blocks: int = 3, GL: int = 32, static: bool = False, pflow: Optional[torch.Tensor] = None,
                      pf_start: int = 0, pf_neg: bool = False, pf_fixed: bool = False,
                      wslab: Optional[torch.Tensor] = None, swz: bool = False,
-                     ahead: int = 1, perm: bool = False) -> None:
+                     ahead: int = 1, perm: bool = False, group: int = 0,
+                     xv: Optional[torch.Tensor] = None, pipe: bool = False, stream: int = 0,
+                     rows: bool = False) -> None:
     """Element flows of one block: ``flow_vals[b, k] = exp(in[b, k] - max_b)
     * sum_h g[b, h] W[h, c_k]`` over the sample's active parents ``h`` (``g =
     nflow * exp(max_b - nmars)``), for every active child ``c_k`` — the slab
@@ -1015,11 +1991,17 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
     ``wslab`` (:func:`slab_wcopy` with ``bwd``, same ``TMS`` / ``slab_bytes`` /
     ``swz``) the slabs come from that copy with bulk loads, ``[KS parents][TMS
     children]``: one 16-byte read per quarter instead of four. ``ahead`` / ``perm`` as in
-    :func:`ws_slab_forward` (``perm`` only with ``wslab``: 16-byte rows).
+    :func:`ws_slab_forward` (``perm`` only with ``wslab``: 16-byte rows); ``group`` / ``xv``
+    as there, over samples with the same output column (not with ``pflow``); ``rows`` as there
+    (row-by-row backward slabs, ``[TMS children][KS parents]``; not with ``pflow``).
     Graph-capturable, no host sync."""
     assert TMS in (1, 2, 4, 8, 16)
     KS, nsplit = slab_shape(H_out, TMS, slab_bytes)
     perm = perm and TMS == 4 and GL == 32 and wslab is not None
+    group = group if (TMS == 4 and GL == 32 and not NWARP & (NWARP - 1) and pflow is None) else 0
+    assert not group or (xv is not None and xv.stride(0) == xp.stride(0) // 2 and xv.dtype == torch.float32)
+    stream = stream if (TMS in (4, 8) and GL == 32 and not group and pflow is None) else 0
+    perm = perm and not group                         # the group's values (xv) keep the packed order
     ahead = ahead if static else 1
     assert sv_in.values.shape[-1] < 1 << (31 - TMS), "input columns too long for the list entries"
     boxw = min(KS, 256)
@@ -1032,9 +2014,14 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
         loader, w, w_start = 9, wslab, 0
     pf = 0 if pflow is None else (2 if pf_fixed else 1)
     assert pf != 2 or B < 1 << 14, "fixed-point param flows: fewer than 2^14 samples"
+    rows = bool(rows)
+    assert not rows or (wslab is not None and slab_rows_ok(TMS, GL, group, stream, pf)), "rows: see slab_rows_ok"
+    perm = perm and not rows
     lists, pack, main, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
                                                         bwd=True, GL=GL, pf=pf, static=static, swz=swz,
-                                                        ahead=ahead)
+                                                        ahead=ahead, group=group, pipe=pipe, stream=stream,
+                                                        rows=rows)
+    xv = xv if group else max_val                     # unread without ``group``
     K = sv_out.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
     assert ent.shape[0] >= n_t and ent.stride(0) == 2 * B and cnt.numel() >= n_t
@@ -1055,13 +2042,14 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
     pack((-(-(K + 1) // 256), B), (256,),
          [xp, xp.stride(0) // 2, cofs, sv_out.indices, sv_out.col_starts, sv_out.nnz,
           sv_flow_out.values, sv_flow_out.values.stride(0), sv_out.values, sv_out.values.stride(0),
-          max_val, sv_in.nnz], device=device)
+          max_val, sv_in.nnz, xv], device=device)
     if perm:
         perm_k((-(-(K + 32 * nsplit) // 256), B), (256,), [xp, xp.stride(0) // 2, cofs], device=device)
     main((nsplit, n_t), (NWARP * 32,),
          [flow_vals, flow_vals.stride(0), w, w_start, xp, xp.stride(0) // 2, cofs, max_val, sv_in.nnz,
           ent, cnt, B, sv_in.values, sv_in.values.stride(0), tmap,
-          pflow if pf else flow_vals, pf_start, int(pf_neg)], shared_mem=smem, device=device)
+          pflow if pf else flow_vals, pf_start, int(pf_neg), sv_out.col_starts, xv],
+         shared_mem=smem, device=device)
     if nsplit > 1:
         fin((-(-sv_in.total_nnz // 256), B), (256,),
             [flow_vals, flow_vals.stride(0), sv_in.nnz, sv_in.values, sv_in.values.stride(0), max_val],
