@@ -80,6 +80,7 @@ def _set(monkeypatch, mode, prec="ieee", sparse=None, **knobs):
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
     if sparse is not None:
         monkeypatch.setattr(sio, "_WS_SPARSE_MODE", "always" if sparse else "never")
+    knobs.setdefault("SLAB_W16", False)       # the exactness tests read W in fp32; test_sparse_w16 covers bf16
     for k, v in knobs.items():
         if k == "SLAB_NWARP":
             v = {t: v for t in (1, 2, 4, 8, 16)}
@@ -153,6 +154,44 @@ def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
     rtol = 1e-4 if prec == "ieee" else 3e-3
     _assert_flows_close(pf, pf_ref, rtol, "transition param flows")
     _assert_flows_close(emit, emit_ref, rtol, "emission param flows")
+
+
+@pytest.mark.parametrize("tm", [4, 8])
+@pytest.mark.parametrize("H,V,T,bs,density,B", [
+    (96, 30, 5, 32, 0.25, 9),
+    (128, 40, 7, 16, 0.2, 70),
+    (2048, 300, 4, 1024, 0.02, 300),
+])
+def test_sparse_w16(monkeypatch, H, V, T, bs, density, B, tm):
+    """bf16 slab-order copies of W (``_WS_SPARSE_SLAB_W16``): the forward and the element-flow
+    backward read W rounded to 8 bits of mantissa; the likelihoods and flows stay within the
+    rounding (about 2^-9 relative per weight) of the exact gather path, and the bf16 copies
+    are what the kernels read (not bit-identical to fp32)."""
+    pc = _build(H, V, T, bs, density)
+    data = torch.randint(0, V, (B, T), device=DEV)
+    _set(monkeypatch, "never")
+    ll_ref, pf_ref, emit_ref = _pass(pc, data)
+    calls = _count(monkeypatch)
+    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=tm, SLAB_W16=True)
+    ll, pf, emit = _pass(pc, data)
+    assert calls["sparse"] == T - 1 and calls["bwd_sparse"] == T - 1
+    assert (ll - ll_ref).abs().max() > 0, "bf16 copies not in use (bit-identical to fp32)"
+    torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=4e-3 * T)
+    _assert_flows_close(pf, pf_ref, 2e-2, "transition param flows")
+    _assert_flows_close(emit, emit_ref, 2e-2, "emission param flows")
+
+
+def test_sparse_w16_forest(monkeypatch):
+    """The same on a circuit that is not a chain (two chains under one root)."""
+    pc, V, n_vars = _build_forest()
+    data = torch.randint(0, V, (24, n_vars), device=DEV)
+    _set(monkeypatch, "never")
+    ll_ref, pf_ref, emit_ref = _pass(pc, data)
+    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=8, SLAB_W16=True)
+    ll, pf, emit = _pass(pc, data)
+    torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=2e-2)
+    _assert_flows_close(pf, pf_ref, 2e-2, "transition param flows")
+    _assert_flows_close(emit, emit_ref, 2e-2, "emission param flows")
 
 
 @pytest.mark.parametrize("loader", [None, 1])

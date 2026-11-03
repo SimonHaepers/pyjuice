@@ -139,6 +139,33 @@ _SLAB_SRC = r"""
 #define SLAB_MAIN ws_slab_fwd
 #endif
 #define FULL 0xffffffffu
+// W16: the slab holds W in bf16 (WB = 2 bytes per element) instead of fp32: the slab-order copies are written in
+// bf16 by the copy kernels (round to nearest even), a quarter (4 rows) of a child is one 8-byte read unpacked by
+// shifts, a row one 2-byte read. Only from the slab-order copies (LOADER 9), 4- to 16-row tiles, no swizzle. The
+// param-flow accumulator S keeps the fp32 layout: byte offsets into W scale by 4 / WB for S (S_OFF, SROWOFF).
+#ifndef W16
+#define W16 0
+#endif
+#if W16 && (LOADER != 9 || TMS < 4 || SWZ)
+#error "W16 needs the slab-order copies, 4- to 16-row tiles and no swizzle"
+#endif
+#define WB (W16 ? 2 : 4)
+#define SLAB_BYTES (KS * TMS * WB)
+#define S_OFF(x) ((x) * (4 / WB))
+__device__ __forceinline__ unsigned short f2bf_(float f) {
+    const unsigned u = __float_as_uint(f);
+    return (unsigned short)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+__device__ __forceinline__ float bf2f_(unsigned short h) { return __uint_as_float((unsigned)h << 16); }
+__device__ __forceinline__ float4 unpack16_(uint2 u) {
+    return make_float4(__uint_as_float(u.x << 16), __uint_as_float(u.x & 0xffff0000u),
+                       __uint_as_float(u.y << 16), __uint_as_float(u.y & 0xffff0000u));
+}
+#if W16
+#define WSTORE(dst, i, v) reinterpret_cast<unsigned short*>(dst)[i] = f2bf_(v)
+#else
+#define WSTORE(dst, i, v) (dst)[i] = (v)
+#endif
 
 __device__ __forceinline__ unsigned smem_addr(const void* p) {
     return static_cast<unsigned>(__cvta_generic_to_shared(p));
@@ -166,7 +193,7 @@ ws_slab_pack(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cofs,
     for (int k = kp + 1; k <= kc; ++k) cb[k] = j;
     if (j < n) {
         const float x = expf(in_vals[(long long)b * in_stride + j] - fmaxf(max_val[b], -1e30f));
-        xp[(long long)b * xp_stride + j] = make_int2((c % KS) * (ROWS ? 4 : TMS * 4), __float_as_int(x));
+        xp[(long long)b * xp_stride + j] = make_int2((c % KS) * (ROWS ? WB : TMS * WB), __float_as_int(x));
 #if GROUP
         xv[(long long)b * xp_stride + j] = x;          // the values alone, for the other members of a group
 #endif
@@ -284,14 +311,14 @@ ws_slab_wcopy(float* __restrict__ dst, const float* __restrict__ w, long long w_
         const int tb = e / (32 * TMS), rem = e - tb * (32 * TMS), r = rem / 32, cl = rem - r * 32;
         const int m = (h0 + tb * TMS) / TMS, cin = j0 - sp * KS + cl;
         if (m * TMS < ((H_OUT + TMS - 1) / TMS) * TMS)
-            dst[((long long)(m * NSPLIT + sp) * TMS + r) * KS + cin] = t[cl][tb * TMS + r];
+            WSTORE(dst, ((long long)(m * NSPLIT + sp) * TMS + r) * KS + cin, t[cl][tb * TMS + r]);
 #else
         // e = (tile in the block, child, row): each tile's 32 rows of TMS floats are contiguous
         const int tb = e / (32 * TMS), rem = e - tb * (32 * TMS), cl = rem / TMS, r = rem - cl * TMS;
         const int m = (h0 + tb * TMS) / TMS, cin = j0 - sp * KS + cl;
         const int rr = SWZ ? r ^ ((((cin * TMS * 4) >> 7) & SWM) << 2) : r;
         if (m * TMS < ((H_OUT + TMS - 1) / TMS) * TMS)
-            dst[((long long)(m * NSPLIT + sp) * KS + cin) * TMS + rr] = t[cl][tb * TMS + r];
+            WSTORE(dst, ((long long)(m * NSPLIT + sp) * KS + cin) * TMS + rr, t[cl][tb * TMS + r]);
 #endif
     }
 }
@@ -343,10 +370,20 @@ ws_slab_lists(int2* __restrict__ ent, int* __restrict__ cnt, const long long* __
 #define WROW(base, r) (reinterpret_cast<const float*>(base)[r])
 #define ROWOFF(base, r) (((((r) >> 2) ^ (int)(((unsigned)reinterpret_cast<size_t>(base) >> 7) & SWM)) << 4) + ((r) & 3) * 4)
 #else
-// forward slab: the TMS rows (parents) of a child are one contiguous row
+// forward slab: the TMS rows (parents) of a child are one contiguous row (TMS x WB bytes)
+#if W16
+#define QUARTER(wv, base, q) const float4 wv = unpack16_(reinterpret_cast<const uint2*>(base)[q]);
+#define WROW(base, r) bf2f_(reinterpret_cast<const unsigned short*>(base)[r])
+#else
 #define QUARTER(wv, base, q) const float4 wv = reinterpret_cast<const float4*>(base)[q];
 #define WROW(base, r) (reinterpret_cast<const float*>(base)[r])
-#define ROWOFF(base, r) ((r) * 4)
+#endif
+#define ROWOFF(base, r) ((r) * WB)
+#endif
+#if W16
+#define SROWOFF(base, r) ((r) * 4)
+#else
+#define SROWOFF(base, r) ROWOFF(base, r)
 #endif
 
 #if PF
@@ -378,10 +415,10 @@ __device__ __forceinline__ unsigned quarters(unsigned rows) {
 #if PF
 // (S sits a multiple of 1 KB after the W slab: the same swizzle bits)
 #define PF_QUARTER(q, wv, g) if (g != 0.f) { \
-    if ((rows >> (4 * (q))) & 1u) pf_add(Sb + ROWOFF(Sb, 4 * (q)), g * wv.x * xr[4 * (q)]); \
-    if ((rows >> (4 * (q) + 1)) & 1u) pf_add(Sb + ROWOFF(Sb, 4 * (q) + 1), g * wv.y * xr[4 * (q) + 1]); \
-    if ((rows >> (4 * (q) + 2)) & 1u) pf_add(Sb + ROWOFF(Sb, 4 * (q) + 2), g * wv.z * xr[4 * (q) + 2]); \
-    if ((rows >> (4 * (q) + 3)) & 1u) pf_add(Sb + ROWOFF(Sb, 4 * (q) + 3), g * wv.w * xr[4 * (q) + 3]); }
+    if ((rows >> (4 * (q))) & 1u) pf_add(Sb + SROWOFF(Sb, 4 * (q)), g * wv.x * xr[4 * (q)]); \
+    if ((rows >> (4 * (q) + 1)) & 1u) pf_add(Sb + SROWOFF(Sb, 4 * (q) + 1), g * wv.y * xr[4 * (q) + 1]); \
+    if ((rows >> (4 * (q) + 2)) & 1u) pf_add(Sb + SROWOFF(Sb, 4 * (q) + 2), g * wv.z * xr[4 * (q) + 2]); \
+    if ((rows >> (4 * (q) + 3)) & 1u) pf_add(Sb + SROWOFF(Sb, 4 * (q) + 3), g * wv.w * xr[4 * (q) + 3]); }
 #define PF_ARGS , unsigned rows, const float* xr, char* sS
 #define PF_PASS , rows, xr, sS
 #else
@@ -400,7 +437,7 @@ __device__ __forceinline__ void slab_walk(float* a, const int2* __restrict__ pp,
         for (int u = 0; u < 4; ++u) {
             const float x = __int_as_float(v[u].y);
 #if PF
-            char* Sb = sS + v[u].x;
+            char* Sb = sS + S_OFF(v[u].x);
 #endif
             #pragma unroll
             for (int q = 0; q < 4; ++q) {
@@ -427,7 +464,7 @@ __device__ __forceinline__ void slab_walk_any(float* a, const int2* __restrict__
         for (int u = 0; u < 4; ++u) {
             const float x = __int_as_float(v[u].y);
 #if PF
-            char* Sb = sS + v[u].x;
+            char* Sb = sS + S_OFF(v[u].x);
 #endif
             #pragma unroll
             for (int q = 0; q < TMS / 4; ++q) {
@@ -668,11 +705,11 @@ __device__ __forceinline__ void load_slab(float* dst, unsigned long long* bar, i
     // the slab is contiguous in the slab-order copy (either direction): bulk copies of up to 16 KB
     if (tid == 0) {
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n"
-                     :: "r"(smem_addr(bar)), "r"(KS * TMS * 4) : "memory");
-        const char* src = reinterpret_cast<const char*>(
-            w + w_start + ((long long)(t0 / TMS) * NSPLIT + k0 / KS) * KS * TMS);
-        for (int off = 0; off < KS * TMS * 4; off += 16384) {
-            const int sz = KS * TMS * 4 - off < 16384 ? KS * TMS * 4 - off : 16384;
+                     :: "r"(smem_addr(bar)), "r"(SLAB_BYTES) : "memory");
+        const char* src = reinterpret_cast<const char*>(w + w_start)
+                          + ((long long)(t0 / TMS) * NSPLIT + k0 / KS) * SLAB_BYTES;
+        for (int off = 0; off < SLAB_BYTES; off += 16384) {
+            const int sz = SLAB_BYTES - off < 16384 ? SLAB_BYTES - off : 16384;
             asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
                          :: "r"(smem_addr(dst) + off), "l"(src + off), "r"(sz), "r"(smem_addr(bar)) : "memory");
         }
@@ -749,12 +786,12 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
             const int* __restrict__ gkey, const float* __restrict__ xv)
 {
     extern __shared__ __align__(1024) float smem[];
-    float* slab = smem;                                              // [KS][TMS]
+    float* slab = smem;                                              // [KS][TMS], SLAB_BYTES
 #if PF
-    float* sacc = slab + KS * TMS;                                   // S, the slab's layout (PF 2: lo, hi)
+    float* sacc = reinterpret_cast<float*>(reinterpret_cast<char*>(smem) + SLAB_BYTES);   // S, fp32 slab layout
     unsigned long long* bar = reinterpret_cast<unsigned long long*>(sacc + KS * TMS * PF);
 #else
-    unsigned long long* bar = reinterpret_cast<unsigned long long*>(slab + KS * TMS);
+    unsigned long long* bar = reinterpret_cast<unsigned long long*>(reinterpret_cast<char*>(smem) + SLAB_BYTES);
 #endif
     int* s_item = reinterpret_cast<int*>(bar + 1);
 
@@ -1044,7 +1081,7 @@ SLAB_MAIN(float* __restrict__ out_vals, long long out_stride,
                     a[r] = fmaf(x, wr, a[r]);
 #if PF
                     if (x != 0.f && ((rows >> r) & 1u))
-                        pf_add(sS + v[u].x + ROWOFF(sS + v[u].x, r), x * wr * xr[r]);
+                        pf_add(sS + S_OFF(v[u].x) + SROWOFF(sS + S_OFF(v[u].x), r), x * wr * xr[r]);
 #endif
                 }
             }
@@ -1164,12 +1201,12 @@ ws_slab_wcopy_bwd(float* __restrict__ dst, const float* __restrict__ w, long lon
 #if ROWS
         const int r = e / 32, pl = e - r * 32;                // slab rows of KS parents, 32 contiguous
         const int pin = j0 - sp * KS + pl;
-        dst[((long long)(m * NSPLIT + sp) * TMS + r) * KS + pin] = t[pl][r];
+        WSTORE(dst, ((long long)(m * NSPLIT + sp) * TMS + r) * KS + pin, t[pl][r]);
 #else
         const int pl = e / TMS, r = e - pl * TMS;
         const int pin = j0 - sp * KS + pl;                    // parent row within the slab
         const int rr = SWZ ? r ^ ((((pin * TMS * 4) >> 7) & SWM) << 2) : r;
-        dst[((long long)(m * NSPLIT + sp) * KS + pin) * TMS + rr] = t[pl][r];
+        WSTORE(dst, ((long long)(m * NSPLIT + sp) * KS + pin) * TMS + rr, t[pl][r]);
 #endif
     }
 }
@@ -1215,7 +1252,7 @@ ws_slab_pack_g(int2* __restrict__ xp, long long xp_stride, int* __restrict__ cof
         float g = nflow[(long long)b * flow_stride + i] * expf(fmaxf(max_val[b], -1e30f) - nm);
         if (in_nnz[b] == 0 || nm == __int_as_float(0xff800000)) g = 0.f;
         const int hl = h % KS;
-        xp[(long long)b * xp_stride + i] = make_int2(BNAT ? hl * (ROWS ? 4 : TMS * 4) : ((hl / BOXW) * TMS * BOXW + hl % BOXW) * 4,
+        xp[(long long)b * xp_stride + i] = make_int2(BNAT ? hl * (ROWS ? WB : TMS * WB) : ((hl / BOXW) * TMS * BOXW + hl % BOXW) * 4,
                                                      __float_as_int(g));
 #if GROUP
         xv[(long long)b * xp_stride + i] = g;
@@ -1779,12 +1816,12 @@ def slab_shape(H_in: int, TMS: int, slab_bytes: int) -> Tuple[int, int]:
         nsplit += 1
 
 
-def slab_smem(KS: int, TMS: int, pf: int = 0, group_nt: int = 0) -> int:
+def slab_smem(KS: int, TMS: int, pf: int = 0, group_nt: int = 0, w16: bool = False) -> int:
     """Dynamic shared memory of a slab CTA: the slab (and the param-flow
     accumulator: ``pf`` 1 fp32, 2 fixed point in two u32 arrays), its barrier
     and the item counter; with ``group_nt`` (the CTA's threads, ``GROUP``) the
     sort keys, entries and group list of one chunk of the tile's list."""
-    return KS * TMS * 4 * (1 + int(pf)) + 16 + (group_nt * 20 + 128 if group_nt else 0)
+    return KS * TMS * (2 if w16 else 4) + KS * TMS * 4 * int(pf) + 16 + (group_nt * 20 + 128 if group_nt else 0)
 
 
 def slab_rows_ok(TMS: int, GL: int, group: int = 0, stream: int = 0, pf: int = 0) -> bool:
@@ -1797,7 +1834,8 @@ def slab_rows_ok(TMS: int, GL: int, group: int = 0, stream: int = 0, pf: int = 0
 def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
                  loader: int, min_blocks: int, bwd: bool = False, GL: int = 32,
                  pf: int = 0, swz: bool = False, static: bool = False, ahead: int = 1,
-                 group: int = 0, pipe: bool = False, stream: int = 0, rows: bool = False) -> tuple:
+                 group: int = 0, pipe: bool = False, stream: int = 0, rows: bool = False,
+                 w16: bool = False) -> tuple:
     """``(lists, pack, main, finalize, perm kernels, main smem bytes)`` of a block
     shape: the forward (tiles of parents, ranges of children) or with
     ``bwd`` the element-flow backward (tiles of children, ranges of
@@ -1818,16 +1856,19 @@ def slab_kernels(H_in: int, H_out: int, BS: int, TMS: int, KS: int, NWARP: int,
     assert not (stream and (group or pf or GL != 32 or TMS not in (4, 8)))
     rows = bool(rows)
     assert not rows or (slab_rows_ok(TMS, GL, group, stream, pf) and loader == 9 and not swz)
+    w16 = bool(w16)
+    assert not w16 or (loader == 9 and TMS in (4, 8, 16) and not swz and not pf and not group and not stream), \
+        "w16: slab-order copies, 4- to 16-row tiles, no swizzle / fused param flows / grouped or pipelined walk"
     key = (H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks, bwd, GL, pf, swz, static, ahead, group, pipe,
-           stream, rows)
+           stream, rows, w16)
     hit = _SLAB_KERNELS.get(key)
     if hit is None:
-        smem = slab_smem(KS, TMS, pf, NWARP * 32 if group else 0)
+        smem = slab_smem(KS, TMS, pf, NWARP * 32 if group else 0, w16)
         n_split = -(-(H_out if bwd else H_in) // KS)
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
                        NWARP=NWARP, LOADER=loader, MINB=min_blocks, BWD=int(bwd), BOXW=min(KS, 256),
                        GL=GL, PF=int(pf), SWZ=int(swz), STATIC=int(static), AHEAD=ahead, GROUP=group,
-                       PIPE=int(pipe), STREAM=stream, ROWS=int(rows))
+                       PIPE=int(pipe), STREAM=stream, ROWS=int(rows), W16=int(w16))
         src = ("".join(f"#define {k} {v}\n" for k, v in defines.items())
                + f"#define NSPLIT_OVERRIDE {n_split}\n" + _SLAB_SRC)
         main = CudaKernel(src, "ws_slab_bwd" if bwd else "ws_slab_fwd", _SLAB_FWD_ARGS, max_shared=smem)
@@ -1856,28 +1897,34 @@ def slab_copy_numel(H_in: int, H_out: int, TMS: int, slab_bytes: int, bwd: bool 
 
 
 def slab_wcopy(dst: torch.Tensor, w: torch.Tensor, w_start: int, H_in: int, H_out: int, BS: int,
-               TMS: int, slab_bytes: int, swz: bool = False, bwd: bool = False, rows: bool = False) -> None:
+               TMS: int, slab_bytes: int, swz: bool = False, bwd: bool = False, rows: bool = False,
+               w16: bool = False) -> None:
     """Write W (block layout of :class:`SparseIOSumLayer` at ``w[w_start:]``) into ``dst`` in
     slab order: one contiguous ``[KS, TMS]`` slab per (parent tile, child range) for the
     forward, per (child tile, parent range) with ``bwd``, as the bulk loader of
     :func:`ws_slab_forward` / :func:`ws_slab_backward` (``wslab``) reads it. One pass over W. With
-    ``rows`` (4-row tiles) each slab is stored row by row, ``[TMS, KS]``."""
+    ``rows`` (4-row tiles) each slab is stored row by row, ``[TMS, KS]``. With ``w16`` the copy is
+    bf16 (``dst`` of dtype ``torch.bfloat16``, the same number of elements), read by the kernels built
+    with ``w16``."""
     H_r = H_out if bwd else H_in
     KS, nsplit = slab_shape(H_r, TMS, slab_bytes)
     swz = swz and TMS in (8, 16)
     rows = bool(rows)
+    w16 = bool(w16)
     assert not rows or TMS == 4
-    key = (H_in, H_out, BS, TMS, KS, swz, bwd, rows)
+    assert not w16 or (TMS in (4, 8, 16) and not swz), "w16: 4- to 16-row tiles, no swizzle"
+    key = (H_in, H_out, BS, TMS, KS, swz, bwd, rows, w16)
     k = _WCOPY_KERNELS.get(key)
     if k is None:
         defines = dict(H_IN=H_in, H_OUT=H_out, BS=BS, TMS=TMS, LOG_TMS=TMS.bit_length() - 1, KS=KS,
-                       NWARP=4, LOADER=9, MINB=1, BWD=int(bwd), BOXW=min(KS, 256), SWZ=int(swz), ROWS=int(rows))
+                       NWARP=4, LOADER=9, MINB=1, BWD=int(bwd), BOXW=min(KS, 256), SWZ=int(swz), ROWS=int(rows),
+                       W16=int(w16))
         src = ("".join(f"#define {k_} {v}\n" for k_, v in defines.items())
                + f"#define NSPLIT_OVERRIDE {nsplit}\n" + _SLAB_SRC)
         k = _WCOPY_KERNELS[key] = CudaKernel(src, "ws_slab_wcopy_bwd" if bwd else "ws_slab_wcopy",
                                              ["ptr", "ptr", "i64"])
     n = slab_copy_numel(H_in, H_out, TMS, slab_bytes, bwd)
-    assert dst.numel() >= n and dst.dtype == torch.float32
+    assert dst.numel() >= n and dst.dtype == (torch.bfloat16 if w16 else torch.float32)
     assert (nsplit * KS) % 32 == 0 and KS % 32 == 0
     if bwd:
         k((-(-H_in // TMS), nsplit * KS // 32), (256,), [dst, w, w_start], device=dst.device)
@@ -1894,7 +1941,7 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
                     static: bool = False, wslab: Optional[torch.Tensor] = None,
                     ahead: int = 1, perm: bool = False, group: int = 0,
                     xv: Optional[torch.Tensor] = None, pipe: bool = False, stream: int = 0,
-                    rows: bool = False) -> None:
+                    rows: bool = False, w16: bool = False) -> None:
     """Build the per-tile sample lists, pack the input columns and run the
     slab forward for one block, writing ``out_vals[b, i]`` (row stride
     ``out_vals.stride(0)``) for every active parent ``i`` of every sample;
@@ -1931,10 +1978,14 @@ def ws_slab_forward(out_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_in
         loader, w, w_start = 9, wslab, 0
     rows = bool(rows)
     assert not rows or (wslab is not None and slab_rows_ok(TMS, GL, group, stream)), "rows: see slab_rows_ok"
-    perm = perm and not rows                          # the bank-group order is for 16-byte rows
+    w16 = bool(w16) and wslab is not None
+    assert not w16 or (wslab.dtype == torch.bfloat16 and TMS in (4, 8, 16) and not swz and not group and not stream), \
+        "w16: a bf16 slab-order copy, 4- to 16-row tiles, no swizzle / grouped or pipelined walk"
+    assert w16 or wslab is None or wslab.dtype == torch.float32
+    perm = perm and not rows and not w16              # the bank-group order is for 16-byte rows
     lists, pack, fwd, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
                                                        GL=GL, swz=swz, static=static, ahead=ahead, group=group,
-                                                       pipe=pipe, stream=stream, rows=rows)
+                                                       pipe=pipe, stream=stream, rows=rows, w16=w16)
     xv = xv if group else max_val                     # unread without ``group``
     K = sv_in.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
@@ -1975,7 +2026,7 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
                      wslab: Optional[torch.Tensor] = None, swz: bool = False,
                      ahead: int = 1, perm: bool = False, group: int = 0,
                      xv: Optional[torch.Tensor] = None, pipe: bool = False, stream: int = 0,
-                     rows: bool = False) -> None:
+                     rows: bool = False, w16: bool = False) -> None:
     """Element flows of one block: ``flow_vals[b, k] = exp(in[b, k] - max_b)
     * sum_h g[b, h] W[h, c_k]`` over the sample's active parents ``h`` (``g =
     nflow * exp(max_b - nmars)``), for every active child ``c_k`` — the slab
@@ -2016,11 +2067,16 @@ def ws_slab_backward(flow_vals: torch.Tensor, w: torch.Tensor, w_start: int, sv_
     assert pf != 2 or B < 1 << 14, "fixed-point param flows: fewer than 2^14 samples"
     rows = bool(rows)
     assert not rows or (wslab is not None and slab_rows_ok(TMS, GL, group, stream, pf)), "rows: see slab_rows_ok"
-    perm = perm and not rows
+    w16 = bool(w16) and wslab is not None
+    assert not w16 or (wslab.dtype == torch.bfloat16 and TMS in (4, 8, 16) and not swz and not group
+                       and not stream and not pf), \
+        "w16: a bf16 slab-order copy, 4- to 16-row tiles, no swizzle / fused param flows / grouped or pipelined walk"
+    assert w16 or wslab is None or wslab.dtype == torch.float32
+    perm = perm and not rows and not w16
     lists, pack, main, fin, perm_k, smem = slab_kernels(H_in, H_out, BS, TMS, KS, NWARP, loader, min_blocks,
                                                         bwd=True, GL=GL, pf=pf, static=static, swz=swz,
                                                         ahead=ahead, group=group, pipe=pipe, stream=stream,
-                                                        rows=rows)
+                                                        rows=rows, w16=w16)
     xv = xv if group else max_val                     # unread without ``group``
     K = sv_out.total_nnz
     assert xp.stride(0) >= 2 * K and xp.stride(0) % 2 == 0 and cofs.stride(0) == nsplit + 1
