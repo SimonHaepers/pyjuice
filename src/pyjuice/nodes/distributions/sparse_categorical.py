@@ -155,7 +155,6 @@ class SparseCategorical(Distribution):
         self._csr_to_csc = csr_to_csc
         self._max_nnz_per_row = max(max_nnz_per_row, 1)
         self._expected_col_nnz = None
-        self._expected_col_tiles = None
         self._columns_sorted = None
         self._b1_desc = None
 
@@ -283,49 +282,6 @@ class SparseCategorical(Distribution):
             self._columns_sorted = cached
         return cached
 
-    def expected_col_tiles(self, tile: int, values: Optional[torch.Tensor] = None) -> float:
-        """Expected fraction of the ``tile``-row tiles of the latent axis that
-        the active column of a token drawn from this distribution touches
-        (a column touches a tile when at least one of its rows lies in it),
-        weighted like :meth:`expected_col_nnz` (column mass with ``values``,
-        column length without). It is what the sparse-IO pass over the
-        per-sample active parent tiles (``SparseIOSumLayer``, ``"tiles"``)
-        pays per sample: on the trained wikitext chains with sorted states a
-        column of 5 % of the rows touches 20 % of the 32-row tiles. Cached
-        per tile size."""
-        cache = getattr(self, "_expected_col_tiles", None)
-        if cache is None:
-            cache = self._expected_col_tiles = {}
-        cached = cache.get(tile)
-        if cached is not None and (values is None or cached[0]):
-            return cached[1]
-        assert self._csc_indptr is not None, "Sparsity pattern not set."
-        indptr = self._csc_indptr.cpu()
-        indices = self._csc_indices.cpu()
-        H, V = int(self._num_nodes), int(self.num_cats)
-        n_tiles = max(1, -(-H // tile))
-        nnz = torch.diff(indptr)
-        if self._nnz > 0:
-            # distinct (column, tile) pairs; rows need not be sorted within a column
-            col_of = torch.repeat_interleave(torch.arange(V), nnz)
-            keys = torch.unique(col_of * n_tiles + indices // tile)
-            tiles = torch.bincount(keys // n_tiles, minlength = V).double()
-        else:
-            tiles = torch.zeros(V, dtype = torch.float64)
-        weights = nnz.double()
-        weighted = False
-        if values is not None and self._nnz > 0 and values.numel() == self._nnz:
-            mass = torch.zeros(self._nnz + 1, dtype = torch.float64)
-            mass[1:] = torch.cumsum(values.detach().reshape(-1).cpu().double(), dim = 0)
-            mass = mass[indptr[1:]] - mass[indptr[:-1]]
-            if mass.sum().item() > 0:
-                weights, weighted = mass, True
-        total = weights.sum().item()
-        est = (weights * tiles).sum().item() / total / n_tiles if total > 0 else 0.0
-        cache[tile] = (weighted, est)
-        return est
-
-    # --- Distribution protocol ----------------------------------------
 
     def get_metadata(self):
         # All CSC state lives on `self`, not in the layer's metadata buffer.

@@ -102,9 +102,9 @@ def _layers(pc):
 @pytest.mark.parametrize("B", [1, 5, 16])
 def test_blocked_chain_forward_backward_parity(H, M, bs, B, monkeypatch):
     # pc_s is the exact-math reference, so keep it on the generic gather
-    # kernels: in "auto" mode B >= 16 with 16-aligned blocks would run the
-    # weight-stationary tf32 path (~1e-5 relative on the LL, checked against
-    # the gather path with tf32 tolerances in sparse_io_ws_test.py).
+    # kernels: in "auto" mode B >= 2 with 16-aligned blocks would run the
+    # sparse pass (its own agreement with the gather kernels is checked in
+    # sparse_io_ws_sparse_test.py).
     monkeypatch.setattr(sio, "_WS_MODE", "never")
     torch.manual_seed(0)
     T, V = 6, 50

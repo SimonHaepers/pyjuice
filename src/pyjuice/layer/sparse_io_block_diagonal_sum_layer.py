@@ -162,7 +162,7 @@ def _row_mapped_csc(dist, row_map: torch.Tensor, NB: int, BS: int) -> _RowMapped
 # The per-sample kernels gather their block's weights for every sample and add
 # param flows with one atomic per (sample, active row, child) — 14 G atomics per
 # backward on a trained H=16k Monarch chain at B=64. From ``_WS_MIN_BATCH``
-# samples up (the sparse-IO weight-stationary knobs, ``PYJUICE_SPARSE_IO_WS``)
+# samples up (the sparse-IO batched-pass knobs, ``PYJUICE_SPARSE_IO_WS``)
 # the sparse layers instead write their sparse side into dense rows and run the
 # dense :class:`BlockDiagonalSumLayer` kernels: each weight tile is loaded once
 # per batch tile, the batch is reduced in-tile and every param flow is written

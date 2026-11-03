@@ -42,36 +42,40 @@ def test_compact_layout_ranges_on_cpu(monkeypatch, builder):
 
 @pytest.mark.parametrize('capacity', [1, 2, 4])
 def test_chunk_reduction_and_aborted_pass_on_cpu(monkeypatch, capacity):
-    # The GPU epilogue is unchanged. Replace it with a CPU sink to exercise
-    # the real buffer reservation, clearing and partial GEMM reduction code.
+    # The GPU epilogue (param_flows += W * S, S = 0) is unchanged. Replace it
+    # with a CPU sink to exercise the real buffer reservation, clearing,
+    # chunked accumulation into S and the pass-end hand-over.
     group = sio._WSGroup(0, 0, 1, 1, 16, 16)
     group.num_slots = 7
     B = 3
     monkeypatch.setattr(sio, '_WS_STASH_BYTES', capacity * 32 * B * 4)
+    monkeypatch.setattr(sio, '_WS_PRECISION', 'ieee')
     accumulator = torch.zeros(16, 16)
     class Sink:
         def __getitem__(self, grid):
-            def accumulate(pflows, params, panel, r0, *args, **kwargs):
-                accumulator[r0:r0+panel.size(0)].add_(panel, alpha=-1 if kwargs['NEGATE'] else 1)
-            return accumulate
+            def epilogue(pflows, params, s, *args, **kwargs):
+                accumulator.add_(s)
+                s.zero_()
+            return epilogue
     monkeypatch.setattr(sio, '_ws_pflow_epilogue_kernel', Sink())
     params = torch.ones(256)
     pflows = torch.zeros(256)
+    assert group.ensure_ready(params, B, need_stash=True)
     # Abandon a partial pass: none of its factors may leak into the next one.
     gt, xt, col = group.stash_slot(0, B, torch.device('cpu'), False, params, pflows)
     gt[:, col:col+B].fill_(100.)
     xt[:, col:col+B].fill_(100.)
     group.begin_pass()
     expected = torch.zeros_like(accumulator)
-    for slot in [6, 1, 4, 0, 3]:  # mixed traversal; skipped slots mimic gather dispatch
+    for slot in [6, 1, 4, 0, 3]:  # mixed traversal; skipped slots mimic blocks on the gather kernels
         g, x = torch.rand(16, B), torch.rand(16, B)
         expected -= g @ x.t()
         gt, xt, col = group.stash_slot(slot, B, torch.device('cpu'), True, params, pflows)
         gt[:, col:col+B].copy_(g)
         xt[:, col:col+B].copy_(x)
-    group.flush(params, pflows)
+    group.flush(params, pflows, final=True)
     torch.testing.assert_close(accumulator, expected)
-    assert group._used == 0
+    assert group._used == 0 and not group._s_dirty and torch.all(group._s == 0)
     assert group._gt.numel() + group._xt.numel() == capacity * 32 * B
 
 

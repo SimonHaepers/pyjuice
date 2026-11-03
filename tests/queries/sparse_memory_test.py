@@ -59,12 +59,25 @@ def test_chunked_statistics_match_full_stash(monkeypatch, precision, slots):
         torch.testing.assert_close(full.param_flows, chunked.param_flows, atol=3e-4, rtol=3e-4)
 
 
-def test_chunked_mixed_dispatch_and_accumulation(monkeypatch):
-    from tests.queries.sparse_io_ws_test import (
-        test_ws_mixed_dispatch_and_stash_reuse, test_ws_flow_accumulation_and_negate)
+def test_chunked_flow_accumulation_and_negate(monkeypatch):
+    """With a one-slot stash (a flush of the deferred param-flow GEMM after
+    every step), ``flows_memory=1`` accumulates across backward calls and
+    ``negate_pflows`` flips the flows, as on the gather kernels."""
     monkeypatch.setattr(sio, '_WS_STASH_BYTES', 1)  # floor of one batch slot
-    test_ws_mixed_dispatch_and_stash_reuse(monkeypatch, active_children=None)
-    # Restore dispatch patched by the first regression before running another.
-    monkeypatch.undo()
-    monkeypatch.setattr(sio, '_WS_STASH_BYTES', 1)
-    test_ws_flow_accumulation_and_negate(monkeypatch)
+    monkeypatch.setattr(sio, '_WS_PRECISION', 'ieee')
+    monkeypatch.setattr(sio, '_WS_SPARSE_SLAB_W16', False)   # exact fp32 against the gather kernels
+    d1 = torch.randint(0, 23, (8, 7), device='cuda:0')
+    d2 = torch.randint(0, 23, (8, 7), device='cuda:0')
+    results = {}
+    for mode in ('never', 'always'):
+        monkeypatch.setattr(sio, '_WS_MODE', mode)
+        pc = build('io', True)
+        for x, mem, neg in ((d1, 0., False), (d2, 1., False), (d1, 0., True)):
+            pc(x, apply_cudagraph=False)
+            pc.backward(x, flows_memory=mem, negate_pflows=neg, allow_modify_flows=False)
+            if mem == 1.:
+                acc = pc.param_flows.detach().clone()
+        results[mode] = (acc, pc.param_flows.detach().clone())
+    torch.testing.assert_close(results['always'][0], results['never'][0], atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(results['always'][1], results['never'][1], atol=1e-4, rtol=1e-4)
+    assert results['always'][1].sum().item() < 0

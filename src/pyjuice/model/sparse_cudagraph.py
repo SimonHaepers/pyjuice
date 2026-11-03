@@ -211,7 +211,7 @@ class SparseGraphState:
         # tokens on device, e.g. the blocked layers).
         self.data = torch.zeros(pc.num_vars, B, dtype=data_dtype, device=device)
         self._buffers: Dict[tuple, torch.Tensor] = {}
-        self.ws_decisions: Dict[tuple, Optional[str]] = {}   # None / "full" / "active"
+        self.ws_decisions: Dict[tuple, bool] = {}   # per block: the sparse pass (True) or the gather kernels
 
         self.graph: Optional[torch.cuda.CUDAGraph] = None
         self.node_mars: Optional[torch.Tensor] = None
@@ -352,8 +352,8 @@ class SparseGraphState:
 
     def capture(self, body: Callable[[], None]) -> None:
         """Warm up and capture ``body`` (the inner-layer pass). The inputs must
-        already be loaded. WS dispatch uses model-level support statistics,
-        independent of the particular capture tokens."""
+        already be loaded. The choice between the sparse pass and the gather
+        kernels depends on the batch size alone, not on the capture tokens."""
         self.compute_patterns()
 
         stream = torch.cuda.Stream(device=self.device)
@@ -368,7 +368,7 @@ class SparseGraphState:
             body()
         self.graph = graph
         self.forward_bindings = self.snapshot_bindings()
-        # The WS kernels use process-wide grow-only scratch (`_ws_scratch`). A
+        # The sparse pass uses process-wide grow-only scratch (`_ws_scratch`). A
         # later, larger eager pass may replace those buffers; keep the ones
         # the graph baked in alive so the replay never writes freed memory.
         self.retain_ws_buffers()

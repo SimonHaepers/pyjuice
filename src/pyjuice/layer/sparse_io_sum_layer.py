@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-import math
 import os
 import warnings
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -14,7 +13,6 @@ from pyjuice.nodes import SumNodes
 from pyjuice.nodes.distributions import sparse_categorical as _scat
 from .sparse_input_sum_layer import SparseInputSumLayer
 from .sparse_node_values import SparseNodeValues
-from .sparse_prod_layer import SparseProdLayer
 from . import sparse_io_cuda as _sio_cuda
 
 
@@ -54,230 +52,72 @@ mean per-lane child ids and weight gathers; BLOCK_B > 1 widens the K_out
 chunks to ``[BLOCK_P, BLOCK_B]``."""
 
 # --------------------------------------------------------------------------- #
-# Weight-stationary (WS) batched path
+# Batched sparse pass
 # --------------------------------------------------------------------------- #
 #
 # The per-sample gather kernels above read ``W[h, c]`` once per (sample, active
-# pair), each from its own 32B sector. At training batch sizes the union of the
-# samples' supports covers essentially every tile of W at every step, so they
-# move ~B * K_in * K_out sectors (~2 GB per step at H=16k, B=64) where one
-# streaming pass over W is ~1 GB. The WS path instead loads each W tile into
-# shared memory once per step and applies it to the whole batch tile:
-# programs own a block of rows (forward: parents, backward: children), walk the
-# reduction axis block by block, and multiply against the batch's activations
-# densified for that block (zeros outside each sample's support) on the tensor
-# cores. Cost is one pass over W per step, independent of the support size —
-# or one pass over the rows of W^T of the batch's active children only (their
-# sorted union, compacted on the device each step), which is what the batch
-# can share, when that union is small (:func:`_ws_dispatch`). At training
-# batch sizes, where the full pass is tensor-core bound, the forward can
-# instead walk every parent tile with only the samples that have an active
-# parent in it (the "tiles" pass below, :func:`_ws_fwd_tiles_kernel`).
+# pair), each from its own 32-byte sector; at training batch sizes the samples'
+# supports together cover nearly every row of W at every step, so they move
+# many passes' worth of W (~2 GB per step at H=16k, B=64, where W is 1 GB).
+# From B=2 on, every batched block whose PC blocks have at least 16 rows and
+# whose columns ascend runs the sparse pass of :mod:`.sparse_io_cuda` instead:
+# W is copied once per pass into slab order (tiles of ``_WS_SPARSE_SLAB_TM``
+# parent rows, ranges of children whose ``[KS, TMS]`` slab fits
+# ``_WS_SPARSE_SLAB_BYTES`` of shared memory, in bf16 with
+# ``_WS_SPARSE_SLAB_W16``), a CTA keeps one slab and walks the packed input
+# column of every sample with an active parent in its tile, forming only the
+# products of the active pairs on the CUDA cores and writing the packed
+# output; the element-flow backward is the same kernel with tiles of children
+# and ranges of parents. B=1 keeps the gather kernels, which are faster there.
 #
-# Parameter flows of tied transitions (the homogeneous HMM chain) are deferred:
-# each step stashes its densified factors and bounded chunks feed GEMMs,
-# ``pflow += W * sum_t G_t^T X_t``, instead of B * K_in * K_out atomics per step.
+# Parameter flows of tied transitions (the homogeneous HMM chain) are deferred
+# to the pass end (:class:`_WSGroup`): either every step's packed sparse
+# inputs are stashed and accumulated every few steps on stationary tiles in
+# shared memory (``_WS_SPARSE_PFLOW`` "tile", large W), or every step's
+# densified factors are stashed and bounded chunks feed one cuBLAS GEMM,
+# ``S += G_t^T X_t`` ("gemm", small W); ``pflow += W * S`` once per pass.
+# :meth:`_WSGroup.ensure_ready` falls back to the gather kernels rather than
+# OOM when the stash does not fit.
 #
-# This is ON BY DEFAULT (``"auto"``): every batched block takes the cheapest of
-# gather / full W pass / active-children pass / tiles pass by the cost model of
-# :func:`_ws_dispatch`, calibrated on the trained wikitext chains; B=1
-# inference keeps the gather kernels, which are faster there. It costs one fp32
-# copy of W plus the stash, and :meth:`_WSGroup.ensure_ready` falls back to the
-# gather kernels rather than OOM when those do not fit. Results differ from the
-# gather path only by tf32 rounding (~1e-3 nats per sequence on a T=128 chain);
-# ``_WS_PRECISION="ieee"`` is bit-comparable but gives up most of the speedup.
+# Until 2026-11-02 the layer also carried tensor-core passes over dense tiles
+# of W (a full pass, a pass over the batch's active children, a pass over the
+# per-sample active parent tiles) and a cost model choosing among them per
+# batch; on the density-0.01 chains the sparse pass wins from B=2 on, so they
+# were removed (prune-pc REPORT_2026-10-26_tiling.md, section 13).
 
 _WS_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS", "auto")
-"""``"auto"`` (the default) — each batched block takes the cheapest of its
-kernel sets by the cost model of :func:`_ws_dispatch` (gather / full W pass /
-active-children pass / tiles pass; the block-diagonal layers go dense from
-``_WS_MIN_BATCH`` samples up); ``"always"`` — WS whenever eligible (tests /
-A-B runs; ``_WS_ACTIVE_MODE`` picks the pass); ``"never"`` — gather kernels
-only."""
-
-_WS_ACTIVE_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_ACTIVE", "auto")
-"""Which W pass the WS kernels take: ``"auto"`` — the cost model decides
-between the full pass and the pass over the batch's active children;
-``"always"`` / ``"never"`` — force one (tests / A-B runs)."""
+"""``"auto"`` (the default) — batched sparse-IO blocks take the sparse pass
+from B=2 on, the block-diagonal layers their dense batched path from
+``_WS_MIN_BATCH`` samples up; ``"always"`` — the block-diagonal layers go
+dense at any B > 1 (tests; the sparse-IO layer as in ``"auto"``);
+``"never"`` — the per-sample gather kernels only."""
 
 _WS_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_MIN_BATCH", "16"))
 """Smallest batch the block-diagonal (Monarch) layers run their dense batched
 path at in ``"auto"`` mode (``_bd_dense_batched`` in
 ``sparse_io_block_diagonal_sum_layer``); below it their per-sample kernels
-win. The sparse-IO layer does not use it any more: its cost model
-(:func:`_ws_dispatch`) covers every batch from B=2 up, and on the trained
-H=16k chains a WS pass already wins from B=2 (the batched gather kernel is
-latency-bound below ~16 samples)."""
+win. The sparse-IO layer takes its sparse pass from B=2 on."""
 
 _WS_PRECISION = os.environ.get("PYJUICE_SPARSE_IO_WS_PRECISION", "tf32")
-"""``"tf32"`` — tensor-core tf32 on operands pre-rounded to nearest (a per-pass
-rounded copy of W plus rounding at densify time), so the error is zero-mean
-(~1e-4 relative) rather than the ~-6e-4 bias of tf32 truncation; ``"ieee"`` —
-exact fp32 FMA, ~3x slower than tf32 but still memory-bound at B=64."""
+"""Precision of the deferred param-flow GEMM (``_WS_SPARSE_PFLOW`` "gemm"):
+``"tf32"`` — tensor-core tf32 on factors rounded to nearest tf32 at densify
+time, so the error is zero-mean (~1e-4 relative) rather than the ~-6e-4 bias
+of tf32 truncation; ``"ieee"`` — exact fp32. The sparse forward and backward
+kernels do not depend on it."""
 
-_WS_MIN_W = 1 << 24
-"""Elements of W (``H_out * H_in``) below which a block stays on the gather
-kernels: a smaller W (64 MB fp32 at 2^24) sits in the L2 cache, where the
-gather kernels read it as cheaply as a streaming pass. On the trained H=2048
-wikitext chains gather beats every WS variant up to B=64 (forward 1.0 vs
-1.7 ms, EM step 15 vs 26 ms at B=64), the gather forward at every batch up to
-B=4096 (2026-10-27). The backward with parameter flows is the exception, from
-``_WS_SMALL_W_BWD_BATCH`` samples on."""
-_WS_SMALL_W_BWD_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SMALL_W_BWD_BATCH", "512"))
-"""Batch from which a block below ``_WS_MIN_W`` runs its backward with
-parameter flows on the full WS pass when the cost model prices the gather
-backward above it: the gather backward adds one atomic per pair, so its cost
-grows with the batch while the full pass's barely does. On the trained 2k
-d0.01 chain (2026-10-27, EM backward): gather 19 / 71 / 140 ms at B = 256 /
-1024 / 2048, the full pass 23 / 18 / 31 ms (below B = 512 the full pass's
-launches outweigh it). A very sparse W (few pairs) stays on gather."""
-
-# Cost model of :func:`_ws_dispatch`, in units of one streamed W element of the
-# full WS pass (~2.9 TB/s on an H100 NVL). Calibrated 2026-10-19 on the trained
-# wikitext chains (H=8k..32k, emission density 0.01..0.1, T=128): per-sample
-# gather kernels vs the two WS passes, CUDA-graph forward and eager EM backward.
-_WS_GATHER_PAIR_COST = 6.0
-"""Forward cost of one gathered ``(sample, in, out)`` pair from B=16 up (the
-gather kernel moves ~1.2e11 pairs/s: one 32B sector per 4B weight)."""
-_WS_GATHER_PAIR_COST_SMALL = 14.0
-"""The same below B=16, where the batched gather kernel's grid (one program per
-32 output rows and sample) leaves most of the SMs idle (~5e10 pairs/s)."""
-_WS_GATHER_PAIR_COST_BWD = 15.0
-"""Backward with parameter flows: the gather kernel adds one atomic per pair
-(~4e10 pairs/s at H=16k, worse when the samples' supports overlap)."""
-_WS_ACTIVE_COST = 1.7
-"""Forward cost of one element of the active children's rows of W^T relative
-to a streamed element of the full pass (gathered rows, index loads), up to
-``_WS_ACTIVE_MAX_BATCH`` samples; above that the forward kernel loses its
-advantage (2x the full pass per element at B=16, 4.5x at B=64, H=16k)."""
-_WS_ACTIVE_MAX_BATCH = 8
-"""Largest batch the forward takes the active-children pass at."""
-_WS_ACTIVE_COST_BWD = 2.0
-"""Backward counterpart of ``_WS_ACTIVE_COST``; the backward kernel keeps its
-advantage at every batch size (0.8x the full pass at B=16, 1.0x at B=64)."""
-_WS_UNION_EXP = 0.7
-"""The expected union of ``B`` samples' input supports is modelled as that of
-``B ** _WS_UNION_EXP`` independent columns of the expected length: the
-frequent tokens' supports overlap heavily (fits 0.56..0.84 on the chains)."""
-_WS_MMA_COST_PER_SAMPLE = 0.0067
-"""Tensor-core work of a W element per sample relative to streaming it: the
-WS passes stop being memory-bound from ``1 / _WS_MMA_COST_PER_SAMPLE`` (~150)
-samples on and their cost then grows with B. Without it a 99 %-sparse H=4096
-chain went to WS from B~300 and trained 2-3x slower than on the gather
-kernels at B=8192 (2026-10-16). Was 0.012 (105 TFLOP/s at B=128);
-recalibrated 2026-10-23 on the full pass's measured scaling, 2.0 / 3.5 /
-6.9 / 13.6x its B=64 time at B=256 / 512 / 1024 / 2048 on the 8k chains and
-2.2 / 4.2x at 16k (140 TFLOP/s at B >= 512)."""
-
-_WS_PFLOW_DEFER = os.environ.get("PYJUICE_SPARSE_IO_WS_PFLOW_DEFER", "1") == "1"
-"""Deferred param-flow GEMM: accumulate every flush's ``Gt @ Xt^T`` into one ``[H_out, H_in]``
-buffer per group (cuBLAS ``beta = 1``) and multiply by W once at the pass end, instead of
-running the W epilogue (two reads and a write of an ``H^2`` panel) at every flush; costs one
-``H^2`` fp32 buffer per group (W is the same for the whole pass)."""
-
-_WS_FLUSH_PANEL_ELEMS = 1 << 26
-"""Max elements of the dense ``[rows, H_in]`` panel the deferred param-flow
-GEMM materialises at a time (256 MB fp32)."""
-
-# Pass over the per-sample active parent tiles ("tiles", :func:`_ws_fwd_tiles_kernel`).
-#
-# At training batch sizes the full W pass is tensor-core bound (its cost grows
-# with B) although a sample's active pairs are 0.2-3 % of the dense
-# multiply-adds: with the sorted state order a sample touches 5-20 % of the
-# 32x32 tiles of W, but a batch's samples rarely share a bigram, so any block of
-# 16+ samples touches nearly every child tile (2026-10-23 analysis,
-# prune-pc ``scripts/bench/analyze_tile_groups.py``). What survives batching is
-# the parent side: for every parent tile the pass gathers exactly the samples
-# that have an active parent in it (lists built on the device each step) and
-# walks the children with that block, loading an activation row only for the
-# child tiles the sample touches (its child-tile bits) and skipping a child
-# tile no sample of the block touches. MMA work ~ B * (parent tiles per sample)
-# * H_in, 4-6x below the full pass on the 8k/16k d0.01 chains.
-_WS_TILES_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES", "auto")
-"""``"auto"`` — the cost model may pick the tiles passes (forward over the
-parent tiles, backward element flows over the child tiles); ``"always"`` —
-WS blocks take them whenever eligible (tests / A-B runs; it beats
-``_WS_ACTIVE_MODE == "always"``); ``"never"`` — excluded."""
-# Tile shape, chosen on the 2026-10-23 sweep (8k d0.01, B=64..2048, 13 shapes,
-# prune-pc results/sparse_io_paths/2026-10-23_ws-tiles): the kernel's cost per
-# multiply-add falls with TM and BB (load elements per MAC ~ 1/TM + 1/BB)
-# while the MMA work grows with TM (parent tiles per sample: 32-row 27 %,
-# 64-row 36 %, 128-row 48 % of the tiles on that chain) and with the padding
-# of a tile's list to BB. 64 x 64 x 128 ran at ~100 TFLOP/s on 34 % of the
-# dense work (72 ms per T=128 batch at B=1024 vs 131 for the full pass and 69
-# for cuBLAS dense TF32; 138 vs 261 / 133 at B=2048); 32 x 32 x 64 took 87,
-# 128 x 32 x 64 109, and 64 x 64 x 64 (4 warps) 173 ms (register pressure).
-# The row mask cost 10 % instead of saving bytes: the activation panel sits in
-# L2 at these sizes.
-_WS_TILES_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TM", "64"))
-"""Parent tile (rows of W per program; the granularity of the per-sample
-parent lists of the forward and of the parent walk of the backward)."""
-_WS_TILES_TK = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_TK", "64"))
-"""Child tile (the child walk of the forward, the per-sample child lists of
-the backward; one activation row chunk of ``TK * 4`` bytes per sample and
-tile). 128 needs more shared memory than an H100 has at 3 stages."""
-_WS_TILES_BB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_BB", "128"))
-"""Samples per program (the MMA batch tile; >= 16). A tile's list is padded
-to a multiple of it."""
-_WS_TILES_ROW_MASK = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_ROW_MASK", "0") != "0"
-"""Load a sample's activation row of a child tile only when the sample has
-an active child in it (its tile bits, held in registers for the program's
-samples); off (the default), every listed sample's row is loaded (zeros
-outside its support), which measured 10 % faster at 8k with the panel in
-L2. Worth trying when ``B * H * 4`` bytes exceed the L2 by far."""
-_WS_TILES_SKIP_K = os.environ.get("PYJUICE_SPARSE_IO_WS_TILES_SKIP_K", "0") != "0"
-"""Skip a child tile (its W tile load and the MMA) when no sample of the block
-touches it. Off by default: the data-dependent branch stops Triton from
-pipelining the loop's loads (8k d0.01: 3.4x slower per iteration, 2026-10-23
-kernel map), and with 64-sample blocks a block touches ~95 % of the tiles."""
-_WS_TILES_MMA_COST_PER_SAMPLE = 0.008
-"""Cost model (:func:`_ws_dispatch`): tensor-core work of one W element of a
-visited tile row per (padded) sample of the block, relative to streaming the
-element in the full pass — the full pass's ``_WS_MMA_COST_PER_SAMPLE`` with
-the gathered rows' lower efficiency and the L2 re-reads of the W tiles by
-the blocks of a tile folded in. Fitted 2026-10-23 with ``_WS_TILES_WAVE_COST``
-on the forced kernel maps of the four 8k / 16k chains at B=64..2048 (16
-points, 15 decisions right; the miss is 8k d0.1 at B=512, a 4 % loss):
-measured tiles / full 1.16 / 1.09 / 0.66 / 0.50 / 0.48 on 8k d0.01, 1.29 /
-0.83 / 0.65 on 16k d0.01 (B=64..512), 1.21 / 1.18 / 1.04 / 0.87 / 0.79 on
-8k d0.1 and 1.34 / 1.03 / 0.91 on 16k d0.1."""
-_WS_TILES_WAVE_COST = 0.013
-"""The pass's time floor, per W element of one wave of full programs
-(``SMs x BB`` rows of a tile row; the programs run one per SM at the default
-shape): with fewer programs than SMs, or one wave with half-empty lists, the
-step costs a wave whatever the padded work (8k d0.01: 42 ms per batch at
-B=256 and 44 at B=512 for 1.4x the work)."""
-_WS_TILES_LIST_SPREAD = (0.5, 2.0)
-"""The lengths of the per-tile sample lists spread around their mean (a tile
-is touched by 10-50 % of the batch on the trained chains when the mean is
-20 %); the padding to ``BB`` is averaged over a geometric range of this
-spread rather than taken at the mean."""
-
-# Pass over the nonzero products only ("sparse", :mod:`pyjuice.layer.sparse_io_cuda`).
-#
-# The tiles pass still multiplies ~45 % of the dense product on the tensor
-# cores (8k d0.01, B=1024) because MMA rows need samples that share W tiles;
-# the useful pairs are 0.24 % of it. The CUDA C++ slab kernel cuts the parents
-# into tiles of 4 or 8 rows, keeps a tile's W slab (a range of the children)
-# in shared memory and walks the packed input column of every sample with an
-# active parent in the tile, fp32 FMAs on the CUDA cores, writing the packed
-# output directly.
-_WS_SPARSE_MODE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE", "auto")
-"""``"auto"`` — the cost model may pick the sparse forward and element-flow
-backward; ``"always"`` — WS forwards and backwards take them whenever
-eligible (tests / A-B runs; it beats ``_WS_TILES_MODE == "always"``);
-``"never"`` — excluded. Eligible: blocks whose input and output columns are
-sorted (the CSC rows ascend in every column,
-:meth:`SparseCategorical.columns_sorted`). The parameter flows keep the
-deferred dense GEMM."""
-_WS_SPARSE_SLAB_TM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_TM", "auto")
-"""Parent rows of a slab tile: ``"auto"`` — 4 or 8 by the cost model, or one
-of 1 / 2 / 4 / 8 / 16 (tests / A-B runs). 8-row tiles visit a sample's
-children a third less often (fewer tiles per sample) and read whole 32-byte
-sectors of W; 4-row tiles lose less to the per-sample work of a tile."""
+_WS_SPARSE_SLAB_TM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_TM", "4"))
+"""Parent rows of a slab tile, 4 / 8 / 16 (the backward: child rows). 4 by
+default: with the bf16 slabs the 4-row kernels ran faster than the 8-row
+ones at every measured point (E35, 2026-11-02, H100, forward kernel ms per
+batch of 127 steps: 21.8 vs 25.9 at 8k d0.01 B=1024, 9.7 vs 11.1 at 8k
+B=256, 49.7 vs 50.8 at 16k B=512; in fp32 24.3 vs 32.3, 12.2 vs 12.8, 72.1
+vs 85.4)."""
+assert _WS_SPARSE_SLAB_TM in _sio_cuda.TILE_HEIGHTS, _WS_SPARSE_SLAB_TM
 _WS_SPARSE_SLAB_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_KB", "64")) * 1024
-"""Shared memory of one slab: the children are split into ranges of that size
-(64 KB: three CTAs per SM; 2 ranges on an 8k chain with 4-row tiles)."""
+"""Shared memory of one fp32 slab: the children are split into ranges of that
+size (64 KB: three CTAs per SM; 2 ranges on an 8k chain with 4-row tiles; a
+bf16 slab of the same ranges takes half). 128 KB (one range at 8k, 2 at 16k)
+measured slower: 85 vs 50 ms per batch at 16k B=512 (E35)."""
 _WS_SPARSE_SLAB_NWARP: Dict[int, int] = {4: 16, 8: 12}
 """Warps per CTA by tile height (16 for others); env
 ``PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP`` overrides. Chosen 2026-10-24 on 8k /
@@ -285,77 +125,24 @@ _WS_SPARSE_SLAB_NWARP: Dict[int, int] = {4: 16, 8: 12}
 three CTAs per SM without spills (40 / 56 registers)."""
 if os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"):
     _WS_SPARSE_SLAB_NWARP = {t: int(os.environ["PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NWARP"])
-                             for t in (1, 2, 4, 8, 16)}
+                             for t in _sio_cuda.TILE_HEIGHTS}
 _WS_SPARSE_SLAB_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_MINB", "3"))
 """CTAs per SM the compiler budgets registers for (``__launch_bounds__``)."""
-_WS_SPARSE_SLAB_GL = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_GL", "32"))
-"""Lanes that walk one (sample, tile, range) item: 32 / 16 / 8 / 4, so a warp
-works on ``32 / GL`` items at once."""
-_WS_SPARSE_SLAB_SWZ = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_SWZ", "1") == "1"
-"""8 / 16-row slabs of the slab-order copies stored with the 32B / 64B swizzle (16-byte chunk
-``q ^ (row bits)``): a warp's 16-byte reads of one 4-row quarter of random children spread
-over all eight bank groups (unswizzled 8-row slabs use four: 7-way conflicts, 2026-10-26)."""
-_WS_SPARSE_SLAB_NATIVE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NATIVE", "1") == "1"
-"""The forward reads its W slabs from a per-pass copy of W in slab order (bulk copies, any tile
-height, no sector over-fetch) instead of with TMA boxes from W itself; one ``H^2`` buffer, the
-size of the rounded copy the tensor-core passes keep. The TMA boxes of 16 / 32-byte rows
-were the forward's limit at small batches (8k d0.01 B=64: 14.5 -> 9.1 ms per batch, at the
-HBM rate; 16k B=512: 109 -> 84 ms, 2026-10-26)."""
-_WS_SPARSE_SLAB_NATIVE_BWD = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_NATIVE_BWD", "1") == "1"
-"""The same for the element-flow (and fused param-flow) backward: slabs ``[KS parents][TMS
-children]`` from a per-pass copy, one 16-byte read per 4-child quarter instead of four."""
-_WS_SPARSE_SLAB_STATIC = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_STATIC", "1") == "1"
-"""Items handed to the warps round-robin instead of through a shared counter."""
-_WS_SPARSE_SLAB_AHEAD = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_AHEAD", "1"))
-"""2: with the round-robin items, the slab kernels load each item's list entry two items ahead,
-so the child range of the next item (indexed by its entry) loads without a stall (ncu
-2026-10-26: 11 % of the stall samples at 8k d0.01, B=1024). Measured 2026-10-27: forward
-kernel -2 / -3 % at 8k B=1024 / 2048, +-2 % at 16k, EM step +-1 %: off by default."""
-_WS_SPARSE_SLAB_GROUP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_GROUP", "0"))
-"""2 / 4 / 8: a warp of the sparse kernels walks up to that many samples whose walked column is the
-same (the same CSC column, ``col_starts``) at once: per child one offset and one W row for all of
-them, their values, 4 FMAs each (4-row tiles, 32 lanes per sample, no fused param flows). At
-B = 2048 on the trained 8k / 16k d0.01 chains 74 / 78 % of the child visits fall in such groups
-of 2 or more inside one tile's list (2026-10-27). 0: one sample per warp."""
-_WS_SPARSE_SLAB_PIPE = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_PIPE", "0") == "1"
-"""With ``_WS_SPARSE_SLAB_GROUP``: a lane loads the next chunk's child offsets and values before
-the current chunk's FMAs (software pipelining inside the warp; more registers)."""
-_WS_SPARSE_SLAB_STREAM = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_STREAM", "0"))
-"""s > 0: each warp of the sparse kernels walks its samples software-pipelined, holding s input
-entries per lane of the current sample in registers while the next sample's entries, the column
-range of the one after and the list entry of the third are in flight (4 / 8-row tiles, no fused
-parameter flows, not with ``_WS_SPARSE_SLAB_GROUP``). 0: one sample at a time."""
-_WS_SPARSE_SLAB_PERM = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_PERM", "0") == "1"
-"""Reorder each 32-entry row of the packed child (parent) lists so that the walk's 8-lane phases
-of 16-byte slab reads hit different bank groups (4-row tiles; ncu 2026-10-26: 34 % of those
-reads' shared-memory wavefronts were bank conflicts at 8k d0.01, B=1024). Measured 2026-10-27:
-the forward / backward kernels -5 to -7 %, but the reorder kernel costs as much (5.6 ms per EM
-step at 8k B=1024, 9 ms at 16k B=512): EM step +-1 %, off by default."""
-_WS_SPARSE_SLAB_ROWS = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_ROWS", "0") == "1"
-"""4-row slabs of the slab-order copies stored row by row and read with one 4-byte load per active
-row of the item (a sample has 1.4 of the 4 rows active on average at 8k d0.01) instead of one 16-byte
-read of all four rows; for both directions, where :func:`.sparse_io_cuda.slab_rows_ok` (4-row tiles,
-32 lanes per item, no grouped / pipelined walk, no fused param flows)."""
 _WS_SPARSE_SLAB_W16 = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_SLAB_W16", "1") == "1"
 """The slab-order copies of W in bf16 (half the bytes of every W read from shared memory and of
 every slab load; the kernels unpack to fp32 before the multiply). The forward and the element-flow
 backward then round W to 8 bits of mantissa (log outputs within about 6e-4 of fp32 at 8k d0.01).
 Measured 2026-11-02 (E35, H100): forward + backward kernels -10 % at 8k B=1024, -22 % at 8k B=256,
--28 % at 16k B=512. Not for the fused param-flow backward, the grouped / pipelined walks or
-swizzled slabs (those keep fp32 copies). fp16 is unusable: 99 % of the trained W's entries lie
-below its normal range."""
+-28 % at 16k B=512. fp16 is unusable: 99 % of the trained W's entries lie below its normal range."""
 _WS_SPARSE_PFLOW = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PFLOW", "auto")
-"""Parameter flows of a block on the sparse dispatch: ``"fused"`` — the
-backward slab kernel accumulates them over the active pairs in shared memory
-and adds them to the param flows itself (no stash, no dense GEMM; ``"fixed"``:
-the same in 32-bit fixed point with native shared atomics, deterministic); ``"gemm"``
-— the deferred dense GEMM of :class:`_WSGroup` like the tensor-core passes; ``"tile"`` —
-each step's sparse inputs are packed into a stash and every ``_WS_SPARSE_PF_TILE_SLOTS`` steps
-accumulated on stationary accumulator tiles of 4 parent rows in shared memory, the samples with the
-same child list (next token) summed in registers first, into the group's deferred accumulator,
-multiplied by W at the pass end (:func:`.sparse_io_cuda.pflow_tile_flush`); ``"auto"`` — ``"tile"`` for a W of at
-least ``_WS_SPARSE_PF_TILE_MIN_W`` elements from ``_WS_SPARSE_PF_TILE_MIN_BATCH`` samples on (a larger W from
-proportionally fewer), else ``"gemm"`` (:func:`_pflow_mode`)."""
+"""Parameter flows of a block on the sparse pass: ``"gemm"`` — the deferred dense GEMM of
+:class:`_WSGroup` (every step's densified factors stashed, bounded chunks accumulated by cuBLAS);
+``"tile"`` — each step's sparse inputs are packed into a stash and every ``_WS_SPARSE_PF_TILE_SLOTS``
+steps accumulated on stationary accumulator tiles of 4 parent rows in shared memory, the samples with
+the same child list (next token) summed in registers first, into the group's deferred accumulator,
+multiplied by W at the pass end (:func:`.sparse_io_cuda.pflow_tile_flush`); ``"auto"`` — ``"tile"`` for a
+W of at least ``_WS_SPARSE_PF_TILE_MIN_W`` elements from ``_WS_SPARSE_PF_TILE_MIN_BATCH`` samples on (a
+larger W from proportionally fewer), else ``"gemm"`` (:func:`_pflow_mode`)."""
 _WS_SPARSE_PF_TILE_MIN_W = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_MIN_W", str(1 << 26)))
 _WS_SPARSE_PF_TILE_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_MIN_BATCH", "256"))
 """``"auto"`` param flows take the tile kernel for a W of at least ``_WS_SPARSE_PF_TILE_MIN_W`` elements (8k x 8k)
@@ -372,165 +159,12 @@ longer ones are faster (pf_bench2 2026-10-29, pf_tile per EM step with 8 / 32 st
 B=512 83.0 / 70.0 ms)."""
 _WS_SPARSE_PF_TILE_STASH_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_STASH_MB", "1024")) << 20
 """Memory of the ``"tile"`` stash; it bounds the steps per accumulation (32 steps at 8k B=1024: about 0.7 GB)."""
-_WS_SPARSE_PF_TILE_FIXED = os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_FIXED", "1") != "0"
-"""``"tile"`` accumulator tiles in 32-bit fixed point (native integer adds; the rows scaled by their sums of g; a
-term's error at most 2^-32 of its row's sum, the result independent of the order of the adds) instead of fp32
-compare-and-swap adds. pf_bench2 2026-10-29 (32 steps): 8k B=1024 22.7 -> 20.2 ms per EM step, 16k B=512 70.4 -> 64.4,
-relative L1 error against fp64 1.8e-7 -> 7.3e-8 (fp32 rounds the long sums)."""
 _WS_SPARSE_PF_TILE_NWARP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_NWARP", "32"))
 """Warps sharing one accumulator tile of ``_WS_SPARSE_PFLOW = "tile"`` (a power of two up to 32; the tile's list
 entries are sorted in chunks of ``32 NWARP``)."""
 _WS_SPARSE_PF_TILE_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_TILE_KB", "128")) * 1024
 """Shared memory of one accumulator tile (4 parent rows x as many children as fit, fp32): 128 KB is the whole
 8k state range per tile, one tile per SM (2026-10-28: 4 x 8192 with 32 warps beat 4 x 4096 with 16 warps)."""
-_WS_SPARSE_PF_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_KB", "48")) * 1024
-"""W slab of the fused param-flow backward (the accumulator doubles it)."""
-_WS_SPARSE_PF_NWARP = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_NWARP", "16"))
-_WS_SPARSE_PF_MINB = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_PF_MINB", "2"))
-_WS_SPARSE_MIN_BATCH = int(os.environ.get("PYJUICE_SPARSE_IO_WS_SPARSE_MIN_BATCH", "32"))
-"""Smallest batch ``"auto"`` considers the sparse forward at: the cost model
-below was fitted from B=64 on; smaller batches keep the passes calibrated
-there (gather, active children, full)."""
-_WS_SPARSE_COST: Dict[int, Tuple[float, float, float]] = {4: (1.0, 0.45, 37.0), 8: (0.6, 0.93, 40.0)}
-"""Cost model of the sparse forward (:func:`_ws_sparse_plan`) by tile height,
-in streamed W elements of the full pass: per W element (the slabs come from
-HBM once per step; 4-row tiles read every 32-byte sector of W twice from L2),
-per child visit (a lane reading a child of a sample's packed column and the
-slab row of the tile) and per item (a sample's visit of a tile's child range
-by a warp). Fitted 2026-10-24 (non-negative least squares on relative error)
-on the forced kernel maps of the four 8k / 16k chains, B=64..2048 / 64..512,
-measured times converted by the full and tiles passes' modelled costs: 14 of
-16 decisions right among full / tiles / sparse with 4 / 8-row tiles (misses:
-16k d0.01 B=64, sparse 8-row 3 % slower than the full pass; 8k d0.1 B=512,
-tiles 4 % slower than full); per-point error 0.7-1.3x."""
-_WS_SPARSE_COST_BWD: Dict[int, Tuple[float, float, float]] = {4: (0.94, 0.42, 35.0), 8: (0.57, 0.88, 38.0)}
-"""The same for the element-flow backward (the slab kernel's mirror: tiles of
-children, ranges of parents): the forward's costs scaled by 0.94, the
-geometric mean of measured / modelled kernel time on the 2026-10-24 EM runs
-of the four 8k / 16k chains (B=64..1024 / 64..512, times converted by the
-full and tiles element-flow kernels' modelled costs; per-point error
-0.74-1.30x). It takes the sparse backward at every density-0.01 point, where
-it measured fastest (9.8-25.7 ms per batch at 8k against 15-55 for the full
-or tiles kernel, 40-102 against 49-155 at 16k), and not at density 0.1."""
-
-
-def _ws_sparse_plan(B: int, H_in: int, H_out: int, k: float, f_sparse: Dict[int, float],
-                    backward: bool = False) -> Tuple[float, int]:
-    """``(cost, tile height)`` of the cheapest sparse pass
-    (:mod:`.sparse_io_cuda`) over the candidate heights in ``f_sparse``
-    (height -> expected fraction of its tiles a sample touches) for ``B``
-    samples, in streamed W elements: one pass over W plus the visits (every
-    child of a sample in the forward, every parent in the backward — ``k``
-    per sample — once per tile it touches) plus the items (once per range of
-    the tile), weighted by :data:`_WS_SPARSE_COST` (forward: tiles of parents,
-    ranges of children) or :data:`_WS_SPARSE_COST_BWD` (element flows: tiles
-    of children, ranges of parents)."""
-    n_w = float(H_in) * float(H_out)
-    H_t, H_r = (H_in, H_out) if backward else (H_out, H_in)
-    costs = _WS_SPARSE_COST_BWD if backward else _WS_SPARSE_COST
-    best = (math.inf, 0)
-    for tm, f in f_sparse.items():
-        c_w, c_visit, c_item = costs.get(tm, costs[4])
-        pairs = B * min(f, 1.0) * -(-H_t // tm)
-        _ks, n_split = _sio_cuda.slab_shape(H_r, tm, _WS_SPARSE_SLAB_BYTES)
-        cost = n_w * c_w + pairs * (min(k, H_r) * c_visit + n_split * c_item)
-        best = min(best, (cost, tm))
-    return best
-
-
-def _ws_tiles_cost(B: int, n_w: float, f_tiles: float, BB: int,
-                   n_tiles: Optional[int] = None, n_sm: int = 132) -> float:
-    """Cost model of the tiles passes (:func:`_ws_fwd_tiles_kernel`,
-    :func:`_ws_bwd_flow_tiles_kernel`) in streamed W elements: the largest
-    of one HBM pass over the tiles the batch touches (the pass is
-    memory-bound at small batches like the full one), one wave of ``n_sm``
-    programs over the ``n_tiles`` listed tiles (:data:`_WS_TILES_WAVE_COST`)
-    and the tensor-core work of the padded tile lists — per tile ``ceil(rows
-    / BB) * BB`` rows of ``H`` elements, with the list lengths spread around
-    their mean ``f_tiles * B`` (:data:`_WS_TILES_LIST_SPREAD`)."""
-    if f_tiles <= 0.0:
-        return math.inf
-    mean = B * f_tiles                                     # expected samples per tile
-    lo, hi = _WS_TILES_LIST_SPREAD
-    n = 9
-    padded = 0.0
-    for i in range(n):
-        rows = mean * lo * (hi / lo) ** (i / (n - 1))
-        padded += math.ceil(rows / BB) * BB
-    padded /= n
-    u = 1.0 - (1.0 - min(f_tiles, 1.0)) ** (B ** _WS_UNION_EXP)
-    wave = n_sm * BB / n_tiles * _WS_TILES_WAVE_COST if n_tiles else 0.0
-    return n_w * max(u, wave, padded * _WS_TILES_MMA_COST_PER_SAMPLE)
-
-
-def _ws_dispatch(B: int, H_in: int, H_out: int, pairs: float, k_in: float,
-                 backward: bool, f_tiles: Optional[float] = None,
-                 BB: Optional[int] = None, n_tiles: Optional[int] = None,
-                 n_sm: int = 132, f_sparse: Optional[Dict[int, float]] = None,
-                 sparse_k: Optional[float] = None, sparse_bwd: bool = False) -> Optional[str]:
-    """Kernel set of a batched sparse-IO block: ``None`` (per-sample gather
-    kernels), ``"full"`` (WS, one pass over W), ``"active"`` (WS, one pass
-    over the rows of W^T of the batch's active children, compacted on the
-    device each step by :func:`_ws_active_children`) or ``"tiles"`` (WS over
-    every sample's active parent tiles in the forward,
-    :func:`_ws_fwd_tiles_kernel`, active child tiles in the backward,
-    :func:`_ws_bwd_flow_tiles_kernel`, when ``f_tiles``, the expected fraction
-    of those tiles a sample touches, is given; ``n_tiles`` the tiles of
-    the listed side, ``n_sm`` the device's SMs) or ``"sparse"`` (the
-    forward over the nonzero products only, :mod:`.sparse_io_cuda`, when
-    ``f_sparse`` maps its candidate tile heights to the expected fraction of
-    those tiles a sample touches, ``sparse_k`` its visits per sample and
-    tile, ``sparse_bwd`` the element-flow backward; :func:`_ws_sparse_plan`) — the
-    cheapest by the cost model above for ``B`` samples with ``pairs`` active
-    ``(sample, in, out)`` pairs per step and ``k_in`` active children per
-    sample (the batch's own counts, or the model's expectation for a CUDA
-    graph), under the ``_WS_MODE`` / ``_WS_ACTIVE_MODE`` / ``_WS_TILES_MODE``
-    overrides."""
-    if _WS_MODE == "never":
-        return None
-    # A W pass streams W (memory-bound) until the tensor-core work of the batch
-    # tile takes over; the active-children pass only reads the expected union.
-    n_w = float(H_in) * float(H_out)
-    W = n_w * max(1.0, _WS_MMA_COST_PER_SAMPLE * B)
-    u = 1.0 - (1.0 - min(k_in, H_in) / H_in) ** (B ** _WS_UNION_EXP)
-    if backward:
-        c_gather = pairs * _WS_GATHER_PAIR_COST_BWD
-        c_active = u * W * _WS_ACTIVE_COST_BWD
-    else:
-        c_gather = pairs * (_WS_GATHER_PAIR_COST if B >= 16 else _WS_GATHER_PAIR_COST_SMALL)
-        c_active = u * W * _WS_ACTIVE_COST if B <= _WS_ACTIVE_MAX_BATCH else math.inf
-    c_full = W
-    tiles_ok = f_tiles is not None and _WS_TILES_MODE != "never"
-    c_tiles = (_ws_tiles_cost(B, n_w, f_tiles, BB or _WS_TILES_BB, n_tiles, n_sm)
-               if tiles_ok else math.inf)
-    forced = True
-    if tiles_ok and _WS_TILES_MODE == "always":
-        ws, c_ws = "tiles", c_tiles
-    elif _WS_ACTIVE_MODE == "always":       # forced, whatever the batch
-        ws, c_ws = "active", u * W * (_WS_ACTIVE_COST_BWD if backward else _WS_ACTIVE_COST)
-    elif _WS_ACTIVE_MODE == "never" or c_active >= c_full:
-        ws, c_ws, forced = "full", c_full, False
-    else:
-        ws, c_ws, forced = "active", c_active, False
-    if c_tiles < c_ws:
-        ws, c_ws = "tiles", c_tiles
-    # the sparse forward wins when forced, or on cost unless another pass is forced
-    sparse_ok = f_sparse is not None and _WS_SPARSE_MODE != "never"
-    if sparse_ok:
-        c_sparse = _ws_sparse_plan(B, H_in, H_out, k_in if sparse_k is None else sparse_k,
-                                   f_sparse, sparse_bwd)[0]
-        if _WS_SPARSE_MODE == "always" or (not forced and B >= _WS_SPARSE_MIN_BATCH
-                                            and c_sparse < c_ws):
-            ws, c_ws = "sparse", c_sparse
-    if _WS_MODE == "always":
-        return ws
-    if n_w < _WS_MIN_W and backward and B >= _WS_SMALL_W_BWD_BATCH:
-        if forced:
-            return ws
-        return "full" if c_gather > c_full else None
-    if B < 2 or n_w < _WS_MIN_W or c_gather <= c_ws:
-        return None
-    return ws
 
 
 class SparseIOSumLayer(SparseInputSumLayer):
@@ -634,16 +268,12 @@ class SparseIOSumLayer(SparseInputSumLayer):
         # marginalised (see ``forward``). Keyed by ``out_num_rows``.
         self._missing_indices_cache: dict = {}
 
-        # ``(group, slot)`` per block for the weight-stationary batched path,
-        # assigned by :func:`build_ws_groups` (TensorCircuit compile time).
+        # ``(group, slot)`` per block for the batched sparse pass and its
+        # deferred parameter flows, assigned by :func:`build_ws_groups`
+        # (TensorCircuit compile time).
         # ``None`` keeps the block on the gather kernels.
         self._ws_slots: List[Optional[Tuple["_WSGroup", int]]] = [None] * len(self.nodes)
-        # Set by :meth:`backward` while it dispatches its blocks: the tiles
-        # pass of a backward is priced on the child tiles, not the parent ones.
-        self._ws_in_backward = False
-        self._ws_sparse_tm: Dict[int, int] = {}       # block -> tile height of the sparse forward
-        self._ws_sparse_tm_bwd: Dict[int, int] = {}   # ... and of the sparse element-flow backward
-        self._ws_fraction_memo: Dict[tuple, Optional[object]] = {}
+        self._ws_sorted_memo: Dict[int, bool] = {}    # block -> both its columns ascend
 
     def __repr__(self) -> str:
         return (
@@ -784,11 +414,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
 
             TILE_M = 32
 
-            ws = self._ws_use(blk_idx, block, sv_in, sv_out, params) if sv_in.is_batched else None
-            if ws:
-                self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params,
-                                       active_children=ws == "active", tiles=ws == "tiles",
-                                       sparse=ws == "sparse")
+            if sv_in.is_batched and self._ws_use(blk_idx, batch_size, params):
+                self._ws_forward_block(blk_idx, block, sv_in, sv_out, max_val, params)
             elif sv_in.is_batched:
                 assert sv_out.is_batched
                 self._launch_batched_forward(block, sv_in, sv_out, max_val, params,
@@ -960,11 +587,8 @@ class SparseIOSumLayer(SparseInputSumLayer):
             )
             self._sparse_outputs[blk_idx] = sv_out
 
-            ws = self._ws_use_static(blk_idx, sparse_prod, ns_idx, params, static_ctx)
-            if ws:
-                self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params,
-                                       active_children=ws == "active", tiles=ws == "tiles",
-                                       sparse=ws == "sparse")
+            if self._ws_use_static(blk_idx, params, static_ctx):
+                self._ws_forward_block(blk_idx, block, sv_in, sv_out, sv_in.max_val, params)
             elif B == 1:
                 self._launch_single_forward(blk_idx, block, sv_in, sv_out, sv_in.max_val,
                                             params, static_ctx)
@@ -973,170 +597,32 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 self._launch_batched_forward(block, sv_in, sv_out, sv_in.max_val,
                                              params, B, TILE_M)
 
-    def _ws_use_static(self, blk_idx: int, sparse_prod: SparseProdLayer, ns_idx: int,
-                       params: torch.Tensor, static_ctx) -> Optional[str]:
-        """:meth:`_ws_use` for the CUDA-graph forward, which has no host-side
-        column sizes: the cost model runs on the model's expected supports
-        (:meth:`_ws_static_support`). The answer is memoised for consistent
-        warmup and capture dispatch."""
+    def _ws_use_static(self, blk_idx: int, params: torch.Tensor, static_ctx) -> bool:
+        """:meth:`_ws_use` for the CUDA-graph forward, memoised in the container
+        so that warmup and capture dispatch alike."""
         key = (id(self), blk_idx)
-        if key in static_ctx.ws_decisions:
-            if static_ctx.ws_decisions[key] == "sparse":
-                self._ws_sparse_tm[blk_idx] = static_ctx.ws_decisions[key + ("tm",)]
-            return static_ctx.ws_decisions[key]
-        use = None
-        ws = self._ws_slots[blk_idx]
-        if ws is not None and _WS_MODE != "never" and ws[0].eligible:
-            group = ws[0]
-            B = static_ctx.B
-            avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
-            TM, _TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
-            f_sparse = self._ws_sparse_fraction(blk_idx, static_ctx)
-            use = _ws_dispatch(B, group.H_in, group.H_out, B * avg_in * avg_out, avg_in,
-                               backward=False,
-                               f_tiles=self._ws_tiles_fraction(blk_idx, static_ctx),
-                               BB=BB, n_tiles=group.H_out // TM if TM else None,
-                               n_sm=_num_sms(params.device), f_sparse=f_sparse)
-            if use is not None and not group.ensure_ready(params, B, need_stash=False,
-                                                          w_copy=use != "sparse"):
-                use = None
-            if use == "sparse":
-                static_ctx.ws_decisions[key + ("tm",)] = _ws_sparse_plan(
-                    B, group.H_in, group.H_out, avg_in, f_sparse)[1]
-        static_ctx.ws_decisions[key] = use
-        if use == "sparse":
-            self._ws_sparse_tm[blk_idx] = static_ctx.ws_decisions[key + ("tm",)]
+        use = static_ctx.ws_decisions.get(key)
+        if use is None:
+            use = static_ctx.ws_decisions[key] = self._ws_use(blk_idx, static_ctx.B, params)
         return use
 
-    def _ws_fraction_cached(self, kind: str, blk_idx: int, static_ctx, backward: bool):
-        """:meth:`_ws_tiles_fraction` / :meth:`_ws_sparse_fraction`, memoised
-        per block, direction and masked-ness of the variable they read: they
-        depend on the emission masses only through
-        :meth:`SparseCategorical.expected_col_tiles`, which caches its first
-        weighted estimate anyway, and an eager backward asks once per block
-        and step (tens of microseconds each, which a host-bound step at H=2k
-        feels)."""
-        prod, ns_idx = self._sparse_input_refs[blk_idx]
-        var = prod.nodes[ns_idx].var_id if backward else self._output_sparsity_var_ids[blk_idx]
-        masked = static_ctx is not None and static_ctx.is_masked(var)
-        key = (kind, blk_idx, backward, masked, _WS_SPARSE_SLAB_TM, _WS_TILES_TM, _WS_TILES_TK)
-        hit = self._ws_fraction_memo.get(key, self)
-        if hit is self:
-            fn = self._ws_tiles_fraction if kind == "tiles" else self._ws_sparse_fraction
-            hit = self._ws_fraction_memo[key] = fn(blk_idx, static_ctx, backward=backward)
+    def _sparse_eligible(self, blk_idx: int) -> bool:
+        """Whether the block can take the sparse pass: it has a weight group
+        whose buffers fit (PC blocks of at least 16 rows,
+        :func:`build_ws_groups`; :meth:`_WSGroup.ensure_ready`), and both its
+        input and output columns ascend (the CSC rows ascend in every column,
+        :meth:`SparseCategorical.columns_sorted`; a host-side scan of the index
+        arrays, memoised per block)."""
+        ws = self._ws_slots[blk_idx]
+        if ws is None or not ws[0].eligible:
+            return False
+        hit = self._ws_sorted_memo.get(blk_idx)
+        if hit is None:
+            prod, ns_idx = self._sparse_input_refs[blk_idx]
+            in_dist = prod.nodes[ns_idx].sparse_input_ns.dist
+            hit = self._ws_sorted_memo[blk_idx] = bool(
+                in_dist.columns_sorted() and self._output_sparsity_dists[blk_idx].columns_sorted())
         return hit
-
-    def _ws_tiles_fraction(self, blk_idx: int, static_ctx=None,
-                           backward: bool = False) -> Optional[float]:
-        """Expected fraction of the tiles of the tiles pass a sample touches
-        (:meth:`SparseCategorical.expected_col_tiles`): the ``TM``-row parent
-        tiles of the output column in the forward, the ``TK``-row child tiles
-        of the input column in the backward; every tile for a variable the
-        profile masks; ``None`` when the block cannot take the pass."""
-        TM, TK = self._ws_tiles_shapes(blk_idx, 1, None)[:2]
-        if TM is None:
-            return None
-        prod, ns_idx = self._sparse_input_refs[blk_idx]
-        in_ns = prod.nodes[ns_idx]
-        emit_ns = in_ns.sparse_input_ns
-        base = emit_ns._param_range[0]
-        in_values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
-        if backward:
-            if static_ctx is not None and static_ctx.is_masked(in_ns.var_id):
-                return 1.0
-            return emit_ns.dist.expected_col_tiles(TK, in_values)
-        out_var = self._output_sparsity_var_ids[blk_idx]
-        if static_ctx is not None and static_ctx.is_masked(out_var):
-            return 1.0
-        out_dist = self._output_sparsity_dists[blk_idx]
-        # weigh the tokens by their emission mass when the output column's
-        # distribution is this block's input one (the tied emission of a
-        # homogeneous chain), as :meth:`_ws_static_support` does for the input
-        # side; the length-weighted estimate is 20-30 % low on the trained
-        # wikitext chains (0.17 vs 0.21 at 8k d0.01, 0.32 vs 0.45 at 8k d0.1)
-        values = in_values if emit_ns.dist is out_dist else None
-        return out_dist.expected_col_tiles(TM, values)
-
-    def _ws_sparse_fraction(self, blk_idx: int, static_ctx=None,
-                            backward: bool = False) -> Optional[Dict[int, float]]:
-        """The sparse pass's candidate tile heights (4 and 8, or the forced
-        ``_WS_SPARSE_SLAB_TM``) mapped to the expected fraction of those tiles
-        a sample touches (as :meth:`_ws_tiles_fraction`): parent tiles of the
-        output column in the forward, child tiles of the input column in the
-        element-flow backward; the cost model's input. ``None`` when the
-        block cannot take the pass (a column whose rows do not ascend)."""
-        prod, ns_idx = self._sparse_input_refs[blk_idx]
-        in_ns = prod.nodes[ns_idx]
-        emit_ns = in_ns.sparse_input_ns
-        out_dist = self._output_sparsity_dists[blk_idx]
-        if not (emit_ns.dist.columns_sorted() and out_dist.columns_sorted()):
-            return None
-        heights = (4, 8) if _WS_SPARSE_SLAB_TM == "auto" else (int(_WS_SPARSE_SLAB_TM),)
-        var = in_ns.var_id if backward else self._output_sparsity_var_ids[blk_idx]
-        if static_ctx is not None and static_ctx.is_masked(var):
-            return {tm: 1.0 for tm in heights}
-        base = emit_ns._param_range[0]
-        in_values = prod._sparse_input_layers[ns_idx].params[base:base + emit_ns.dist._nnz]
-        if backward:
-            return {tm: emit_ns.dist.expected_col_tiles(tm, in_values) for tm in heights}
-        values = in_values if emit_ns.dist is out_dist else None
-        return {tm: out_dist.expected_col_tiles(tm, values) for tm in heights}
-
-    def _ws_tiles_shapes(self, blk_idx: int, B: int, device) -> tuple:
-        """``(TM, TK, BB, num_warps, num_stages)`` of the tiles pass for this
-        block: the configured tiles clipped to the PC block sizes (powers of
-        two >= 16 that divide them); ``(None, ...)`` when the block is not
-        eligible (a block size below 16)."""
-        group, _ = self._ws_slots[blk_idx]
-        BS, CBS = group.BS, group.CBS
-        if BS % 16 or CBS % 16:
-            return (None, None, None, None, None)
-        TM = min(_WS_TILES_TM, BS)
-        while BS % TM:
-            TM //= 2
-        TK = min(_WS_TILES_TK, CBS)
-        while CBS % TK:
-            TK //= 2
-        BB = max(16, _WS_TILES_BB)
-        # 8 warps from a 64 x 64 accumulator up (64 x 64 x 64 on 4 warps ran 2x
-        # slower than on 8: register pressure); 3 stages when a stage's two
-        # operand tiles reach 32 KB of shared memory
-        warps = 8 if BB * max(TM, TK) >= 64 * 64 else 4
-        stages = 3 if (TK * TM + BB * max(TM, TK)) * 4 >= 32 * 1024 else 4
-        return (TM, TK, BB, warps, stages)
-
-    def _ws_static_pairs(self, blk_idx: int, B: int, static_ctx) -> float:
-        """Expected active ``(sample, in, out)`` pairs per step of a batch of
-        ``B`` (:meth:`_ws_static_support`)."""
-        avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
-        return B * avg_in * avg_out
-
-    def _ws_static_support(self, blk_idx: int, static_ctx) -> Tuple[float, float]:
-        """Expected active children and parents per sample of a batch whose
-        column lengths live on the device (CUDA-graph forward, backward after
-        a replay), from the model rather than from the tokens of any
-        particular batch, so a graph's dispatch does not depend on what it
-        was captured on: the expected column length of each side's
-        distribution (:meth:`SparseCategorical.expected_col_nnz`, weighted by
-        the input side's emission probabilities, which this layer can reach),
-        all rows for a variable the profile masks."""
-        prod, ns_idx = self._sparse_input_refs[blk_idx]
-        in_ns = prod.nodes[ns_idx]
-        emit_ns = in_ns.sparse_input_ns
-        in_dist = emit_ns.dist
-        out_dist = self._output_sparsity_dists[blk_idx]
-        out_var = self._output_sparsity_var_ids[blk_idx]
-        if static_ctx is not None and static_ctx.is_masked(in_ns.var_id):
-            avg_in = in_dist._num_nodes
-        else:
-            base = emit_ns._param_range[0]
-            values = prod._sparse_input_layers[ns_idx].params[base:base + in_dist._nnz]
-            avg_in = in_dist.expected_col_nnz(values)
-        if static_ctx is not None and static_ctx.is_masked(out_var):
-            avg_out = out_dist._num_nodes
-        else:
-            avg_out = out_dist.expected_col_nnz()
-        return avg_in, avg_out
 
     def graph_columns(self):
         return list(zip(self._output_sparsity_dists, self._output_sparsity_var_ids))
@@ -1248,18 +734,10 @@ class SparseIOSumLayer(SparseInputSumLayer):
                 sv_flow_in.values.zero_()
                 continue
 
-            self._ws_in_backward = True
-            try:
-                ws = (self._ws_use(blk_idx, block, sv_in, sv_out, params, need_stash=compute_pflows,
-                                   static_ctx=kwargs.get("static_ctx"))
-                      if sv_in.is_batched else None)
-            finally:
-                self._ws_in_backward = False
-            if ws:
+            if sv_in.is_batched and self._ws_use(blk_idx, batch_size, params, need_stash=compute_pflows):
                 self._ws_backward_block(
                     blk_idx, block, sv_in, sv_out, sv_flow_out, sv_flow_in,
                     params, param_flows if compute_pflows else None, negate_pflows,
-                    active_children=ws == "active", tiles=ws == "tiles", sparse=ws == "sparse",
                 )
             elif sv_in.is_batched:
                 BLOCK_B = _BWD_BATCHED_BLOCK_B
@@ -1329,178 +807,61 @@ class SparseIOSumLayer(SparseInputSumLayer):
         return None
 
     # ------------------------------------------------------------------ #
-    # Weight-stationary batched path
+    # Batched sparse pass
     # ------------------------------------------------------------------ #
 
-    def _ws_use(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
-                sv_out: SparseNodeValues, params: torch.Tensor,
-                need_stash: bool = False, static_ctx=None) -> Optional[str]:
-        """Kernel set for this batched block: ``None`` for the gather kernels,
-        ``"full"`` / ``"active"`` for the WS kernels and their W pass (see
-        ``_WS_MODE``, :func:`_ws_dispatch`).
-
-        ``"auto"`` runs the cost model on the batch's own pairs and support,
-        or on the model's expected ones (:meth:`_ws_static_support`) for
-        static containers, whose column lengths are on the device; a backward
-        that accumulates parameter flows (``need_stash``) uses the backward
-        costs. Then :meth:`_WSGroup.ensure_ready` has the last word, so a
-        group whose buffers do not fit stays on the gather kernels instead of
-        failing the run.
-        """
-        ws = self._ws_slots[blk_idx]
-        if ws is None or _WS_MODE == "never":
-            return None
-        group = ws[0]
-        if not group.eligible:
-            return None
-        B = sv_in.batch_size
-        small_w = group.H_in * group.H_out < _WS_MIN_W and not (need_stash and B >= _WS_SMALL_W_BWD_BATCH)
-        if _WS_MODE != "always" and (B < 2 or small_w):
-            return None      # :func:`_ws_dispatch`'s gather rule, before the host-side estimates below
-        avg_out = 0.0
-        if sv_in.static or sv_out.static:
-            avg_in, avg_out = self._ws_static_support(blk_idx, static_ctx)
-            pairs, k_in = B * avg_in * avg_out, avg_in
-        else:
-            pairs = sum(a * b for a, b in zip(sv_in.nnz_list, sv_out.nnz_list))
-            k_in = sum(sv_in.nnz_list) / max(B, 1)    # total_nnz is the longest column
-        # the tiles passes' expected tile fraction (parents of the forward,
-        # children of the backward) comes from the model: the batch's tile
-        # counts live on the device
-        f_tiles = self._ws_fraction_cached("tiles", blk_idx, static_ctx, self._ws_in_backward)
-        TM, TK, BB = self._ws_tiles_shapes(blk_idx, B, params.device)[:3]
-        if TM is None:
-            n_tiles = None
-        else:
-            n_tiles = group.H_in // TK if self._ws_in_backward else group.H_out // TM
-        bwd = self._ws_in_backward
-        f_sparse = self._ws_fraction_cached("sparse", blk_idx, static_ctx, bwd)
-        if sv_in.static or sv_out.static:
-            k_out = avg_out
-        else:
-            k_out = sum(sv_out.nnz_list) / max(B, 1)
-        k_visit = k_out if bwd else k_in
-        use = _ws_dispatch(B, group.H_in, group.H_out, pairs, k_in, backward=need_stash,
-                           f_tiles=f_tiles, BB=BB, n_tiles=n_tiles, n_sm=_num_sms(params.device),
-                           f_sparse=f_sparse, sparse_k=k_visit, sparse_bwd=bwd)
-        if use == "sparse":
-            # the sparse kernels read W itself; fused param flows need no stash
-            ready = group.ensure_ready(params, B, need_stash and _pflow_mode(group.H_in, group.H_out, B) == "gemm",
-                                       w_copy=False)
-        else:
-            ready = use is None or group.ensure_ready(params, B, need_stash)
-        if not ready:
-            use = None
-        if use == "sparse":
-            tm = _ws_sparse_plan(B, group.H_in, group.H_out, k_visit, f_sparse, bwd)[1]
-            (self._ws_sparse_tm_bwd if bwd else self._ws_sparse_tm)[blk_idx] = tm
-        return use
+    def _ws_use(self, blk_idx: int, B: int, params: torch.Tensor, need_stash: bool = False) -> bool:
+        """Whether this batched block runs the sparse pass: from B=2 on
+        (``_WS_MODE``), when the block is eligible (:meth:`_sparse_eligible`)
+        and, with ``need_stash`` (a backward that accumulates parameter flows
+        on the deferred GEMM), its stash fits (:meth:`_WSGroup.ensure_ready`;
+        a group whose buffers do not fit stays on the gather kernels instead
+        of failing the run)."""
+        if _WS_MODE == "never" or B < 2 or not self._sparse_eligible(blk_idx):
+            return False
+        group = self._ws_slots[blk_idx][0]
+        return group.ensure_ready(params, B, need_stash and _pflow_mode(group.H_in, group.H_out, B) == "gemm")
 
     def _ws_forward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                           sv_out: SparseNodeValues, max_val: torch.Tensor,
-                          params: torch.Tensor, active_children: bool = False,
-                          tiles: bool = False, sparse: bool = False) -> None:
-        """``sv_out = log(W @ exp(sv_in - max)) + max`` for the whole batch:
-        densify the inputs, stream W once through :func:`_ws_fwd_kernel` (all
-        of it, or with ``active_children`` only the rows of W^T of the batch's
-        active children) — or with ``tiles`` walk every parent tile with the
-        samples that have an active parent in it
-        (:func:`_ws_fwd_tiles_kernel`) — then gather the active parents. With
-        ``sparse`` the CUDA-core slab kernel of :mod:`.sparse_io_cuda` (tile
-        height ``self._ws_sparse_tm[blk_idx]``, set by the dispatch) forms
-        only the products of the active pairs from the packed columns and
-        writes the packed output (exact fp32 W)."""
+                          params: torch.Tensor) -> None:
+        """``sv_out = log(W @ exp(sv_in - max)) + max`` for the whole batch on
+        the sparse pass (:func:`.sparse_io_cuda.ws_slab_forward`): tiles of
+        ``_WS_SPARSE_SLAB_TM`` parents from the slab-order copy of W
+        (:meth:`_WSGroup.slab_copy`, rebuilt once per pass), only the
+        products of the active pairs, the packed output written directly."""
         group, _ = self._ws_slots[blk_idx]
-        _, _, _, _, _NB, NB_ch, BS, CBS = block
+        _, _, _, _, _NB, _NB_ch, BS, _CBS = block
         B = sv_in.batch_size
         device = params.device
         H_in, H_out = group.H_in, group.H_out
-        if sparse:
-            TMS = self._ws_sparse_tm[blk_idx]
-            n_m = -(-H_out // TMS)
-            K = sv_in.total_nnz
-            _KS, nsplit = _sio_cuda.slab_shape(H_in, TMS, _WS_SPARSE_SLAB_BYTES)
-            ent = _ws_scratch("sp_ent", (n_m, 2 * B), device, torch.int32)
-            cnt = _ws_scratch("sp_cnt", (n_m,), device, torch.int32)
-            xp = _ws_scratch("sp_xpack", (B, 2 * K), device, torch.int32)
-            cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
-            rows = (_WS_SPARSE_SLAB_ROWS and _WS_SPARSE_SLAB_NATIVE
-                    and _sio_cuda.slab_rows_ok(TMS, _WS_SPARSE_SLAB_GL, _WS_SPARSE_SLAB_GROUP, _WS_SPARSE_SLAB_STREAM))
-            w16 = (_WS_SPARSE_SLAB_W16 and _WS_SPARSE_SLAB_NATIVE and TMS in (4, 8, 16)
-                   and not _WS_SPARSE_SLAB_GROUP and not _WS_SPARSE_SLAB_STREAM)
-            swz = _WS_SPARSE_SLAB_SWZ and not w16
-            wslab = (group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, swz, BS, rows=rows, w16=w16)
-                     if _WS_SPARSE_SLAB_NATIVE else None)
-            _sio_cuda.ws_slab_forward(
-                sv_out.values, params, group.pid_start, sv_in, sv_out, max_val,
-                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS, wslab=wslab, w16=w16,
-                slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
-                min_blocks=_WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
-                swz=swz, static=_WS_SPARSE_SLAB_STATIC,
-                ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM, group=_WS_SPARSE_SLAB_GROUP,
-                pipe=_WS_SPARSE_SLAB_PIPE, stream=_WS_SPARSE_SLAB_STREAM,
-                xv=(_ws_scratch("sp_xval", (B, K), device, torch.float32)
-                    if _WS_SPARSE_SLAB_GROUP else None), rows=rows,
-            )
-            return
-        rnd = _WS_PRECISION == "tf32"
-        w, w_start = group.weights(params)
-
-        xd = _ws_scratch("x", (B, H_in), device)
-        xd.zero_()
-        _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
-            xd, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
-            sv_in.values.stride(0), H_in, 1, 0,
-            BLOCK=_WS_VEC, ROUND=rnd,
-        )
-
-        yd = _ws_scratch("y", (B, H_out), device)
-        if tiles:
-            TM, TK, BB, warps, stages = self._ws_tiles_shapes(blk_idx, B, device)
-            assert TM is not None
-            lists, counts = _ws_tile_lists(sv_out, H_out, TM, device)
-            bits, n_words = _ws_tile_bits(sv_in, H_in, TK, device)
-            _ws_fwd_tiles_kernel[(triton.cdiv(B, BB), H_out // TM)](
-                yd, w, xd, max_val, sv_in.nnz, lists, counts, bits, w_start, B, H_in, H_out,
-                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB, NW=n_words,
-                PREC="tf32" if rnd else "ieee", ROW_MASK=_WS_TILES_ROW_MASK,
-                SKIP_K=_WS_TILES_SKIP_K,
-                num_warps=warps, num_stages=stages,
-            )
-        else:
-            TM, BB, warps, stages = _ws_tiles(H_out, B, BS, 128, device)
-            TK = min(32, CBS)
-            if active_children:
-                active, n_active = _ws_active_children(sv_in, H_in, device)
-            else:
-                active = n_active = sv_in.nnz                  # unused
-            _ws_fwd_kernel[(triton.cdiv(B, BB), H_out // TM)](
-                yd, w, xd, max_val, sv_in.nnz, active, n_active, w_start, B, H_in, H_out,
-                NB_ch=NB_ch, BS=BS, CBS=CBS, TM=TM, TK=TK, BB=BB,
-                PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
-                num_warps=warps, num_stages=stages,
-            )
-
-        _ws_gather_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
-            sv_out.values, yd, sv_out.indices, sv_out.col_starts, sv_out.nnz,
-            sv_out.values.stride(0), H_out, BLOCK=_WS_VEC,
+        TMS = _WS_SPARSE_SLAB_TM
+        n_m = -(-H_out // TMS)
+        K = sv_in.total_nnz
+        _KS, nsplit = _sio_cuda.slab_shape(H_in, TMS, _WS_SPARSE_SLAB_BYTES)
+        ent = _ws_scratch("sp_ent", (n_m, 2 * B), device, torch.int32)
+        cnt = _ws_scratch("sp_cnt", (n_m,), device, torch.int32)
+        xp = _ws_scratch("sp_xpack", (B, 2 * K), device, torch.int32)
+        cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+        wslab = group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, BS, w16=_WS_SPARSE_SLAB_W16)
+        _sio_cuda.ws_slab_forward(
+            sv_out.values, wslab, sv_in, sv_out, max_val, ent, cnt, xp, cofs, B, H_in, H_out, BS,
+            TMS=TMS, slab_bytes=_WS_SPARSE_SLAB_BYTES, NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16),
+            min_blocks=_WS_SPARSE_SLAB_MINB, w16=_WS_SPARSE_SLAB_W16,
         )
 
     def _ws_backward_block(self, blk_idx: int, block: tuple, sv_in: SparseNodeValues,
                            sv_out: SparseNodeValues, sv_flow_out: SparseNodeValues,
                            sv_flow_in: SparseNodeValues, params: torch.Tensor,
-                           param_flows: Optional[torch.Tensor],
-                           negate_pflows: bool, active_children: bool = False,
-                           tiles: bool = False, sparse: bool = False) -> None:
-        """Element flows through :func:`_ws_bwd_flow_kernel` (over all
-        children, or with ``active_children`` only the batch's) or, with
-        ``tiles``, :func:`_ws_bwd_flow_tiles_kernel` (every child tile with
-        the samples that have an active child in it) or, with ``sparse``, the
-        CUDA-core slab kernel of :mod:`.sparse_io_cuda` (tile height
-        ``self._ws_sparse_tm_bwd[blk_idx]``) over the active pairs only, which
-        writes the packed element flows directly; the parameter flows are
-        only *stashed* here (densified ``G`` / ``X`` factors in this block's
-        slot) and accumulated by :meth:`_WSGroup.flush` in bounded chunks.
+                           param_flows: Optional[torch.Tensor], negate_pflows: bool) -> None:
+        """Element flows on the sparse pass
+        (:func:`.sparse_io_cuda.ws_slab_backward`: tiles of
+        ``_WS_SPARSE_SLAB_TM`` children, ranges of parents, the packed flows
+        written directly). The parameter flows are only *stashed* here — the
+        step's packed inputs for the tile accumulation (``_WS_SPARSE_PFLOW``
+        "tile"), or its densified ``G`` / ``X`` factors in this block's slot
+        of the group's stash ("gemm") — and accumulated by
+        :meth:`_WSGroup.flush`.
 
         With ``gs[b, h] = nflow[b, h] * exp(max_b - nmars[b, h])`` and
         ``x[b, c] = exp(in[b, c] - max_b)`` (zero off-support):
@@ -1508,138 +869,63 @@ class SparseIOSumLayer(SparseInputSumLayer):
           pflow[h, c]  += W[h, c] * sum_b gs[b, h] x[b, c]
         """
         group, slot = self._ws_slots[blk_idx]
-        _, _, _, _, _NB, NB_ch, BS, CBS = block
+        _, _, _, _, _NB, _NB_ch, BS, _CBS = block
         B = sv_in.batch_size
         device = params.device
         H_in, H_out = group.H_in, group.H_out
-        rnd = _WS_PRECISION == "tf32"
         max_val = sv_in.max_val
         assert max_val is not None, (
-            "WS backward needs the fused per-sample sv_in.max_val from the "
-            "upstream prod layer's re-forward."
+            "the sparse backward needs the fused per-sample sv_in.max_val from "
+            "the upstream prod layer's re-forward."
         )
-        pf_mode = _pflow_mode(group.H_in, group.H_out, B)
-        fused_pf = sparse and param_flows is not None and pf_mode in ("fused", "fixed")
-        tile_pf = sparse and param_flows is not None and pf_mode == "tile"
-        # the sparse kernels read W itself (exact fp32), not the rounded copy
-        w, w_start = (params, group.pid_start) if sparse else group.weights(params)
-
-        if sparse:
-            gd = None
-            if tile_pf:                                    # stationary accumulator tiles
+        if param_flows is not None:
+            if _pflow_mode(H_in, H_out, B) == "tile":
                 group.tile_stash(params, param_flows, sv_in, sv_out, sv_flow_out, max_val, B, negate_pflows)
-            elif param_flows is not None and not fused_pf:   # the stash of the deferred param-flow GEMM only
+            else:
+                rnd = _WS_PRECISION == "tf32"
                 gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
                 _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
-                    gt, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
+                    gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
                     sv_in.nnz, sv_out.col_starts, sv_out.nnz,
-                    sv_flow_out.values.stride(0), sv_out.values.stride(0), H_out,
-                    gt.stride(0), col0,
-                    BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=True, WRITE_D=False,
+                    sv_flow_out.values.stride(0), sv_out.values.stride(0), gt.stride(0), col0,
+                    BLOCK=_WS_VEC, ROUND=rnd,
                 )
-        else:
-            gd = _ws_scratch("g", (B, H_out), device)
-            gd.zero_()
-            if param_flows is not None:
-                gt, xt, col0 = group.stash_slot(slot, B, device, negate_pflows, params, param_flows)
-            else:
-                gt, xt, col0 = gd, None, 0
-            _ws_densify_g_kernel[(triton.cdiv(sv_out.total_nnz, _WS_VEC), B)](
-                gd, gt, sv_out.indices, sv_flow_out.values, sv_out.values, max_val,
-                sv_in.nnz, sv_out.col_starts, sv_out.nnz,
-                sv_flow_out.values.stride(0), sv_out.values.stride(0), H_out,
-                gt.stride(0), col0,
-                BLOCK=_WS_VEC, ROUND=rnd, WRITE_T=param_flows is not None, WRITE_D=True,
-            )
-        if param_flows is not None and not fused_pf and not tile_pf:
-            _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
-                xt, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
-                sv_in.values.stride(0), 1, xt.stride(0), col0,
-                BLOCK=_WS_VEC, ROUND=rnd,
-            )
+                _ws_densify_x_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
+                    xt, sv_in.indices, sv_in.values, max_val, sv_in.col_starts, sv_in.nnz,
+                    sv_in.values.stride(0), xt.stride(0), col0,
+                    BLOCK=_WS_VEC, ROUND=rnd,
+                )
 
-        if sparse:
-            TMS = self._ws_sparse_tm_bwd[blk_idx]
-            n_t = -(-H_in // TMS)
-            slab_bytes = _WS_SPARSE_PF_BYTES if fused_pf else _WS_SPARSE_SLAB_BYTES
-            _KS, nsplit = _sio_cuda.slab_shape(H_out, TMS, slab_bytes)
-            ent = _ws_scratch("sp_ent", (n_t, 2 * B), device, torch.int32)
-            cnt = _ws_scratch("sp_cnt", (n_t,), device, torch.int32)
-            xp = _ws_scratch("sp_xpack", (B, 2 * sv_out.total_nnz), device, torch.int32)
-            cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
-            rows = (_WS_SPARSE_SLAB_ROWS and _WS_SPARSE_SLAB_NATIVE_BWD
-                    and _sio_cuda.slab_rows_ok(TMS, _WS_SPARSE_SLAB_GL, 0 if fused_pf else _WS_SPARSE_SLAB_GROUP,
-                                               _WS_SPARSE_SLAB_STREAM, int(fused_pf)))
-            w16 = (_WS_SPARSE_SLAB_W16 and _WS_SPARSE_SLAB_NATIVE_BWD and TMS in (4, 8, 16) and not fused_pf
-                   and not _WS_SPARSE_SLAB_GROUP and not _WS_SPARSE_SLAB_STREAM)
-            swz = _WS_SPARSE_SLAB_SWZ and not w16
-            wslab = (group.slab_copy(params, TMS, slab_bytes, swz, BS, bwd=True, rows=rows, w16=w16)
-                     if _WS_SPARSE_SLAB_NATIVE_BWD else None)
-            _sio_cuda.ws_slab_backward(
-                sv_flow_in.values, params, group.pid_start, sv_in, sv_out, sv_flow_out, max_val,
-                ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS, slab_bytes=slab_bytes,
-                wslab=wslab, swz=swz, w16=w16,
-                NWARP=_WS_SPARSE_PF_NWARP if fused_pf else _WS_SPARSE_SLAB_NWARP.get(TMS, 16),
-                min_blocks=_WS_SPARSE_PF_MINB if fused_pf else _WS_SPARSE_SLAB_MINB, GL=_WS_SPARSE_SLAB_GL,
-                static=_WS_SPARSE_SLAB_STATIC, ahead=_WS_SPARSE_SLAB_AHEAD, perm=_WS_SPARSE_SLAB_PERM,
-                group=0 if fused_pf else _WS_SPARSE_SLAB_GROUP, pipe=_WS_SPARSE_SLAB_PIPE,
-                stream=_WS_SPARSE_SLAB_STREAM,
-                xv=(_ws_scratch("sp_xval", (B, sv_out.total_nnz), device, torch.float32)
-                    if _WS_SPARSE_SLAB_GROUP and not fused_pf else None),
-                pflow=param_flows if fused_pf else None, pf_start=group.pfid_start, pf_neg=negate_pflows,
-                pf_fixed=pf_mode == "fixed", rows=rows,
-            )
-            return
-
-        fd = _ws_scratch("f", (B, H_in), device)
-        if tiles:
-            TM, TK, BB, warps, stages = self._ws_tiles_shapes(blk_idx, B, device)
-            assert TM is not None
-            lists, counts = _ws_tile_lists(sv_in, H_in, TK, device)
-            bits, n_words = _ws_tile_bits(sv_out, H_out, TM, device)
-            _ws_bwd_flow_tiles_kernel[(triton.cdiv(B, BB), H_in // TK)](
-                fd, w, gd, lists, counts, bits, w_start, B, H_in, H_out,
-                NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB, NW=n_words,
-                PREC="tf32" if rnd else "ieee", ROW_MASK=_WS_TILES_ROW_MASK,
-                SKIP_K=_WS_TILES_SKIP_K,
-                num_warps=warps, num_stages=stages,
-            )
-        else:
-            TK, BB, warps, stages = _ws_tiles(H_in, B, CBS, 128, device)
-            TM = min(32, BS)
-            if active_children:
-                active, n_active = _ws_active_children(sv_in, H_in, device)
-            else:
-                active = n_active = sv_in.nnz                  # unused
-            _ws_bwd_flow_kernel[(triton.cdiv(B, BB), H_in // TK)](
-                fd, w, gd, active, n_active, w_start, B, H_in, H_out,
-                NB_ch=NB_ch, BS=BS, CBS=CBS, TK=TK, TM=TM, BB=BB,
-                PREC="tf32" if rnd else "ieee", GATHER_K=active_children,
-                num_warps=warps, num_stages=stages,
-            )
-
-        _ws_gather_flow_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), B)](
-            sv_flow_in.values, fd, sv_in.indices, sv_in.values, max_val,
-            sv_in.col_starts, sv_in.nnz, sv_in.values.stride(0),
-            sv_flow_in.values.stride(0), H_in, BLOCK=_WS_VEC,
+        TMS = _WS_SPARSE_SLAB_TM
+        n_t = -(-H_in // TMS)
+        _KS, nsplit = _sio_cuda.slab_shape(H_out, TMS, _WS_SPARSE_SLAB_BYTES)
+        ent = _ws_scratch("sp_ent", (n_t, 2 * B), device, torch.int32)
+        cnt = _ws_scratch("sp_cnt", (n_t,), device, torch.int32)
+        xp = _ws_scratch("sp_xpack", (B, 2 * sv_out.total_nnz), device, torch.int32)
+        cofs = _ws_scratch("sp_cofs", (B, nsplit + 1), device, torch.int32)
+        wslab = group.slab_copy(params, TMS, _WS_SPARSE_SLAB_BYTES, BS, bwd=True, w16=_WS_SPARSE_SLAB_W16)
+        _sio_cuda.ws_slab_backward(
+            sv_flow_in.values, wslab, sv_in, sv_out, sv_flow_out, max_val,
+            ent, cnt, xp, cofs, B, H_in, H_out, BS, TMS=TMS, slab_bytes=_WS_SPARSE_SLAB_BYTES,
+            NWARP=_WS_SPARSE_SLAB_NWARP.get(TMS, 16), min_blocks=_WS_SPARSE_SLAB_MINB,
+            w16=_WS_SPARSE_SLAB_W16,
         )
 
 
 # =====================================================================
-# Weight-stationary path: shared state
+# Batched sparse pass: shared state
 # =====================================================================
 
 _WS_STASH_BYTES = int(os.environ.get("PYJUICE_SPARSE_IO_WS_STASH_MIB", "256")) * 2**20
-"""Factor-buffer budget per tied matrix; at least one batch slot is retained.
-Set to 0 to retain all slots (reference behavior). Chunking changes only the
-order of parameter-flow accumulation, not the batch or the EM update.
-"""
+"""Factor-buffer budget per tied matrix of the deferred param-flow GEMM; at
+least one batch slot is retained. Set to 0 to retain all slots (reference
+behavior). Chunking changes only the order of parameter-flow accumulation,
+not the batch or the EM update."""
 
 _WS_VEC = 256
 """Element tile of the densify / gather kernels."""
 
 _WS_SCRATCH: Dict[Tuple[str, torch.device], torch.Tensor] = {}
-_WS_W_OWNER: Dict[torch.device, Tuple["_WSGroup", int]] = {}
 _WS_SLAB_OWNER: Dict[torch.device, tuple] = {}
 _WS_NUM_SMS: Dict[torch.device, int] = {}
 
@@ -1647,7 +933,8 @@ _WS_NUM_SMS: Dict[torch.device, int] = {}
 def _ws_scratch(name: str, shape: Tuple[int, ...], device: torch.device,
                 dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Process-wide grow-only scratch (one dtype per name). Layers run one at
-    a time on one stream, so every WS call can reuse the same buffers."""
+    a time on one stream, so every call of the sparse pass can reuse the same
+    buffers."""
     n = 1
     for s in shape:
         n *= s
@@ -1657,67 +944,6 @@ def _ws_scratch(name: str, shape: Tuple[int, ...], device: torch.device,
         buf = torch.empty(n, dtype=dtype, device=device)
         _WS_SCRATCH[(name, device)] = buf
     return buf[:n].view(shape)
-
-
-def _ws_active_children(sv_in: SparseNodeValues, H_in: int,
-                        device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(active, count)``: the sorted union of the batch's active input rows,
-    its first ``count[0]`` entries (``count`` a one-element device view, read
-    by the kernels as their loop bound). Flags, inclusive prefix sum,
-    compaction: four launches, all graph-capturable, no host sync."""
-    flags = _ws_scratch("u_flags", (H_in,), device, torch.int32)
-    pos = _ws_scratch("u_pos", (H_in,), device, torch.int32)
-    active = _ws_scratch("u_active", (H_in,), device, torch.int32)
-    flags.zero_()
-    _ws_union_mark_kernel[(triton.cdiv(sv_in.total_nnz, _WS_VEC), sv_in.batch_size)](
-        flags, sv_in.indices, sv_in.col_starts, sv_in.nnz, BLOCK=_WS_VEC,
-    )
-    torch.cumsum(flags, 0, dtype=torch.int32, out=pos)
-    _ws_union_compact_kernel[(triton.cdiv(H_in, _WS_VEC),)](
-        active, flags, pos, H_in, BLOCK=_WS_VEC,
-    )
-    return active, pos[H_in - 1:]
-
-
-def _ws_tile_lists(sv: SparseNodeValues, H: int, T: int,
-                   device: torch.device) -> Tuple[torch.Tensor, torch.Tensor]:
-    """``(lists, counts)`` of the tiles passes: for every ``T``-row tile ``m``
-    of the ``H`` rows of the batched column ``sv`` the samples with an active
-    row in it, ``lists[m, 0:counts[m]]`` (int32, batch order, ``lists`` is
-    ``[n_tiles, B]``): the parents of the forward, the children of the
-    backward. Per-sample flags, then one program per tile scans the batch
-    (prefix sum) and compacts; graph-capturable, no host sync."""
-    B = sv.batch_size
-    n_tiles = H // T
-    flags = _ws_scratch("tl_flags", (B, n_tiles), device, torch.int32)
-    lists = _ws_scratch("tl_lists", (n_tiles, B), device, torch.int32)
-    counts = _ws_scratch("tl_counts", (n_tiles,), device, torch.int32)
-    flags.zero_()
-    _ws_tile_mark_kernel[(triton.cdiv(sv.total_nnz, _WS_VEC), B)](
-        flags, sv.indices, sv.col_starts, sv.nnz, n_tiles, T, BLOCK=_WS_VEC,
-    )
-    _ws_tile_lists_kernel[(n_tiles,)](
-        lists, counts, flags, B, n_tiles, BLOCK_B=max(16, triton.next_power_of_2(B)),
-        num_warps=8 if B > 2048 else 4,
-    )
-    return lists, counts
-
-
-def _ws_tile_bits(sv: SparseNodeValues, H: int, T: int,
-                  device: torch.device) -> Tuple[torch.Tensor, int]:
-    """``(bits, n_words)``: per sample the ``T``-row tiles of ``sv`` it has an
-    active row in, as bits of ``n_words`` (a power of two) int32 words
-    (``bits[b, t // 32] >> (t % 32) & 1``): the children of the forward, the
-    parents of the backward. Graph-capturable."""
-    B = sv.batch_size
-    n_tiles = H // T
-    n_words = triton.next_power_of_2(triton.cdiv(n_tiles, 32))   # a tl.arange extent in the kernels
-    bits = _ws_scratch("tl_bits", (B, n_words), device, torch.int32)
-    bits.zero_()
-    _ws_tile_bits_kernel[(triton.cdiv(sv.total_nnz, _WS_VEC), B)](
-        bits, sv.indices, sv.col_starts, sv.nnz, n_words, T, BLOCK=_WS_VEC,
-    )
-    return bits, n_words
 
 
 def _num_sms(device: torch.device) -> int:
@@ -1737,23 +963,6 @@ def _single_forward_splits(k_tiles: int, n_m: int, n_prog: int) -> Tuple[int, in
     return -(-k_tiles // ct) if ct > 0 else 1, ct
 
 
-def _ws_tiles(n_rows: int, B: int, blk: int, t_max: int,
-              device: torch.device) -> Tuple[int, int, int, int]:
-    """``(row tile, batch tile, num_warps, num_stages)``: largest tiles that
-    still give one program per SM. Row tiles divide ``blk`` (a power of two
-    >= 16); batch slices of the same row block are launched adjacently so
-    they share W through L2. From B=128 on the in-tile MMA starts to bind
-    (H=16k, B=256: 128-wide batch tiles 0.90 ms/step vs 1.35 with 64-wide)."""
-    n_sm = _num_sms(device)
-    BB = 128 if B >= 128 else (64 if B >= 64 else max(16, triton.next_power_of_2(B)))
-    T = min(t_max, blk)
-    while T > 16 and (n_rows // T) * triton.cdiv(B, BB) < n_sm:
-        T //= 2
-    while BB > 16 and (n_rows // T) * triton.cdiv(B, BB) < n_sm:
-        BB //= 2
-    return (T, BB, 8, 3) if BB >= 128 else (T, BB, 4, 4)
-
-
 def _pflow_mode(H_in: int, H_out: int, B: int) -> str:
     """The param-flow path of a sparse-dispatch block (``_WS_SPARSE_PFLOW``, ``"auto"`` resolved)."""
     if _WS_SPARSE_PFLOW != "auto":
@@ -1764,14 +973,17 @@ def _pflow_mode(H_in: int, H_out: int, B: int) -> str:
 
 
 class _WSGroup:
-    """WS state shared by every :class:`SparseIOSumLayer` block that reads
-    the same (tied) transition matrix, i.e. the same ``pid_start`` /
+    """State shared by every :class:`SparseIOSumLayer` block that reads the
+    same (tied) transition matrix, i.e. the same ``pid_start`` /
     ``pfid_start`` / shape — all 127 steps of a homogeneous HMM chain:
 
-    * the per-pass tf32-rounded copy of W (``_WS_PRECISION == "tf32"``);
-    * the stash of densified backward factors, up to the configured number of
-      ``B``-column slots: ``Gt[H_out, slots*B]`` / ``Xt[H_in, slots*B]``.
-      Full chunks flush during traversal; the remainder flushes at pass end.
+    * the per-pass copy of W in slab order (:meth:`slab_copy`);
+    * the deferred parameter flows: the ``[H_out, H_in]`` accumulator ``S``
+      (``pflow += W * S`` at the pass end) and its stash — the stored steps'
+      packed inputs (``_WS_SPARSE_PFLOW`` "tile") or the densified factors
+      ``Gt[H_out, slots*B]`` / ``Xt[H_in, slots*B]`` of up to the configured
+      number of ``B``-column slots ("gemm"; full chunks flush during
+      traversal, the remainder at the pass end).
 
     ``TensorCircuit`` calls :meth:`begin_pass` at the start of every
     forward / backward and :meth:`flush` after the inner backward.
@@ -1785,11 +997,11 @@ class _WSGroup:
         self.H_out = NB * BS
         self.H_in = NB_ch * CBS
         self.num_slots = 0
-        # tl.dot needs every tile dim >= 16; tiles must divide the PC blocks.
+        # blocks below 16 rows stay on the gather kernels (the sparse pass
+        # and the param-flow epilogue tile the PC blocks in 16s and 64s)
         self.eligible = BS % 16 == 0 and CBS % 16 == 0
-        self._w_valid = False
         self._slab_valid = False
-        self._s: Optional[torch.Tensor] = None      # deferred-epilogue accumulator (_WS_PFLOW_DEFER)
+        self._s: Optional[torch.Tensor] = None      # the deferred accumulator S
         self._s_dirty = False
         self._gt: Optional[torch.Tensor] = None
         self._xt: Optional[torch.Tensor] = None
@@ -1798,6 +1010,7 @@ class _WSGroup:
         self._used = 0
         self._negate: Optional[bool] = None
         self._tbufs: Optional[dict] = None          # _WS_SPARSE_PFLOW "tile": stored steps
+        self._tbytes = 0                            # the tile size for the device (pflow_tile_bytes)
         self._tused = 0
         self._tnegate: Optional[bool] = None
 
@@ -1813,7 +1026,9 @@ class _WSGroup:
         if (b is None or b["B"] != B or b["xo"].shape[2] < Kx or b["gp"].shape[2] < Kg
                 or (self._tused and self._tnegate != negate)):
             self.tile_flush()
-            _KS, nsplit, n_m = _sio_cuda.pflow_tile_shape(self.H_in, self.H_out, _WS_SPARSE_PF_TILE_BYTES)
+            self._tbytes = _sio_cuda.pflow_tile_bytes(self.H_in, self.H_out, device, _WS_SPARSE_PF_TILE_BYTES,
+                                                      _WS_SPARSE_PF_TILE_NWARP)
+            _KS, nsplit, n_m = _sio_cuda.pflow_tile_shape(self.H_in, self.H_out, self._tbytes)
             per_step = n_m * (B * 8 + 4) + B * (Kx * 8 + (nsplit + 1) * 4 + 8 + Kg * 4)
             S = max(1, min(_WS_SPARSE_PF_TILE_SLOTS, _WS_SPARSE_PF_TILE_STASH_BYTES // per_step))
             i32 = dict(dtype=torch.int32, device=device)
@@ -1825,7 +1040,7 @@ class _WSGroup:
         elif self._tused == b["cnt"].shape[0]:
             self.tile_flush()
         _sio_cuda.pflow_tile_stash(b, self._tused, sv_in, sv_out, sv_flow_out, max_val, B,
-                                   self.H_in, self.H_out, _WS_SPARSE_PF_TILE_BYTES)
+                                   self.H_in, self.H_out, self._tbytes)
         self._tused += 1
         self._tnegate = negate
 
@@ -1834,16 +1049,15 @@ class _WSGroup:
         if self._tused:
             _sio_cuda.pflow_tile_flush(self._s, self._tbufs, self._tused, self._tbufs["B"], self.H_in, self.H_out,
                                        -1.0 if self._tnegate else 1.0, _WS_SPARSE_PF_TILE_NWARP,
-                                       slab_bytes=_WS_SPARSE_PF_TILE_BYTES, fixed=_WS_SPARSE_PF_TILE_FIXED)
+                                       slab_bytes=self._tbytes)
             self._s_dirty = True
             self._tused = 0
             self._tnegate = None
 
     def begin_pass(self) -> None:
         """Params may have changed since the last pass (EM step): rebuild the
-        rounded copy on next use. Unflushed factors of an abandoned pass are
-        discarded. Reserved slots are zeroed before reuse."""
-        self._w_valid = False
+        slab-order copy on next use. Unflushed factors of an abandoned pass
+        are discarded. Reserved slots are zeroed before reuse."""
         self._slab_valid = False
         if self._s_dirty:            # an abandoned pass left flushes in the accumulator
             self._s.zero_()
@@ -1853,75 +1067,49 @@ class _WSGroup:
         self._tused = 0
         self._tnegate = None
 
-    def weights(self, params: torch.Tensor) -> Tuple[torch.Tensor, int]:
-        """``(tensor, offset of W in it)`` for the WS GEMMs. In tf32 mode
-        this is a process-wide buffer holding W rounded to nearest tf32,
-        rebuilt once per pass (or whenever another group used the buffer)."""
-        if _WS_PRECISION != "tf32":
-            return params, self.pid_start
-        device = params.device
-        n = self.H_out * self.H_in
-        buf = _ws_scratch("w_rn", (n,), device)
-        owner = _WS_W_OWNER.get(device)
-        if not (self._w_valid and owner is not None and owner[0] is self
-                and owner[1] == buf.data_ptr()):
-            BLOCK = 4096
-            _ws_round_copy_kernel[(triton.cdiv(n, BLOCK),)](
-                buf, params, self.pid_start, n, BLOCK=BLOCK,
-            )
-            _WS_W_OWNER[device] = (self, buf.data_ptr())
-            self._w_valid = True
-        return buf, 0
-
-    def slab_copy(self, params: torch.Tensor, TMS: int, slab_bytes: int, swz: bool, BS: int,
-                  bwd: bool = False, rows: bool = False, w16: bool = False) -> torch.Tensor:
+    def slab_copy(self, params: torch.Tensor, TMS: int, slab_bytes: int, BS: int,
+                  bwd: bool = False, w16: bool = False) -> torch.Tensor:
         """W in the sparse forward's (``bwd``: backward's) slab order
         (:func:`.sparse_io_cuda.slab_wcopy`), a process-wide buffer rebuilt once per pass
-        (or when another group, direction, slab shape or layout used it); ``rows``: slabs stored
-        row by row; ``w16``: the copy in bf16 (:data:`_WS_SPARSE_SLAB_W16`)."""
+        (or when another group, direction or slab shape used it); ``w16``: the copy in bf16
+        (:data:`_WS_SPARSE_SLAB_W16`)."""
         device = params.device
         n = _sio_cuda.slab_copy_numel(self.H_in, self.H_out, TMS, slab_bytes, bwd)
         buf = _ws_scratch("w_slab16" if w16 else "w_slab", (n,), device,
                           torch.bfloat16 if w16 else torch.float32)
-        tag = (self, buf.data_ptr(), TMS, slab_bytes, swz, bwd, rows, w16)
+        tag = (self, buf.data_ptr(), TMS, slab_bytes, bwd, w16)
         if not (self._slab_valid and _WS_SLAB_OWNER.get(device) == tag):
             _sio_cuda.slab_wcopy(buf, params, self.pid_start, self.H_in, self.H_out, BS, TMS,
-                                 slab_bytes, swz, bwd, rows, w16)
+                                 slab_bytes, bwd, w16)
             _WS_SLAB_OWNER[device] = tag
             self._slab_valid = True
         return buf
 
-    def ensure_ready(self, params: torch.Tensor, B: int, need_stash: bool, w_copy: bool = True) -> bool:
-        """Allocate this group's WS buffers up front — the per-pass rounded W
-        copy (``H^2`` floats; not for the sparse kernels, ``w_copy=False``, which
-        read W itself) and, when ``need_stash``, the deferred param-flow
-        stash (``(H_out + H_in) * chunk_slots * B`` floats). Returns ``False``
-        after disabling the group if they do not fit, so that enabling WS by
-        default can never turn a run that used to fit into an OOM crash; the
-        blocks then stay on the gather kernels for the rest of the session.
+    def ensure_ready(self, params: torch.Tensor, B: int, need_stash: bool) -> bool:
+        """Allocate the deferred param-flow buffers up front when ``need_stash``:
+        the accumulator ``S`` (``H_out * H_in`` floats) and the factor stash
+        (``(H_out + H_in) * chunk_slots * B`` floats). Returns ``False`` after
+        disabling the group if they do not fit, so that the sparse pass can
+        never turn a run that used to fit into an OOM crash; the blocks then
+        stay on the gather kernels for the rest of the session.
         """
         try:
-            if _WS_PRECISION == "tf32" and w_copy:
-                _ws_scratch("w_rn", (self.H_out * self.H_in,), params.device)
             if need_stash:
                 self._ensure_stash(B, params.device)
-                if _WS_PFLOW_DEFER and self._s is None:
+                if self._s is None:
                     self._s = torch.zeros(self.H_out, self.H_in, dtype=torch.float32, device=params.device)
         except torch.cuda.OutOfMemoryError:
             self.eligible = False
             self._gt = self._xt = self._s = None
-            _WS_SCRATCH.pop(("w_rn", params.device), None)
             extra = (self.H_out * self.H_in
                      + (self.H_out + self.H_in) * self._stash_slots(B) * B) * 4 / 2 ** 30
             warnings.warn(
-                "Not enough GPU memory for the weight-stationary sparse-IO "
-                f"path (needs up to ~{extra:.1f} GiB beyond the circuit: one "
-                "fp32 copy of the transition matrix plus the deferred "
-                "param-flow stash); falling back to the per-sample gather "
-                "kernels, which are several times slower at this batch size. "
-                "Lower the batch size, or set PYJUICE_SPARSE_IO_WS_PRECISION="
-                "ieee to drop the W copy (exact, but its backward is slower "
-                "than the gather path).",
+                "Not enough GPU memory for the deferred parameter flows of the "
+                f"sparse-IO pass (needs up to ~{extra:.1f} GiB beyond the circuit: "
+                "one fp32 accumulator the size of the transition matrix plus the "
+                "factor stash); falling back to the per-sample gather kernels, "
+                "which are several times slower at this batch size. Lower the "
+                "batch size or PYJUICE_SPARSE_IO_WS_STASH_MIB.",
                 RuntimeWarning,
             )
             return False
@@ -1965,48 +1153,18 @@ class _WSGroup:
         return self._gt, self._xt, col0
 
     def flush(self, params: torch.Tensor, param_flows: torch.Tensor, final: bool = False) -> None:
-        """Accumulate this chunk's Gt @ Xt.T into parameter flows (with
-        :data:`_WS_PFLOW_DEFER` into the group's accumulator, which ``final``,
-        the pass end, multiplies by W into the parameter flows and zeroes).
-
-        Row panels also bound the GEMM output temporary. The last chunk can
-        be smaller than capacity; cuBLAS receives its true reduction extent.
-        """
+        """Accumulate the stashed steps into ``S``: the stored packed steps
+        on the accumulator tiles (:meth:`tile_flush`) and this chunk's
+        ``Gt @ Xt.T`` by cuBLAS (``beta = 1``). At the pass end (``final``)
+        ``param_flows += W * S`` by :func:`_ws_pflow_epilogue_kernel`, which
+        also zeroes ``S`` for the next pass. The last chunk can be smaller
+        than capacity; cuBLAS receives its true reduction extent."""
         self.tile_flush()
-        if (_WS_PFLOW_DEFER or self._tbufs is not None) and self._s is not None:
-            self._flush_deferred(params, param_flows, final)
-            return
-        if not self._used:
-            return
-        columns = self._used * self._B
-        device = params.device
-        TMe = min(64, self.BS)
-        TKe = min(64, self.CBS)
-        rows = min(self.H_out, max(TMe, _WS_FLUSH_PANEL_ELEMS // self.H_in // TMe * TMe))
-        panel = _ws_scratch("pflow_panel", (rows, self.H_in), device)
-        prev = torch.backends.cuda.matmul.allow_tf32
-        # Gt / Xt were rounded to nearest tf32 at densify time, so cuBLAS's
-        # tf32 truncation is exact on them.
-        torch.backends.cuda.matmul.allow_tf32 = _WS_PRECISION == "tf32"
-        try:
-            for r0 in range(0, self.H_out, rows):
-                r = min(rows, self.H_out - r0)
-                out = panel[:r]
-                torch.mm(self._gt[r0:r0 + r, :columns], self._xt[:, :columns].t(), out=out)
-                _ws_pflow_epilogue_kernel[(r // TMe, self.H_in // TKe)](
-                    param_flows, params, out, r0, self.pid_start, self.pfid_start,
-                    self.H_in, NB_ch=self.NB_ch, BS=self.BS, CBS=self.CBS,
-                    TM=TMe, TK=TKe, NEGATE=bool(self._negate),
-                )
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = prev
-        self._used = 0
-        self._negate = None
-
-    def _flush_deferred(self, params: torch.Tensor, param_flows: torch.Tensor, final: bool) -> None:
         if self._used:
             columns = self._used * self._B
             prev = torch.backends.cuda.matmul.allow_tf32
+            # Gt / Xt were rounded to nearest tf32 at densify time, so cuBLAS's
+            # tf32 truncation is exact on them.
             torch.backends.cuda.matmul.allow_tf32 = _WS_PRECISION == "tf32"
             try:
                 self._s.addmm_(self._gt[:, :columns], self._xt[:, :columns].t(), beta=1.0,
@@ -2020,9 +1178,8 @@ class _WSGroup:
             TMe = min(64, self.BS)
             TKe = min(64, self.CBS)
             _ws_pflow_epilogue_kernel[(self.H_out // TMe, self.H_in // TKe)](
-                param_flows, params, self._s, 0, self.pid_start, self.pfid_start,
-                self.H_in, NB_ch=self.NB_ch, BS=self.BS, CBS=self.CBS,
-                TM=TMe, TK=TKe, NEGATE=False, ZERO_S=True,
+                param_flows, params, self._s, self.pid_start, self.pfid_start,
+                self.H_in, NB_ch=self.NB_ch, BS=self.BS, CBS=self.CBS, TM=TMe, TK=TKe,
             )
             self._s_dirty = False
 
@@ -2638,7 +1795,7 @@ def _sparse_io_sum_backward_kernel(
 
 
 # =====================================================================
-# Weight-stationary path: Triton kernels
+# Deferred parameter flows ("gemm"): Triton kernels
 # =====================================================================
 
 
@@ -2654,23 +1811,13 @@ def _ws_round_tf32(x):
     return xi.to(tl.float32, bitcast=True)
 
 
-@triton.jit(do_not_specialize=["src_start", "n"])
-def _ws_round_copy_kernel(dst_ptr, src_ptr, src_start, n, BLOCK: tl.constexpr):
-    """``dst[i] = round_tf32(src[src_start + i])`` — the per-pass W copy."""
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    mask = offs < n
-    x = tl.load(src_ptr + src_start + offs, mask=mask, other=0.0)
-    tl.store(dst_ptr + offs, _ws_round_tf32(x), mask=mask)
-
-
-@triton.jit(do_not_specialize=["v_stride", "dst_stride_b", "dst_stride_r", "dst_off"])
+@triton.jit(do_not_specialize=["v_stride", "dst_ld", "dst_off"])
 def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
-                         v_stride, dst_stride_b, dst_stride_r, dst_off,
+                         v_stride, dst_ld, dst_off,
                          BLOCK: tl.constexpr, ROUND: tl.constexpr):
-    """Scatter ``exp(values[b, k] - max_b)`` of a batched sparse column to
-    ``dst[dst_off + b*dst_stride_b + row*dst_stride_r]`` (a pre-zeroed dense
-    ``[B, H]`` (strides ``H, 1``) or a transposed stash ``[H, N]`` slot
-    (strides ``1, N``)). Grid ``(cdiv(max nnz, BLOCK), B)``."""
+    """Scatter ``exp(values[b, k] - max_b)`` of a batched sparse column into
+    the transposed stash slot ``dst[dst_off + b + row * dst_ld]`` (a pre-zeroed
+    ``[H, N]`` slot of the factor stash). Grid ``(cdiv(max nnz, BLOCK), B)``."""
     b = tl.program_id(1)
     k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     mask = k < tl.load(nnz_ptr + b)
@@ -2680,231 +1827,17 @@ def _ws_densify_x_kernel(dst_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
     x = tl.exp(v - mx)
     if ROUND:
         x = _ws_round_tf32(x)
-    tl.store(dst_ptr + dst_off + b * dst_stride_b + row.to(tl.int64) * dst_stride_r, x,
-             mask=mask)
-
-
-@triton.jit(do_not_specialize=["out_stride"])
-def _ws_gather_kernel(out_ptr, src_ptr, idx_ptr, cs_ptr, nnz_ptr, out_stride, H,
-                      BLOCK: tl.constexpr):
-    """``out[b, k] = src[b, indices[col_starts[b] + k]]`` for ``k < nnz[b]``."""
-    b = tl.program_id(1)
-    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = k < tl.load(nnz_ptr + b)
-    row = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
-    v = tl.load(src_ptr + b * H + row, mask=mask, other=0.0)
-    tl.store(out_ptr + b * out_stride + k, v, mask=mask)
-
-
-@triton.jit
-def _ws_union_mark_kernel(flags_ptr, idx_ptr, cs_ptr, nnz_ptr, BLOCK: tl.constexpr):
-    """``flags[indices[col_starts[b] + k]] = 1`` for ``k < nnz[b]``. Grid
-    ``(cdiv(max nnz, BLOCK), B)``; samples sharing a row store the same 1."""
-    b = tl.program_id(1)
-    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = k < tl.load(nnz_ptr + b)
-    row = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
-    tl.store(flags_ptr + row, tl.full([BLOCK], 1, tl.int32), mask=mask)
-
-
-@triton.jit
-def _ws_union_compact_kernel(active_ptr, flags_ptr, pos_ptr, H, BLOCK: tl.constexpr):
-    """``active[pos[c] - 1] = c`` for every flagged row ``c``, ``pos`` the
-    inclusive prefix sum of the flags: the sorted active rows, ``pos[H - 1]``
-    of them. Grid ``(cdiv(H, BLOCK),)``."""
-    c = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = c < H
-    f = tl.load(flags_ptr + c, mask=mask, other=0)
-    p = tl.load(pos_ptr + c, mask=mask, other=0)
-    tl.store(active_ptr + p - 1, c, mask=mask & (f != 0))
-
-
-@triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_fwd_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, act_ptr, nact_ptr, w_start, B,
-                   H_in, H_out,
-                   NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                   TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr,
-                   PREC: tl.constexpr, GATHER_K: tl.constexpr):
-    """Weight-stationary forward of one SparseIOSumLayer block. Grid
-    ``(cdiv(B, BB), H_out // TM)``: program = (batch slice, block of TM
-    parents). It walks the children — the softmax / reduction axis — TK at a
-    time; every W tile is loaded once and applied to all BB samples:
-
-        acc[b, m]      = sum_c xd[b, c] * W[h0 + m, c]
-        yd[b, h0 + m]  = log(acc[b, m] + 1e-24) + max_b   (-inf if nnz_in[b] == 0)
-
-    W[h, c] sits at ``w_start + (pb*NB_ch + cb)*CBS*BS + cs*BS + w`` with
-    ``h = pb*BS + w`` and ``c = cb*CBS + cs`` (parents contiguous), so the
-    loaded ``[TK, TM]`` tile is the dot's ``[K, N]`` operand as is. With
-    ``GATHER_K`` the children walked are the batch's active ones only,
-    ``act[0:nact]`` (sorted, :func:`_ws_active_children`), each a contiguous
-    run of TM parents at ``w_rows + c*BS``: W traffic ``nact * H_out``.
-    """
-    pid_b = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    h0 = pid_m * TM
-    pb = h0 // BS
-    w0 = h0 % BS
-    offs_m = tl.arange(0, TM)
-    offs_k = tl.arange(0, TK)
-    offs_b = pid_b * BB + tl.arange(0, BB)
-    mask_b = offs_b < B
-
-    w_rows = w_ptr + w_start + pb.to(tl.int64) * (NB_ch * CBS * BS) + w0
-    acc = tl.zeros([BB, TM], dtype=tl.float32)
-    if GATHER_K:
-        n_act = tl.load(nact_ptr)
-        for k0 in range(0, n_act, TK):
-            offs = k0 + offs_k
-            mask_k = offs < n_act
-            c = tl.load(act_ptr + offs, mask=mask_k, other=0)
-            wt = tl.load(w_rows + c.to(tl.int64)[:, None] * BS + offs_m[None, :],
-                         mask=mask_k[:, None], other=0.0)
-            x = tl.load(xd_ptr + offs_b[:, None] * H_in + c[None, :],
-                        mask=mask_b[:, None] & mask_k[None, :], other=0.0)
-            acc += tl.dot(x, wt, input_precision=PREC)
-    else:
-        for k0 in range(0, H_in, TK):
-            cb = k0 // CBS
-            cs0 = k0 % CBS
-            wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
-            x = tl.load(xd_ptr + offs_b[:, None] * H_in + (k0 + offs_k)[None, :],
-                        mask=mask_b[:, None], other=0.0)
-            acc += tl.dot(x, wt, input_precision=PREC)
-
-    mx = tl.maximum(tl.load(max_ptr + offs_b, mask=mask_b, other=0.0), -1e30)
-    kin = tl.load(kin_ptr + offs_b, mask=mask_b, other=0)
-    res = tl.log(acc) + mx[:, None]
-    res = tl.where(kin[:, None] == 0, -float("inf"), res)
-    tl.store(yd_ptr + offs_b[:, None] * H_out + (h0 + offs_m)[None, :], res,
-             mask=mask_b[:, None])
-
-
-@triton.jit(do_not_specialize=["n_tiles", "TM"])
-def _ws_tile_mark_kernel(flags_ptr, idx_ptr, cs_ptr, nnz_ptr, n_tiles, TM, BLOCK: tl.constexpr):
-    """``flags[b, indices[col_starts[b] + k] // TM] = 1`` for ``k < nnz[b]``.
-    Grid ``(cdiv(max nnz, BLOCK), B)``."""
-    b = tl.program_id(1)
-    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = k < tl.load(nnz_ptr + b)
-    row = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
-    tl.store(flags_ptr + b.to(tl.int64) * n_tiles + row // TM, tl.full([BLOCK], 1, tl.int32), mask=mask)
-
-
-@triton.jit(do_not_specialize=["B", "n_tiles"])
-def _ws_tile_lists_kernel(lists_ptr, counts_ptr, flags_ptr, B, n_tiles, BLOCK_B: tl.constexpr):
-    """One program per parent tile ``m``: ``lists[m, j] = `` the ``j``-th
-    sample with ``flags[b, m]`` set (ascending ``b``), ``counts[m]`` their
-    number. Grid ``(n_tiles,)``."""
-    m = tl.program_id(0)
-    b = tl.arange(0, BLOCK_B)
-    mask = b < B
-    f = tl.load(flags_ptr + b.to(tl.int64) * n_tiles + m, mask=mask, other=0)
-    pos = tl.cumsum(f, 0)
-    tl.store(lists_ptr + m.to(tl.int64) * B + pos - 1, b, mask=mask & (f != 0))
-    tl.store(counts_ptr + m, tl.sum(f, 0))
-
-
-@triton.jit(do_not_specialize=["n_words", "TK"])
-def _ws_tile_bits_kernel(bits_ptr, idx_ptr, cs_ptr, nnz_ptr, n_words, TK, BLOCK: tl.constexpr):
-    """``bits[b, t // 32] |= 1 << (t % 32)`` for the child tile ``t =
-    indices[col_starts[b] + k] // TK`` of every ``k < nnz[b]``. Grid
-    ``(cdiv(max nnz, BLOCK), B)``."""
-    b = tl.program_id(1)
-    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = k < tl.load(nnz_ptr + b)
-    t = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0) // TK
-    one = tl.full([BLOCK], 1, tl.int32)
-    tl.atomic_or(bits_ptr + b.to(tl.int64) * n_words + t // 32, one << (t % 32), mask=mask)
-
-
-@triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_fwd_tiles_kernel(yd_ptr, w_ptr, xd_ptr, max_ptr, kin_ptr, lists_ptr, counts_ptr, bits_ptr,
-                         w_start, B, H_in, H_out,
-                         NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                         TM: tl.constexpr, TK: tl.constexpr, BB: tl.constexpr, NW: tl.constexpr,
-                         PREC: tl.constexpr, ROW_MASK: tl.constexpr, SKIP_K: tl.constexpr):
-    """Weight-stationary forward over every sample's active parent tiles.
-    Grid ``(cdiv(B, BB), H_out // TM)``: program = (block of BB samples of
-    the parent tile's list, parent tile ``m``); programs past the list's
-    length return at once. As :func:`_ws_fwd_kernel`, the program walks the
-    children TK at a time against the W tile ``[TK, TM]``, but its batch rows
-    are the gathered samples ``lists[m, blk*BB : ...]``, and with ``ROW_MASK``
-    an activation row is loaded only when the sample has an active child in
-    the tile (its child-tile bits, ``NW`` words per sample held in registers,
-    so the mask never waits for a load; the other rows are zero anyway). The
-    children are walked word by word of the bits, 32 tiles per word. With
-    ``SKIP_K`` a child tile no sample of the block touches is skipped (a
-    branch that costs the loop its pipelining). Writes ``yd[b, m-tile]`` for
-    the block's samples only — every active parent of a sample lies in a
-    tile whose list holds the sample, which is all the gather that follows
-    reads."""
-    blk = tl.program_id(0)
-    pid_m = tl.program_id(1)
-    n = tl.load(counts_ptr + pid_m)
-    if blk * BB >= n:
-        return
-    offs_b = blk * BB + tl.arange(0, BB)
-    mask_b = offs_b < n
-    ids = tl.load(lists_ptr + pid_m.to(tl.int64) * B + offs_b, mask=mask_b, other=0)
-    ids64 = ids.to(tl.int64)
-    h0 = pid_m * TM
-    pb = h0 // BS
-    w0 = h0 % BS
-    offs_m = tl.arange(0, TM)
-    offs_k = tl.arange(0, TK)
-    offs_w = tl.arange(0, NW)
-    w_rows = w_ptr + w_start + pb.to(tl.int64) * (NB_ch * CBS * BS) + w0
-    x_rows = xd_ptr + ids64[:, None] * H_in
-    words = tl.load(bits_ptr + ids64[:, None] * NW + offs_w[None, :], mask=mask_b[:, None], other=0)
-    n_tiles = H_in // TK
-
-    acc = tl.zeros([BB, TM], dtype=tl.float32)
-    for wi in range(0, NW):
-        # the block's bits of the 32 child tiles of word wi, one int per sample
-        w_sel = tl.sum(tl.where(offs_w[None, :] == wi, words, 0), axis=1)
-        any_bit = tl.sum(w_sel, 0)
-        n_j = tl.minimum(32, n_tiles - wi * 32)
-        if SKIP_K:
-            if any_bit != 0:
-                for j in range(0, n_j):
-                    touch = mask_b & (((w_sel >> j) & 1) != 0)
-                    k0 = (wi * 32 + j) * TK
-                    cb = k0 // CBS
-                    cs0 = k0 % CBS
-                    wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
-                    x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
-                    acc += tl.dot(x, wt, input_precision=PREC)
-        else:
-            for j in range(0, n_j):
-                if ROW_MASK:
-                    touch = mask_b & (((w_sel >> j) & 1) != 0)
-                else:
-                    touch = mask_b
-                k0 = (wi * 32 + j) * TK
-                cb = k0 // CBS
-                cs0 = k0 % CBS
-                wt = tl.load(w_rows + cb * (CBS * BS) + (cs0 + offs_k)[:, None] * BS + offs_m[None, :])
-                x = tl.load(x_rows + (k0 + offs_k)[None, :], mask=touch[:, None], other=0.0)
-                acc += tl.dot(x, wt, input_precision=PREC)
-
-    mx = tl.maximum(tl.load(max_ptr + ids, mask=mask_b, other=0.0), -1e30)
-    kin = tl.load(kin_ptr + ids, mask=mask_b, other=0)
-    res = tl.log(acc) + mx[:, None]
-    res = tl.where(kin[:, None] == 0, -float("inf"), res)
-    tl.store(yd_ptr + ids64[:, None] * H_out + (h0 + offs_m)[None, :], res, mask=mask_b[:, None])
+    tl.store(dst_ptr + dst_off + b + row.to(tl.int64) * dst_ld, x, mask=mask)
 
 
 @triton.jit(do_not_specialize=["flow_stride", "mars_stride", "gt_ld", "gt_off"])
-def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr, kin_ptr,
-                         cs_ptr, nnz_ptr, flow_stride, mars_stride, H_out, gt_ld, gt_off,
-                         BLOCK: tl.constexpr, ROUND: tl.constexpr, WRITE_T: tl.constexpr,
-                         WRITE_D: tl.constexpr):
+def _ws_densify_g_kernel(gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr, kin_ptr,
+                         cs_ptr, nnz_ptr, flow_stride, mars_stride, gt_ld, gt_off,
+                         BLOCK: tl.constexpr, ROUND: tl.constexpr):
     """Scatter ``gs = nflow * exp(max_b - nmars)`` (0 for samples without
-    active inputs) of the batched output column into the pre-zeroed dense
-    ``gd[B, H_out]`` (with ``WRITE_D``) and, with ``WRITE_T``, into the transposed stash slot
-    ``gt[h, gt_off + b]``. ``max_b`` is the input max the forward used, so
-    ``gs * x = nflow * exp(in - nmars)`` exactly as the gather kernel's
+    active inputs) of the batched output column into the transposed stash
+    slot ``gt[h, gt_off + b]``. ``max_b`` is the input max the forward used,
+    so ``gs * x = nflow * exp(in - nmars)`` exactly as the gather kernel's
     per-pair term."""
     b = tl.program_id(1)
     k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -2918,144 +1851,20 @@ def _ws_densify_g_kernel(gd_ptr, gt_ptr, idx_ptr, nflow_ptr, nmars_ptr, max_ptr,
     g = tl.where(dead, 0.0, g)
     if ROUND:
         g = _ws_round_tf32(g)
-    if WRITE_D:
-        tl.store(gd_ptr + b * H_out + h, g, mask=mask)
-    if WRITE_T:
-        tl.store(gt_ptr + gt_off + h * gt_ld + b, g, mask=mask)
+    tl.store(gt_ptr + gt_off + h * gt_ld + b, g, mask=mask)
 
 
-@triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_bwd_flow_kernel(fd_ptr, w_ptr, gd_ptr, act_ptr, nact_ptr, w_start, B, H_in, H_out,
-                        NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                        TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr,
-                        PREC: tl.constexpr, GATHER_K: tl.constexpr):
-    """Weight-stationary element-flow backward. Grid ``(cdiv(B, BB),
-    H_in // TK)``: program = (batch slice, block of TK children); walks the
-    parents TM at a time, ``fd[b, c] = sum_h gd[b, h] * W[h, c]``. The
-    ``[TM, TK]`` W tile is parents-contiguous, i.e. K-major for the dot.
-    With ``GATHER_K`` the children are the batch's active ones only,
-    ``act[0:nact]`` (sorted, :func:`_ws_active_children`), programs past
-    them return; ``fd`` is written at those children only, which is all the
-    gather that follows reads."""
-    pid_b = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    offs_k = tl.arange(0, TK)
-    offs_m = tl.arange(0, TM)
-    offs_b = pid_b * BB + tl.arange(0, BB)
-    mask_b = offs_b < B
-    if GATHER_K:
-        n_act = tl.load(nact_ptr)
-        if pid_c * TK >= n_act:
-            return
-        c = pid_c * TK + offs_k
-        mask_k = c < n_act
-        c = tl.load(act_ptr + c, mask=mask_k, other=0)
-    else:
-        c = pid_c * TK + offs_k
-        mask_k = offs_k < TK
-
-    w_cols = w_ptr + w_start + c.to(tl.int64)[None, :] * BS
-    acc = tl.zeros([BB, TK], dtype=tl.float32)
-    for h0 in range(0, H_out, TM):
-        pb = h0 // BS
-        w0 = h0 % BS
-        w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None],
-                    mask=mask_k[None, :], other=0.0)
-        g = tl.load(gd_ptr + offs_b[:, None] * H_out + (h0 + offs_m)[None, :],
-                    mask=mask_b[:, None], other=0.0)
-        acc += tl.dot(g, w, input_precision=PREC)
-    tl.store(fd_ptr + offs_b[:, None] * H_in + c[None, :], acc,
-             mask=mask_b[:, None] & mask_k[None, :])
-
-
-@triton.jit(do_not_specialize=["w_start", "B"])
-def _ws_bwd_flow_tiles_kernel(fd_ptr, w_ptr, gd_ptr, lists_ptr, counts_ptr, bits_ptr,
-                              w_start, B, H_in, H_out,
+@triton.jit(do_not_specialize=["pid_start", "pfid_start"])
+def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, pid_start, pfid_start, H_in,
                               NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                              TK: tl.constexpr, TM: tl.constexpr, BB: tl.constexpr, NW: tl.constexpr,
-                              PREC: tl.constexpr, ROW_MASK: tl.constexpr, SKIP_K: tl.constexpr):
-    """Weight-stationary element-flow backward over every sample's active
-    child tiles — the mirror of :func:`_ws_fwd_tiles_kernel`. Grid
-    ``(cdiv(B, BB), H_in // TK)``: program = (block of BB samples of the
-    child tile's list, child tile ``k``); it walks the parents TM at a time,
-    word by word of the parent-tile bits, ``fd[b, c] = sum_h gd[b, h] * W[h,
-    c]``, loading a sample's ``gd`` row only for the parent tiles it has an
-    active parent in. ``fd`` is written at the block's samples and this
-    tile's children only, which is all the gather that follows reads."""
-    blk = tl.program_id(0)
-    pid_c = tl.program_id(1)
-    n = tl.load(counts_ptr + pid_c)
-    if blk * BB >= n:
-        return
-    offs_b = blk * BB + tl.arange(0, BB)
-    mask_b = offs_b < n
-    ids = tl.load(lists_ptr + pid_c.to(tl.int64) * B + offs_b, mask=mask_b, other=0)
-    ids64 = ids.to(tl.int64)
-    offs_k = tl.arange(0, TK)
-    offs_m = tl.arange(0, TM)
-    offs_w = tl.arange(0, NW)
-    c = pid_c * TK + offs_k
-    w_cols = w_ptr + w_start + c.to(tl.int64)[None, :] * BS
-    g_rows = gd_ptr + ids64[:, None] * H_out
-    words = tl.load(bits_ptr + ids64[:, None] * NW + offs_w[None, :], mask=mask_b[:, None], other=0)
-    n_tiles = H_out // TM
-
-    acc = tl.zeros([BB, TK], dtype=tl.float32)
-    for wi in range(0, NW):
-        w_sel = tl.sum(tl.where(offs_w[None, :] == wi, words, 0), axis=1)
-        any_bit = tl.sum(w_sel, 0)
-        n_j = tl.minimum(32, n_tiles - wi * 32)
-        if SKIP_K:
-            if any_bit != 0:
-                for j in range(0, n_j):
-                    touch = mask_b & (((w_sel >> j) & 1) != 0)
-                    h0 = (wi * 32 + j) * TM
-                    pb = h0 // BS
-                    w0 = h0 % BS
-                    w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None])
-                    g = tl.load(g_rows + (h0 + offs_m)[None, :], mask=touch[:, None], other=0.0)
-                    acc += tl.dot(g, w, input_precision=PREC)
-        else:
-            for j in range(0, n_j):
-                if ROW_MASK:
-                    touch = mask_b & (((w_sel >> j) & 1) != 0)
-                else:
-                    touch = mask_b
-                h0 = (wi * 32 + j) * TM
-                pb = h0 // BS
-                w0 = h0 % BS
-                w = tl.load(w_cols + pb.to(tl.int64) * (NB_ch * CBS * BS) + (w0 + offs_m)[:, None])
-                g = tl.load(g_rows + (h0 + offs_m)[None, :], mask=touch[:, None], other=0.0)
-                acc += tl.dot(g, w, input_precision=PREC)
-    tl.store(fd_ptr + ids64[:, None] * H_in + c[None, :], acc, mask=mask_b[:, None])
-
-
-@triton.jit(do_not_specialize=["v_stride", "out_stride"])
-def _ws_gather_flow_kernel(out_ptr, fd_ptr, idx_ptr, val_ptr, max_ptr, cs_ptr, nnz_ptr,
-                           v_stride, out_stride, H_in, BLOCK: tl.constexpr):
-    """``flow_in[b, k] = exp(in[b, k] - max_b) * fd[b, indices[cs[b] + k]]``."""
-    b = tl.program_id(1)
-    k = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = k < tl.load(nnz_ptr + b)
-    c = tl.load(idx_ptr + tl.load(cs_ptr + b) + k, mask=mask, other=0)
-    v = tl.load(val_ptr + b * v_stride + k, mask=mask, other=-float("inf"))
-    mx = tl.maximum(tl.load(max_ptr + b), -1e30)
-    f = tl.load(fd_ptr + b * H_in + c, mask=mask, other=0.0)
-    tl.store(out_ptr + b * out_stride + k, tl.exp(v - mx) * f, mask=mask)
-
-
-@triton.jit(do_not_specialize=["r0", "pid_start", "pfid_start"])
-def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H_in,
-                              NB_ch: tl.constexpr, BS: tl.constexpr, CBS: tl.constexpr,
-                              TM: tl.constexpr, TK: tl.constexpr, NEGATE: tl.constexpr,
-                              ZERO_S: tl.constexpr = False):
-    """``param_flows[(h, c)] += W[(h, c)] * S[h - r0, c]`` for one
-    ``[rows, H_in]`` panel ``S = Gt[r0:r0+rows] @ Xt^T`` of the deferred
-    param-flow GEMM (same ``(pb*NB_ch + cb)*CBS*BS + cs*BS + w`` layout for
-    params and param flows). Grid ``(rows // TM, H_in // TK)``."""
+                              TM: tl.constexpr, TK: tl.constexpr):
+    """``param_flows[(h, c)] += W[(h, c)] * S[h, c]`` for the deferred
+    accumulator ``S [H_out, H_in]`` (same ``(pb*NB_ch + cb)*CBS*BS + cs*BS +
+    w`` layout for params and param flows), then ``S = 0`` for the next
+    pass. Grid ``(H_out // TM, H_in // TK)``."""
     pid_m = tl.program_id(0)
     pid_c = tl.program_id(1)
-    h0 = r0 + pid_m * TM
+    h0 = pid_m * TM
     c0 = pid_c * TK
     pb = h0 // BS
     w0 = h0 % BS
@@ -3063,14 +1872,11 @@ def _ws_pflow_epilogue_kernel(pf_ptr, w_ptr, s_ptr, r0, pid_start, pfid_start, H
     cs0 = c0 % CBS
     offs_m = tl.arange(0, TM)
     offs_k = tl.arange(0, TK)
-    s_off = (pid_m * TM + offs_m).to(tl.int64)[:, None] * H_in + (c0 + offs_k)[None, :]
+    s_off = (h0 + offs_m).to(tl.int64)[:, None] * H_in + (c0 + offs_k)[None, :]
     s = tl.load(s_ptr + s_off)
-    if ZERO_S:                  # the deferred accumulator starts the next pass at zero
-        tl.store(s_ptr + s_off, tl.zeros_like(s))
+    tl.store(s_ptr + s_off, tl.zeros_like(s))
     off = ((pb.to(tl.int64) * NB_ch + cb) * (CBS * BS)
            + (cs0 + offs_k)[None, :] * BS + (w0 + offs_m)[:, None])
     upd = tl.load(w_ptr + pid_start + off) * s
-    if NEGATE:
-        upd = -upd
     pf = tl.load(pf_ptr + pfid_start + off)
     tl.store(pf_ptr + pfid_start + off, pf + upd)

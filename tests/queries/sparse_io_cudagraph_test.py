@@ -73,13 +73,12 @@ def _build_tree(plain_subtree_roots=False, H=64, V=30, bs=16, density=0.3, seed=
     return pc, V
 
 
-def _set_ws(monkeypatch, mode, prec="ieee", active_children=None):
-    """``active_children``: force the WS kernels on (True) / off (False) the
-    batch's active children (``_WS_ACTIVE_MODE``), or leave the default."""
+def _set_ws(monkeypatch, mode, prec="ieee"):
+    """``mode``: ``_WS_MODE`` (``"never"``: the gather kernels; ``"always"`` /
+    ``"auto"``: the sparse pass from B=2 on); ``prec``: the deferred param-flow
+    GEMM's precision."""
     monkeypatch.setattr(sio, "_WS_MODE", mode)
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
-    if active_children is not None:
-        monkeypatch.setattr(sio, "_WS_ACTIVE_MODE", "always" if active_children else "never")
 
 
 def _eager(pc, x):
@@ -112,7 +111,7 @@ def _cuda():
         pytest.skip("CUDA required")
 
 
-@pytest.mark.parametrize("ws_mode", ["never", "always", "always-active"])
+@pytest.mark.parametrize("ws_mode", ["never", "always"])
 @pytest.mark.parametrize("H,V,T,bs,density,B", [
     (64, 20, 6, 16, 0.3, 1),
     (64, 20, 6, 16, 0.3, 3),
@@ -121,7 +120,7 @@ def _cuda():
     (128, 40, 7, 16, 0.2, 70),
 ])
 def test_replay_matches_eager(monkeypatch, ws_mode, H, V, T, bs, density, B):
-    _set_ws(monkeypatch, ws_mode.split("-")[0], active_children=ws_mode.endswith("active"))
+    _set_ws(monkeypatch, ws_mode)
     pc = _build(H, V, T, bs, density)
     batches = [torch.randint(0, V, (B, T), device=DEV) for _ in range(3)]
     refs = [_eager(pc, x) for x in batches]
@@ -137,13 +136,13 @@ def test_replay_matches_eager(monkeypatch, ws_mode, H, V, T, bs, density, B):
         torch.testing.assert_close(_replay(pc, x.cpu()), ref, rtol=0.0, atol=1e-4)
 
 
-@pytest.mark.parametrize("ws_mode", ["never", "always", "always-active"])
+@pytest.mark.parametrize("ws_mode", ["never", "always"])
 @pytest.mark.parametrize("B", [1, 12])
 def test_backward_after_replay_matches_eager(monkeypatch, ws_mode, B):
     """The eager backward rebinds the sum outputs the replay wrote; its flows
     must equal those after an eager forward — including on the capture call
     itself, which is how pc-arena records (forward + backward of batch 0)."""
-    _set_ws(monkeypatch, ws_mode.split("-")[0], active_children=ws_mode.endswith("active"))
+    _set_ws(monkeypatch, ws_mode)
     H, V, T, bs = 128, 40, 8, 32
     pc = _build(H, V, T, bs, 0.2, seed=1)
     d0, d1 = (torch.randint(0, V, (B, T), device=DEV) for _ in range(2))

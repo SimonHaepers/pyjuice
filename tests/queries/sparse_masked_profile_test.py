@@ -28,6 +28,15 @@ DEV = torch.device("cuda:0")
 T, H, V = 6, 64, 17
 
 
+@pytest.fixture(autouse=True)
+def _fp32_w_copies(monkeypatch):
+    """The checks below compare masked queries with brute force at 2e-4 on the
+    LL; the sparse pass (from B=2 on) reads bf16 copies of W by default, which
+    is ~3e-5 relative on these LLs. Masking logic is what is tested here, so
+    the copies stay fp32 (bf16 is covered by ``sparse_io_ws_sparse_test``)."""
+    monkeypatch.setattr(sio, "_WS_SPARSE_SLAB_W16", False)
+
+
 def _build(kind, compact=False):
     cptr, rid, vals, _ = random_emission_csc(H, V, 0.25, seed=11)
     torch.manual_seed(11)

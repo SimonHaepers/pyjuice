@@ -416,8 +416,8 @@ class TensorCircuit(nn.Module):
                     self._run_pattern_cache = dict()
                 else:
                     self._run_pattern_cache = None
-                # Weight-stationary sparse-IO groups: params may have changed
-                # since the last pass (EM step), drop the per-pass rounded W copy.
+                # Sparse-IO weight groups: params may have changed since the
+                # last pass (EM step), drop the per-pass slab-order W copy.
                 for ws_group in self._sparse_io_ws_groups:
                     ws_group.begin_pass()
 
@@ -803,13 +803,24 @@ class TensorCircuit(nn.Module):
                 saved_nf = self.node_flows.clone()
                 saved_ef = self.element_flows.clone()
                 saved_pf = self.param_flows.clone() if compute_param_flows else None
+
+                def _graph_body():
+                    # The sparse-IO pass reads W from a per-pass copy in the
+                    # backward's slab order, shared with the forward's order.
+                    # A replayed forward rewrites it in forward order and an
+                    # EM step changes W, so the copy must be part of the
+                    # captured backward (see ``_sparse_graph_body`` in forward).
+                    for ws_group in self._sparse_io_ws_groups:
+                        ws_group.begin_pass()
+                    _run_inner_layers()
+
                 s = torch.cuda.Stream()
                 s.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(s):
                     for _ in range(3):
                         self.node_flows.copy_(saved_nf)
                         self.element_flows.copy_(saved_ef)
-                        _run_inner_layers()
+                        _graph_body()
                 torch.cuda.current_stream().wait_stream(s)
                 if saved_pf is not None:
                     self.param_flows.copy_(saved_pf)
@@ -819,7 +830,7 @@ class TensorCircuit(nn.Module):
                 # Capture
                 g = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(g):
-                    _run_inner_layers()
+                    _graph_body()
 
                 # Save
                 self._recorded_cuda_graphs[signature] = g
@@ -835,8 +846,8 @@ class TensorCircuit(nn.Module):
             else:
                 _run_inner_layers()
 
-            # Deferred parameter flows of the weight-stationary sparse-IO
-            # path: one GEMM per tied transition matrix for the whole pass.
+            # Deferred parameter flows of the sparse-IO pass: accumulated per
+            # tied transition matrix for the whole pass, multiplied by W once.
             if compute_param_flows:
                 for ws_group in self._sparse_io_ws_groups:
                     ws_group.flush(self.params, self.param_flows, final=True)

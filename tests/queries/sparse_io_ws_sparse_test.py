@@ -1,13 +1,15 @@
-"""The CUDA-core forward of :class:`SparseIOSumLayer` over the nonzero
-products only (``"sparse"``, :mod:`pyjuice.layer.sparse_io_cuda`): for every
-parent tile of 4 or 8 rows the samples with an active parent in it walk their
-packed input columns against the tile's W slab in shared memory and write the
-packed output. It must give the gather path's log-likelihoods (and, through
-them, flows) at every batch size, eagerly and under a CUDA graph, on state
-counts that are not powers of two, with the slab copied by TMA and by 4-byte
-``cp.async``, with empty columns and masked variables, on a circuit that is
-not a chain, for every kernel configuration (slab sources, swizzle, item
-assignment, parameter-flow paths); blocks with unsorted columns must not take it.
+"""The batched sparse pass of :class:`SparseIOSumLayer`
+(:mod:`pyjuice.layer.sparse_io_cuda`): for every parent tile of 4 / 8 / 16
+rows the samples with an active parent in it walk their packed input columns
+against the tile's W slab in shared memory and write the packed output; the
+element-flow backward is its mirror. It must give the gather kernels'
+log-likelihoods (and, through them, flows) at every batch size from 2 on,
+eagerly and under a CUDA graph, on state counts that are not powers of two,
+with fp32 and bf16 slabs, with the children split into several ranges, with
+empty columns and masked variables, on a circuit that is not a chain, on
+both parameter-flow paths (accumulator tiles, deferred dense GEMM) and
+across accumulated / negated backward calls; B=1 and blocks with unsorted
+columns must stay on the gather kernels.
 """
 from __future__ import annotations
 
@@ -72,33 +74,31 @@ def _build_forest(H=64, V=30, T=5, bs=16, density=0.3, seed=0):
     return pc, V, 2 * T
 
 
-def _set(monkeypatch, mode, prec="ieee", sparse=None, **knobs):
-    """``sparse``: force the sparse forward on (True) / off (False) for the
-    WS forwards (``_WS_SPARSE_MODE``); ``knobs``: ``_WS_SPARSE_<name>``
-    (``SLAB_TM`` / ``SLAB_BYTES`` / ``SLAB_NWARP`` / ``SLAB_MINB``)."""
+def _set(monkeypatch, mode, prec="ieee", **knobs):
+    """``mode``: ``_WS_MODE`` (``"never"`` = the gather kernels, the reference;
+    ``"auto"`` = the sparse pass from B=2 on); ``prec``: the deferred GEMM's
+    precision; ``knobs``: ``_WS_SPARSE_<name>`` (``SLAB_TM`` / ``SLAB_BYTES`` /
+    ``SLAB_NWARP`` / ``SLAB_MINB`` / ``SLAB_W16`` / ``PFLOW`` / ``PF_TILE_*``)."""
     monkeypatch.setattr(sio, "_WS_MODE", mode)
     monkeypatch.setattr(sio, "_WS_PRECISION", prec)
-    if sparse is not None:
-        monkeypatch.setattr(sio, "_WS_SPARSE_MODE", "always" if sparse else "never")
     knobs.setdefault("SLAB_W16", False)       # the exactness tests read W in fp32; test_sparse_w16 covers bf16
     for k, v in knobs.items():
         if k == "SLAB_NWARP":
-            v = {t: v for t in (1, 2, 4, 8, 16)}
+            v = {t: v for t in sio_cuda.TILE_HEIGHTS}
         monkeypatch.setattr(sio, f"_WS_SPARSE_{k}", v)
 
 
 def _count(monkeypatch):
-    calls = {"fwd": 0, "sparse": 0, "bwd": 0, "bwd_sparse": 0}
+    """Calls of the sparse forward / backward block methods."""
+    calls = {"fwd": 0, "bwd": 0}
     fwd, bwd = sio.SparseIOSumLayer._ws_forward_block, sio.SparseIOSumLayer._ws_backward_block
 
     def counted_fwd(self, *a, **k):
         calls["fwd"] += 1
-        calls["sparse"] += bool(k.get("sparse"))
         return fwd(self, *a, **k)
 
     def counted_bwd(self, *a, **k):
         calls["bwd"] += 1
-        calls["bwd_sparse"] += bool(k.get("sparse"))
         return bwd(self, *a, **k)
 
     monkeypatch.setattr(sio.SparseIOSumLayer, "_ws_forward_block", counted_fwd)
@@ -110,11 +110,11 @@ def _emit_flows(pc):
     return torch.cat([layer.param_flows.detach().reshape(-1).clone() for layer in pc.input_layer_group])
 
 
-def _pass(pc, data):
+def _pass(pc, data, flows_memory=0.0, negate=False):
     """LL, transition param flows and emission param flows (the backward
     reads the forward's packed node values)."""
     ll = pc(data, apply_cudagraph=False).detach().clone()
-    pc.backward(data, compute_param_flows=True, flows_memory=0.0)
+    pc.backward(data, compute_param_flows=True, flows_memory=flows_memory, negate_pflows=negate)
     return ll, pc.param_flows.detach().clone(), _emit_flows(pc)
 
 
@@ -124,7 +124,7 @@ def _assert_flows_close(got, ref, rtol, what):
     assert err < rtol, f"{what}: max |diff| / max |ref| = {err:.2e} (tol {rtol:.0e})"
 
 
-@pytest.mark.parametrize("tm", ["auto", 4, 8])
+@pytest.mark.parametrize("tm", [4, 8, 16])
 @pytest.mark.parametrize("prec", ["ieee", "tf32"])
 @pytest.mark.parametrize("H,V,T,bs,density,B", [
     (64, 20, 6, 16, 0.3, 3),              # few samples, PC blocks of 16
@@ -136,9 +136,9 @@ def _assert_flows_close(got, ref, rtol, what):
     (2048, 300, 4, 1024, 0.02, 300),
 ])
 def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
-    """The forward and the element-flow backward are exact fp32 in both
-    precisions (they read W itself, not the tf32 copy) with either tile
-    height; the parameter flows keep the deferred (tf32 or ieee) GEMM."""
+    """The forward and the element-flow backward are exact fp32 with either
+    tile height; the parameter flows take the deferred (tf32 or ieee) GEMM
+    (W below the tile threshold)."""
     pc = _build(H, V, T, bs, density)
     data = torch.randint(0, V, (B, T), device=DEV)
 
@@ -146,10 +146,9 @@ def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
     ll_ref, pf_ref, emit_ref = _pass(pc, data)
 
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", prec, sparse=True, SLAB_TM=tm)
+    _set(monkeypatch, "auto", prec, SLAB_TM=tm)
     ll, pf, emit = _pass(pc, data)
-    assert calls["fwd"] == T - 1 and calls["sparse"] == T - 1
-    assert calls["bwd"] == T - 1 and calls["bwd_sparse"] == T - 1
+    assert calls["fwd"] == T - 1 and calls["bwd"] == T - 1
     torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=_TOL[prec])
     rtol = 1e-4 if prec == "ieee" else 3e-3
     _assert_flows_close(pf, pf_ref, rtol, "transition param flows")
@@ -164,133 +163,86 @@ def test_sparse_matches_gather(monkeypatch, prec, H, V, T, bs, density, B, tm):
 ])
 def test_sparse_w16(monkeypatch, H, V, T, bs, density, B, tm):
     """bf16 slab-order copies of W (``_WS_SPARSE_SLAB_W16``): the forward and the element-flow
-    backward read W rounded to 8 bits of mantissa; the likelihoods and flows stay within the
-    rounding (about 2^-9 relative per weight) of the exact gather path, and the bf16 copies
-    are what the kernels read (not bit-identical to fp32)."""
+    backward round W to 8 bits of mantissa, so the LLs agree with the gather kernels to a few
+    1e-3 per sequence and the flows to 2 % (relative to the largest), and differ from the exact
+    pass."""
     pc = _build(H, V, T, bs, density)
     data = torch.randint(0, V, (B, T), device=DEV)
     _set(monkeypatch, "never")
     ll_ref, pf_ref, emit_ref = _pass(pc, data)
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=tm, SLAB_W16=True)
+    _set(monkeypatch, "auto", "ieee", SLAB_TM=tm, SLAB_W16=True)
     ll, pf, emit = _pass(pc, data)
-    assert calls["sparse"] == T - 1 and calls["bwd_sparse"] == T - 1
-    assert (ll - ll_ref).abs().max() > 0, "bf16 copies not in use (bit-identical to fp32)"
+    assert calls["fwd"] == T - 1 and calls["bwd"] == T - 1
     torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=4e-3 * T)
     _assert_flows_close(pf, pf_ref, 2e-2, "transition param flows")
     _assert_flows_close(emit, emit_ref, 2e-2, "emission param flows")
+    assert not torch.equal(ll, ll_ref), "bf16 slabs gave bit-identical LLs: the fp32 copy was read"
 
 
 def test_sparse_w16_forest(monkeypatch):
-    """The same on a circuit that is not a chain (two chains under one root)."""
+    """bf16 slabs on a circuit that is not a chain (two transition matrices per layer, each with its
+    own slab-order copies)."""
     pc, V, n_vars = _build_forest()
-    data = torch.randint(0, V, (24, n_vars), device=DEV)
+    x = torch.randint(0, V, (24, n_vars), device=DEV)
     _set(monkeypatch, "never")
-    ll_ref, pf_ref, emit_ref = _pass(pc, data)
-    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=8, SLAB_W16=True)
-    ll, pf, emit = _pass(pc, data)
-    torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=2e-2)
-    _assert_flows_close(pf, pf_ref, 2e-2, "transition param flows")
+    ll_ref, pf_ref, emit_ref = _pass(pc, x)
+    _set(monkeypatch, "auto", "ieee", SLAB_TM=4, SLAB_W16=True)
+    ll, pf, emit = _pass(pc, x)
+    torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=4e-3 * n_vars)
+    _assert_flows_close(pf, pf_ref, 2e-2, "sum param flows")
     _assert_flows_close(emit, emit_ref, 2e-2, "emission param flows")
 
 
-@pytest.mark.parametrize("loader", [None, 1])
 @pytest.mark.parametrize("knobs", [
-    dict(),                                                   # the default: 4 or 8-row tiles by cost
     dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2),            # 32 children per CTA: 8 ranges
-    dict(SLAB_TM=2, SLAB_BYTES=1024),                         # 2-row tiles, 4 ranges
-    dict(SLAB_TM=1, SLAB_NWARP=4, SLAB_MINB=1),
     dict(SLAB_TM=8, SLAB_BYTES=2048),                         # 8-row tiles, 4 ranges
     dict(SLAB_TM=16, SLAB_BYTES=6144, SLAB_NWARP=12, SLAB_MINB=2),   # 16 rows, 3 ranges
+    dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_W16=True),    # 8 ranges of bf16 slabs
 ])
-def test_sparse_knobs(monkeypatch, knobs, loader):
-    """Every slab configuration gives the same result: tile heights 1 to 16
-    (only the 4-row quarters with one of the sample's parents read), the
-    children split into ranges whose partial sums add up in the output, TMA
-    and 4-byte ``cp.async`` copies of the slab, forward and element-flow
-    backward (whose slab is parents x children, the parents split into
-    ranges likewise); density 0.3 at H=256 puts up to all rows of a tile in a
-    sample."""
+def test_sparse_ranges(monkeypatch, knobs):
+    """The children split into several ranges whose partial sums add up in
+    the output (and the parents likewise in the backward), with tile heights
+    4 to 16 (only the 4-row quarters with one of the sample's parents read);
+    density 0.3 at H=256 puts up to all rows of a tile in a sample."""
     pc = _build(256, 60, 5, 128, 0.3, seed=2)
     data = torch.randint(0, 60, (40, 5), device=DEV)
     _set(monkeypatch, "never")
     ref = _pass(pc, data)
-    monkeypatch.setattr(sio_cuda, "FORCE_LOADER", loader)
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True, **knobs)
+    _set(monkeypatch, "auto", "ieee", **knobs)
     got = _pass(pc, data)
-    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
-    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
-    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
-    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
+    assert calls["fwd"] == 4 and calls["bwd"] == 4
+    tol = 2e-2 if knobs.get("SLAB_W16") else 1e-4
+    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=tol)
+    _assert_flows_close(got[1], ref[1], tol, "transition param flows")
+    _assert_flows_close(got[2], ref[2], tol, "emission param flows")
 
 
 @pytest.mark.parametrize("opts", [
-    dict(SLAB_NATIVE=False, SLAB_NATIVE_BWD=False, SLAB_STATIC=False),   # TMA boxes of W, shared item counter
-    dict(SLAB_NATIVE=True, SLAB_NATIVE_BWD=True, SLAB_SWZ=False),        # slab-order copies, unswizzled
-    dict(SLAB_TM=8, SLAB_SWZ=True, SLAB_GL=16),                           # 8-row swizzled slabs, 2 items per warp
-    dict(SLAB_TM=16, SLAB_SWZ=True, SLAB_BYTES=6144, SLAB_NWARP=12, SLAB_MINB=2),   # 64B swizzle, 3 ranges
-    dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_NATIVE_BWD=False),   # copy forward, TMA backward, 8 ranges
-    dict(PFLOW="fused"),                                                 # param flows in the backward slab kernel
-    dict(PFLOW="fixed", SLAB_TM=8),                                      # ... in 32-bit fixed point
-    dict(PFLOW="fixed", SLAB_TM=2, PF_BYTES=1024, PF_NWARP=4, PF_MINB=1),   # 2-row tiles, several parent ranges
-    dict(SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),                       # entries two items ahead, bank-group order
-    dict(SLAB_TM=4, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_AHEAD=2, SLAB_PERM=True),   # ... 8 ranges, short rows
-    dict(PFLOW="fixed", SLAB_TM=4, SLAB_AHEAD=2, SLAB_PERM=True),        # ... with fixed-point param flows
-    dict(SLAB_TM=4, SLAB_GROUP=4, SLAB_MINB=2),                          # samples with the same column per warp
-    dict(SLAB_TM=4, SLAB_GROUP=2, SLAB_NATIVE_BWD=False),                 # ... TMA backward layout
-    dict(SLAB_TM=4, SLAB_GROUP=8, SLAB_MINB=2, PFLOW="fixed"),           # ... forward grouped, backward fused
-    dict(SLAB_TM=4, SLAB_STREAM=4, SLAB_MINB=2),                         # samples walked software-pipelined
-    dict(SLAB_TM=8, SLAB_STREAM=1, SLAB_MINB=2, SLAB_BYTES=2048, SLAB_NWARP=2),   # 8-row, 4 ranges, long tails
-    dict(SLAB_TM=4, SLAB_STREAM=2, SLAB_NATIVE_BWD=False),               # ... TMA backward layout
-    dict(SLAB_TM=8, SLAB_STREAM=6, SLAB_MINB=2, PFLOW="fixed"),          # ... forward only (fused backward)
-    dict(SLAB_TM=4, SLAB_ROWS=True),                                      # row-by-row slabs, 4-byte reads per active row
-    dict(SLAB_TM=4, SLAB_ROWS=True, SLAB_BYTES=512, SLAB_NWARP=2, SLAB_AHEAD=2, SLAB_PERM=True),   # ... 8 ranges
-    dict(SLAB_TM=4, SLAB_ROWS=True, SLAB_NATIVE_BWD=False),               # ... forward only (TMA backward)
-    dict(SLAB_TM=4, SLAB_ROWS=True, PFLOW="fixed"),                       # ... forward only (fused backward)
+    dict(PFLOW="gemm"),                                                   # the deferred dense GEMM
     dict(PFLOW="tile"),                                                   # param flows on accumulator tiles
     dict(PFLOW="tile", PF_TILE_SLOTS=1),                                  # ... accumulated after every step
     dict(PFLOW="tile", PF_TILE_SLOTS=3, PF_TILE_NWARP=2),                 # ... every 3 steps, 2 warps per tile
     dict(PFLOW="tile", PF_TILE_STASH_BYTES=1),                            # ... the stash budget: one step at a time
-    dict(PFLOW="tile", PF_TILE_FIXED=False),                              # ... fp32 tiles (compare-and-swap adds)
-    dict(PFLOW="tile", PF_TILE_FIXED=False, PF_TILE_BYTES=1024, PF_TILE_NWARP=4),
     dict(PFLOW="tile", PF_TILE_BYTES=1024, PF_TILE_NWARP=4),              # ... 4 ranges of 64 children
 ])
-@pytest.mark.parametrize("defer", [True, False])
-def test_sparse_slab_options(monkeypatch, opts, defer):
-    """The slab sources (TMA boxes of W, or the per-pass slab-order copies of either
-    direction, swizzled or not), the item assignment, the lanes per item and the
-    parameter-flow paths (the deferred dense GEMM with or without the deferred
-    epilogue; fp32 or fixed-point accumulation in the backward slab kernel) give
-    the gather path's LLs and flows."""
+def test_sparse_pflow_paths(monkeypatch, opts):
+    """Both parameter-flow paths give the gather kernels' flows, and a second
+    pass (which reuses the slab copies and the accumulator) again."""
     pc = _build(256, 60, 5, 128, 0.3, seed=3)
     data = torch.randint(0, 60, (40, 5), device=DEV)
     _set(monkeypatch, "never")
     ref = _pass(pc, data)
-    monkeypatch.setattr(sio, "_WS_PFLOW_DEFER", defer)
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True, **opts)
+    _set(monkeypatch, "auto", "ieee", **opts)
     got = _pass(pc, data)
-    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
+    assert calls["fwd"] == 4 and calls["bwd"] == 4
     torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
     _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
     _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
-    got2 = _pass(pc, data)                       # a second pass reuses the copies / accumulator
+    got2 = _pass(pc, data)
     _assert_flows_close(got2[1], ref[1], 1e-4, "transition param flows, second pass")
-
-
-def test_sparse_slab_rows_toggle(monkeypatch):
-    """Passes with and without row-by-row slabs on one circuit: the per-pass slab copies follow
-    the layout the kernels read (the copy cache keys on it)."""
-    pc = _build(256, 60, 5, 128, 0.3, seed=4)
-    data = torch.randint(0, 60, (24, 5), device=DEV)
-    _set(monkeypatch, "never")
-    ref = _pass(pc, data)
-    for rows in (False, True, False, True):
-        _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, SLAB_ROWS=rows)
-        got = _pass(pc, data)
-        torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
-        _assert_flows_close(got[1], ref[1], 1e-4, f"transition param flows, rows={rows}")
 
 
 def test_pflow_mode_auto(monkeypatch):
@@ -310,14 +262,12 @@ def test_pflow_mode_auto(monkeypatch):
     assert sio._pflow_mode(8192, 8192, 1024) == "gemm"
 
 
-@pytest.mark.parametrize("fixed", [True, False])
 @pytest.mark.parametrize("H,pad", [(256, 0), (250, 0), (256, 1)])
-def test_pflow_tile_corner(H, pad, fixed):
+def test_pflow_tile_corner(H, pad):
     """``pflow_tile_flush`` with a corner leaves exactly the pairs (parent < P, child < C) out: the corner
     run plus a dense outer product over the corner equals the run without one (fp32, random samples; several
     samples share their child list, as samples with the same next token do). The tiles are added to S by 16-byte
-    groups (H = 256) or one value at a time: H not a multiple of 4 (250), or S's rows not 16-byte aligned (pad 1);
-    the tiles in fixed point or fp32."""
+    groups (H = 256) or one value at a time: H not a multiple of 4 (250), or S's rows not 16-byte aligned (pad 1)."""
     B, S = 24, 3
     gen = torch.Generator(device="cpu").manual_seed(7)
     lists = [torch.sort(torch.randperm(H, generator=gen)[:k]).values for k in (37, 60, 1, 90)]
@@ -358,110 +308,20 @@ def test_pflow_tile_corner(H, pad, fixed):
             ref[p[:, None], c[None, :]] += (g[b, :len(p)].double().to(DEV)[:, None]
                                             * torch.exp(v[b, :len(c)].double()).to(DEV)[None, :])
     full = torch.zeros(H, H + pad, device=DEV)[:, pad:]
-    sio_cuda.pflow_tile_flush(full, bufs, S, B, H, H, 1.0, NW=2, slab_bytes=KB, fixed=fixed)
+    sio_cuda.pflow_tile_flush(full, bufs, S, B, H, H, 1.0, NW=2, slab_bytes=KB)
     torch.testing.assert_close(full.double(), ref, rtol=1e-5, atol=1e-6)
     P, C = 128, 2 * KS
     part = torch.zeros(H, H + pad, device=DEV)[:, pad:]
-    sio_cuda.pflow_tile_flush(part, bufs, S, B, H, H, -1.0, NW=2, slab_bytes=KB, corner=(P, C), fixed=fixed)
+    sio_cuda.pflow_tile_flush(part, bufs, S, B, H, H, -1.0, NW=2, slab_bytes=KB, corner=(P, C))
     assert torch.all(part[:P, :C] == 0)
     torch.testing.assert_close(-part[P:].double(), ref[P:], rtol=1e-5, atol=1e-6)
     torch.testing.assert_close(-part[:P, C:].double(), ref[:P, C:], rtol=1e-5, atol=1e-6)
 
 
-def _bank_order(keys):
-    """Reference of ``ws_slab_perm`` for one row: the indices of the row's entries in their
-    new order. Phases of 8 filled one after the other with one entry of every bank group
-    left, then one more of the groups with the most entries left (ties: lower group);
-    within a phase by group, a group's entries in their order."""
-    left = {g: [i for i, k in enumerate(keys) if k == g] for g in range(8)}
-    out = []
-    while len(out) < len(keys):
-        m, t = min(8, len(keys) - len(out)), [0] * 8
-        while m:
-            cand = [g for g in range(8) if len(left[g]) - t[g] > 0]
-            if len(cand) > m:
-                cand = sorted(cand, key=lambda g: (t[g] - len(left[g]), g))[:m]
-            for g in cand:
-                t[g] += 1
-            m -= len(cand)
-        for g in range(8):
-            out += left[g][:t[g]]
-            left[g] = left[g][t[g]:]
-    return out
-
-
-def test_slab_perm_rows():
-    """``ws_slab_perm`` reorders each 32-entry row of every (sample, range) list
-    within the row as :func:`_bank_order` does: fewer bank-group conflicts of the
-    8-entry phases in total, none in a full row that allows none."""
-    H, TMS, KS, B = 256, 4, 64, 9
-    nsplit = H // KS
-    perm = sio_cuda.slab_kernels(H, H, 64, TMS, KS, 4, 9, 1)[4]
-    g = torch.Generator().manual_seed(5)
-    sizes = torch.randint(1, H, (B - 2,), generator=g).tolist() + [H, 0]   # random, full, empty column
-    cols = [torch.sort(torch.randperm(H, generator=g)[:n]).values for n in sizes]
-    K = max(len(c) for c in cols) + 1
-    xp = torch.zeros(B, 2 * K, dtype=torch.int32)
-    cofs = torch.zeros(B, nsplit + 1, dtype=torch.int32)
-    for b, c in enumerate(cols):
-        xp[b, 0:2 * len(c):2] = (c % KS) * TMS * 4
-        xp[b, 1:2 * len(c):2] = c.int()                      # payload: the child itself
-        cofs[b] = torch.searchsorted(c, torch.arange(nsplit + 1) * KS).int()
-    xp_d, cofs_d = xp.to(DEV), cofs.to(DEV)
-    perm((-(-(K + 32 * nsplit) // 256), B), (256,), [xp_d, xp_d.stride(0) // 2, cofs_d], device=DEV)
-    out = xp_d.cpu()
-
-    def conflicts(keys):   # extra wavefronts of the 8-lane phases of one row
-        return sum(max(torch.bincount(keys[p:p + 8], minlength=8).tolist()) - 1
-                   for p in range(0, len(keys), 8) if len(keys[p:p + 8]))
-    total_before = total_after = 0
-    for b, c in enumerate(cols):
-        for s in range(nsplit):
-            j0, j1 = int(cofs[b, s]), int(cofs[b, s + 1])
-            for r0 in range(j0, j1, 32):
-                r1 = min(r0 + 32, j1)
-                before, after = xp[b, 2 * r0:2 * r1].view(-1, 2), out[b, 2 * r0:2 * r1].view(-1, 2)
-                kb, ka = ((before[:, 0] >> 4) & 7).long(), ((after[:, 0] >> 4) & 7).long()
-                assert torch.equal(after, before[_bank_order(kb.tolist())]), (b, s, r0)
-                total_before, total_after = total_before + conflicts(kb), total_after + conflicts(ka)
-                if len(ka) == 32 and torch.bincount(ka, minlength=8).max() <= 4:
-                    assert conflicts(ka) == 0
-        assert (out[b, 2 * len(c):] == 0).all()
-    assert total_after < total_before
-
-
-@pytest.mark.parametrize("opts", [
-    dict(SLAB_GROUP=8, SLAB_MINB=2),                                     # one range, groups cut at 8
-    dict(SLAB_GROUP=4, SLAB_MINB=2, SLAB_BYTES=512, SLAB_NWARP=1),      # 8 ranges, lists longer than a chunk
-    dict(SLAB_GROUP=2, SLAB_PERM=True),                                  # with the bank-group order
-    dict(SLAB_GROUP=4, SLAB_MINB=2, SLAB_PIPE=True),                     # next chunk loaded during the FMAs
-    dict(SLAB_GROUP=8, SLAB_MINB=2, SLAB_PIPE=True, SLAB_BYTES=1024, SLAB_NWARP=2),   # ... 4 ranges, short lists
-])
-def test_sparse_slab_groups(monkeypatch, opts):
-    """Many samples share a token (8 tokens, 160 samples): the grouped walk
-    (``SLAB_GROUP``) cuts runs of up to ~20 samples with the same column into
-    groups, also across several column ranges and sorted chunks, and gives the
-    gather path's LLs and flows."""
-    pc = _build(256, 8, 5, 128, 0.3, seed=4)
-    data = torch.randint(0, 8, (160, 5), device=DEV)
-    _set(monkeypatch, "never")
-    ref = _pass(pc, data)
-    calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, **opts)
-    got = _pass(pc, data)
-    assert calls["sparse"] == 4 and calls["bwd_sparse"] == 4
-    torch.testing.assert_close(got[0], ref[0], rtol=0.0, atol=1e-4)
-    _assert_flows_close(got[1], ref[1], 1e-4, "transition param flows")
-    _assert_flows_close(got[2], ref[2], 1e-4, "emission param flows")
-
-
-@pytest.mark.parametrize("opts", [dict(), dict(SLAB_GROUP=4, SLAB_MINB=2), dict(SLAB_STREAM=4, SLAB_MINB=2)])
-def test_sparse_empty_columns(monkeypatch, opts):
+def test_sparse_empty_columns(monkeypatch):
     """A sample whose token has an empty emission column (impossible
-    sequence) gets ``-inf``-like values like the gather path; the others are
-    unaffected. The empty column starts where token 1's does: the grouped
-    walk (``SLAB_GROUP``) must not put them in one group; the pipelined walk
-    (``SLAB_STREAM``) gives the same."""
+    sequence) gets ``-inf``-like values like the gather kernels; the others
+    are unaffected."""
     H, V, T, bs = 64, 20, 6, 16
     indptr, indices, _, _ = random_emission_csc(H, V, 0.3, seed=3)
     indices = indices[indptr[1]:]                    # token 0 loses its column
@@ -473,7 +333,7 @@ def test_sparse_empty_columns(monkeypatch, opts):
     x[0, 2] = x[4, 2] = x[2, 0] = 1                  # token 1 next to the empty columns
     _set(monkeypatch, "never")
     ref = pc(x, apply_cudagraph=False).detach().clone()
-    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=4, **opts)
+    _set(monkeypatch, "auto", "ieee", SLAB_TM=4)
     got = pc(x, apply_cudagraph=False).detach().clone()
     impossible = torch.tensor([False, True, False, True, False], device=DEV)
     assert (got[impossible] < -1e29).all()
@@ -481,29 +341,29 @@ def test_sparse_empty_columns(monkeypatch, opts):
 
 
 @pytest.mark.parametrize("H,V,T,bs,density,B", [
-    (64, 20, 6, 16, 0.3, 1),            # static B=1 container
+    (64, 20, 6, 16, 0.3, 1),            # static B=1 container: the gather kernels
     (96, 30, 5, 32, 0.25, 9),
     (128, 40, 7, 16, 0.2, 70),
 ])
 def test_sparse_graph_replay_matches_eager(monkeypatch, H, V, T, bs, density, B):
     """The per-step lists and ranges are built on the device inside the
-    captured graph: replays on new batches give the eager gather path, and
-    the eager backward after a replay agrees."""
+    captured graph: replays on new batches give the eager gather kernels,
+    and the eager backward after a replay agrees."""
     pc = _build(H, V, T, bs, density, seed=1)
     batches = [torch.randint(0, V, (B, T), device=DEV) for _ in range(3)]
     _set(monkeypatch, "never")
     refs = [pc(x, apply_cudagraph=False).detach().clone() for x in batches]
-    _set(monkeypatch, "always", "ieee", sparse=True)
+    _set(monkeypatch, "auto", "ieee")
     calls = _count(monkeypatch)
     pc(batches[0], record_cudagraph=True)
     assert pc._sparse_graph_fwd is not None and pc._sparse_graph_fwd.graph is not None
-    assert calls["sparse"] > 0
+    assert (calls["fwd"] > 0) == (B > 1)
     for x, ref in zip(batches, refs):
         got = pc(x).detach().clone()
         torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-4)
     _set(monkeypatch, "never")
     _, pf_ref, emit_ref = _pass(pc, batches[1])
-    _set(monkeypatch, "always", "ieee", sparse=True)
+    _set(monkeypatch, "auto", "ieee")
     pc(batches[1])
     pc.backward(batches[1], compute_param_flows=True, flows_memory=0.0)
     _assert_flows_close(pc.param_flows.detach(), pf_ref, 1e-4, "transition param flows")
@@ -521,7 +381,7 @@ def test_sparse_masked_variables(monkeypatch):
     mm[2, 4] = True
     _set(monkeypatch, "never")
     ref = pc(x, missing_mask=mm, apply_cudagraph=False).detach().clone()
-    _set(monkeypatch, "always", "ieee", sparse=True)
+    _set(monkeypatch, "auto", "ieee")
     got = pc(x, missing_mask=mm, record_cudagraph=True).detach().clone()
     torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-5)
     mm[0, 2], mm[1, 2] = False, True
@@ -540,21 +400,21 @@ def test_sparse_on_forest(monkeypatch, B):
     _set(monkeypatch, "never")
     refs = [_pass(pc, x) for x in batches]
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True, SLAB_TM=8)
+    _set(monkeypatch, "auto", "ieee", SLAB_TM=8)
     for x, (ll_ref, pf_ref, emit_ref) in zip(batches, refs):
         ll, pf, emit = _pass(pc, x)
         torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
         _assert_flows_close(pf, pf_ref, 1e-4, "sum param flows")
         _assert_flows_close(emit, emit_ref, 1e-4, "emission param flows")
-    assert calls["sparse"] > 0 and calls["bwd_sparse"] > 0
+    assert calls["fwd"] > 0 and calls["bwd"] > 0
     pc(batches[0], record_cudagraph=True)
     for x, (ll_ref, _, _) in zip(batches, refs):
         torch.testing.assert_close(pc(x).detach(), ll_ref, rtol=0.0, atol=1e-4)
 
 
 def test_sparse_needs_sorted_columns(monkeypatch):
-    """A column whose rows do not ascend makes the block ineligible: forced
-    WS forwards take another pass, and the result is still right."""
+    """A column whose rows do not ascend makes the block ineligible: it stays
+    on the gather kernels, and the result is still right."""
     H, V, T, bs = 64, 20, 5, 16
     indptr, indices, _, _ = random_emission_csc(H, V, 0.3, seed=4)
     a, b = int(indptr[2]), int(indptr[3])
@@ -565,9 +425,9 @@ def test_sparse_needs_sorted_columns(monkeypatch):
     _set(monkeypatch, "never")
     ref = pc(x, apply_cudagraph=False).detach().clone()
     calls = _count(monkeypatch)
-    _set(monkeypatch, "always", "ieee", sparse=True)
+    _set(monkeypatch, "auto", "ieee")
     got = pc(x, apply_cudagraph=False).detach().clone()
-    assert calls["fwd"] == T - 1 and calls["sparse"] == 0
+    assert calls["fwd"] == 0
     torch.testing.assert_close(got, ref, rtol=0.0, atol=1e-4)
 
 
@@ -584,46 +444,83 @@ def test_columns_sorted():
     assert dist.columns_sorted()
 
 
-def test_sparse_dispatch_cost_model():
-    """The cost model (:func:`_ws_sparse_plan`, fitted 2026-10-24 on the
-    forced kernel maps of the four 8k / 16k chains) takes the sparse forward
-    on the density-0.01 chains from B=64 on — 8-row tiles up to B=512 and
-    4-row tiles above on 8k d0.01 (where they measured faster), 8-row tiles on
-    16k d0.01 — and leaves the density-0.1 chains to the full and tiles
-    passes, which were faster there; never without the tile fractions, never
-    below ``_WS_SPARSE_MIN_BATCH`` (outside the fit). The element-flow
-    backward, priced on its own costs, makes the same decisions on these
-    chains (measured likewise).
-    Model inputs are the trained chains' expected supports (mass-weighted,
-    sorted states). Pure host logic, no GPU."""
-    d = sio._ws_dispatch
-    cases = [   # (H, k_in, f(4), f(8), f(64), expected (decision, sparse tile height) per B)
-        (8192, 508, 0.107, 0.143, 0.361, {16: (None, 0), 64: ("sparse", 8), 256: ("sparse", 8),
-                                          512: ("sparse", 8), 1024: ("sparse", 4), 2048: ("sparse", 4)}),
-        (16384, 1592, 0.158, 0.203, 0.425, {64: ("sparse", 8), 256: ("sparse", 8), 512: ("sparse", 8)}),
-        (8192, 1382, 0.267, 0.327, 0.611, {64: ("full", 0), 256: ("full", 0), 1024: ("tiles", 0),
-                                           2048: ("tiles", 0)}),
-        (16384, 3196, 0.301, 0.360, 0.606, {64: ("full", 0), 256: ("full", 0), 512: ("tiles", 0)}),
-    ]
-    for H, k, f4, f8, f64, expect in cases:
-        fs = {4: f4, 8: f8}
-        for B, (use, tm) in expect.items():
-            got = d(B, H, H, B * k * k, k, False, f_tiles=f64, BB=128, n_tiles=H // 64, f_sparse=fs)
-            got_tm = sio._ws_sparse_plan(B, H, H, k, fs)[1] if got == "sparse" else 0
-            assert (got, got_tm) == (use, tm), (H, k, B, got, got_tm)
-    # the element-flow backward with parameter flows (own costs, child tiles of the input column)
-    for H, k, f4, f8, f64, expect in cases:
-        fs = {4: f4, 8: f8}
-        for B, (use, tm) in expect.items():
-            if B < 64:
-                continue
-            got = d(B, H, H, B * k * k, k, True, f_tiles=f64, BB=128, n_tiles=H // 64,
-                    f_sparse=fs, sparse_k=k, sparse_bwd=True)
-            got_tm = sio._ws_sparse_plan(B, H, H, k, fs, True)[1] if got == "sparse" else 0
-            assert (got, got_tm) == (use, tm), ("backward", H, k, B, got, got_tm)
-    fs = {4: 0.107, 8: 0.143}
-    assert d(1024, 8192, 8192, 1024 * 508 * 508, 508, False, f_tiles=0.361, BB=128,
-             n_tiles=128) == "tiles"                                       # no tile fractions
-    # H=4096, density 0.2 (random): the active-children pass at B=4, not the sparse forward
-    assert d(4, 4096, 4096, 4 * 819 * 819, 819, False, f_tiles=1.0, BB=128, n_tiles=64,
-             f_sparse={4: 0.59, 8: 0.83}) == "active"
+def test_rule_on_batch_size(monkeypatch):
+    """The dispatch is a rule on the batch size: B=1 runs the gather kernels,
+    every B from 2 on the sparse pass (forward and backward), and ``"never"``
+    keeps the gather kernels at any B."""
+    H, V, T, bs = 128, 40, 6, 32
+    pc = _build(H, V, T, bs, 0.2, seed=5)
+    for B, mode, expect in ((1, "auto", 0), (2, "auto", T - 1), (3, "auto", T - 1), (64, "auto", T - 1),
+                            (64, "never", 0)):
+        calls = _count(monkeypatch)
+        _set(monkeypatch, mode)
+        _pass(pc, torch.randint(0, V, (B, T), device=DEV))
+        assert (calls["fwd"], calls["bwd"]) == (expect, expect), (B, mode, calls)
+        monkeypatch.undo()
+
+
+def test_flow_accumulation_and_negate(monkeypatch):
+    """``flows_memory=1`` accumulates across backward calls and
+    ``negate_pflows`` flips the deferred flows, as on the gather kernels."""
+    H, V, T, bs = 64, 24, 6, 16
+    pc = _build(H, V, T, bs, 0.3, seed=2)
+    d1 = torch.randint(0, V, (8, T), device=DEV)
+    d2 = torch.randint(0, V, (8, T), device=DEV)
+    results = {}
+    for mode in ("never", "auto"):
+        _set(monkeypatch, mode)
+        _pass(pc, d1)
+        _, pf_acc, _ = _pass(pc, d2, flows_memory=1.0)
+        _, pf_neg, _ = _pass(pc, d1, negate=True)
+        results[mode] = (pf_acc, pf_neg)
+    _assert_flows_close(results["auto"][0], results["never"][0], 1e-4, "accumulated flows")
+    _assert_flows_close(results["auto"][1], results["never"][1], 1e-4, "negated flows")
+    assert results["auto"][1].sum().item() < 0
+
+
+def test_em_step_matches_gather(monkeypatch):
+    """One mini-batch EM step (forward, backward with parameter flows, update)
+    on the sparse pass gives the gather kernels' parameters and LLs."""
+    H, V, T, bs = 128, 40, 8, 32
+    data = torch.randint(0, V, (20, T), device=DEV)
+    params = {}
+    for mode in ("never", "auto"):
+        _set(monkeypatch, mode)
+        pc = _build(H, V, T, bs, 0.2, seed=3)
+        _pass(pc, data)
+        pc.mini_batch_em(step_size=0.5, pseudocount=1e-3, use_cudagraph=False)
+        params[mode] = pc.params.detach().clone()
+        params[mode + "_ll"] = pc(data).detach().clone()
+    assert (params["auto"] - params["never"]).abs().max().item() < 1e-5
+    torch.testing.assert_close(params["auto_ll"], params["never_ll"], rtol=0.0, atol=1e-4)
+
+
+def test_graph_backward_replay_after_em(monkeypatch):
+    """A captured node-flow backward (a conditional query with
+    ``record_cudagraph``) replayed after an EM step and a forward replay: the
+    sparse pass reads W from a per-pass copy in slab order that the forward
+    and the backward share, so the backward's copy must be captured with it
+    (gpuq job 623 on snapshot 2026-11-02_lean: the second turn's conditional
+    probabilities were off by up to 0.35 relative on the compact layout)."""
+    from pyjuice.queries import conditional
+    H, V, T, bs, B = 128, 23, 7, 32, 17
+    torch.manual_seed(2)
+    xs = [torch.randint(0, V, (B, T), device=DEV) for _ in range(2)]
+    mask = torch.zeros(T, dtype=torch.bool, device=DEV)
+    mask[1] = mask[3] = True                   # the same masked set both turns: one graph, replayed
+    results = {}
+    for mode in ("never", "auto"):
+        _set(monkeypatch, mode, "ieee")
+        pc = _build(H, V, T, bs, 0.3, seed=5)
+        kw = dict(apply_cudagraph=False) if mode == "never" else dict(record_cudagraph=True)
+        out = []
+        for x in xs:
+            pc(x, **kw)
+            pc.backward(x, flows_memory=0.0, allow_modify_flows=False, apply_cudagraph=False)
+            pc.mini_batch_em(step_size=0.2, pseudocount=0.1)
+            out.append((pc(x, **kw).detach().clone(),
+                        conditional(pc, x, missing_mask=mask, allow_modify_flows=False, **kw).clone()))
+        results[mode] = out
+    for (ll, q), (ll_ref, q_ref) in zip(results["auto"], results["never"]):
+        torch.testing.assert_close(ll, ll_ref, rtol=0.0, atol=1e-4)
+        torch.testing.assert_close(q, q_ref, rtol=0.0, atol=1e-4)
