@@ -930,7 +930,7 @@ def _sparse_cat_em_row_sum_kernel(
 
     if keep_zero_params:
         param = tl.load(params_ptr + param_base + offs, mask = mask, other = 0.0)
-        contribution = tl.where(param < 1e-12, 0.0, contribution)
+        contribution = tl.where(param == 0.0, 0.0, contribution)
 
     tl.atomic_add(row_sums_ptr + row_id, contribution, mask = mask)
 
@@ -959,7 +959,7 @@ def _sparse_cat_em_update_kernel(
     new_param = tl.where(row_sum > 0, new_param, param)
 
     if keep_zero_params:
-        new_param = tl.where(param < 1e-12, 0.0, new_param)
+        new_param = tl.where(param == 0.0, 0.0, new_param)
 
     tl.store(params_ptr + param_base + offs, new_param, mask = mask)
 

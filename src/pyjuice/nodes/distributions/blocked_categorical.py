@@ -363,13 +363,13 @@ class BlockedCategorical(Distribution):
 
             contribution = flows + pseudocount
             if keep_zero_params:
-                contribution = torch.where(params < 1e-12, torch.zeros_like(contribution), contribution)
+                contribution = torch.where(params == 0.0, torch.zeros_like(contribution), contribution)
             row_sums = dist._row_sums(contribution)                     # [M, k]
             denom = torch.where(row_sums > 0, row_sums, torch.ones_like(row_sums))
             tb = dist._token_block.to(params.device)
             new_params = (1.0 - step_size) * params + step_size * contribution / denom[tb]
             if keep_zero_params:
-                new_params = torch.where(params < 1e-12, torch.zeros_like(new_params), new_params)
+                new_params = torch.where(params == 0.0, torch.zeros_like(new_params), new_params)
             params.copy_(new_params)
 
     def custom_partition(self, layer, node_mars):
